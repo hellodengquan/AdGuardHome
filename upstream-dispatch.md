@@ -460,3 +460,415 @@ DNS 请求到达
 | `proxy/exchange.go` | `exchangeUpstreams`、负载均衡权重计算 |
 | `proxy/upstreammode.go` | 上游模式枚举定义 |
 | `proxy/dnscontext.go` | `DNSContext`、`CustomUpstreamConfig` |
+
+---
+
+## 附录 A：上游失败回退策略详解
+
+### A.1 回退决策流程
+
+**文件**：`dnsproxy/proxy/proxy.go:583` (`replyFromUpstream`)
+
+当所有主上游同时失败时，系统按以下流程进行回退决策：
+
+```
+主上游交换失败
+    │
+    ▼
+┌─ 分支判断 ─────────────────────────────────────┐
+│                                               │
+│  1. 是私有查询（isPrivate == true）？          │
+│     └─ 是 → 不回退，直接失败                   │
+│                                               │
+│  2. Fallbacks 配置为空（p.Fallbacks == nil）？ │
+│     └─ 是 → 不回退，直接失败                   │
+│                                               │
+└─ 否 → 进入 Fallback 回退流程 ──────────────────┘
+    │
+    ▼
+┌─ Fallback 回退流程 ────────────────────────────┐
+│                                               │
+│  步骤1：按域名匹配 Fallback 上游               │
+│         p.Fallbacks.getUpstreamsForDomain(...) │
+│         （与主上游使用完全相同的域名匹配规则） │
+│                                               │
+│  步骤2：并行查询所有 Fallback 上游             │
+│         upstream.ExchangeParallel(...)         │
+│         所有上游同时发送，返回第一个成功响应   │
+│                                               │
+└─ 成功？────────────────────────────────────────┘
+    │
+    ├─ 是 → 返回 Fallback 响应
+    │
+    └─ 否 → 所有 Fallback 也失败
+         │
+         ▼
+      生成 SERVFAIL 响应
+```
+
+### A.2 最终响应码：SERVFAIL vs NXDOMAIN
+
+**文件**：`dnsproxy/proxy/proxy.go:643` (`handleExchangeResult`)
+
+| 场景 | 响应码 | 触发条件 |
+|------|--------|----------|
+| **上游列表为空** | NXDOMAIN | `selectUpstreams` 返回空列表（如私有上游配置错误） |
+| **所有上游（含 Fallback）失败** | **SERVFAIL** | 主上游全失败 + Fallback 全失败 |
+| **Bogus NXDOMAIN** | NXDOMAIN | 响应 IP 在 Bogus NXDOMAIN 列表中 |
+
+**关键代码**：
+```go
+func (p *Proxy) handleExchangeResult(...) {
+    if resp == nil {
+        // 所有上游都失败时，生成 SERVFAIL
+        d.Res = p.messages.NewMsgSERVFAIL(req)
+        d.hasEDNS0 = false
+        return
+    }
+    // ...
+}
+```
+
+**运营结论**：
+- ✅ 配置了 Fallback DNS 时，**优先切换到 Fallback**
+- ❌ Fallback 也失败时，**返回 SERVFAIL**，而非 NXDOMAIN
+- ⚠️ 私有 PTR 查询不触发 Fallback，直接失败
+
+### A.3 错误聚合与日志
+
+**文件**：`dnsproxy/proxy/exchange.go:67`
+
+当多个上游失败时，错误信息会被聚合：
+```go
+err = fmt.Errorf("all upstreams failed to exchange request: %w",
+    errors.Join(errs...))
+```
+
+每个失败的上游都会记录错误日志（Error 级别）：
+```
+exchange failed  upstream=1.1.1.1:53  question=example.com. A
+  duration=2.001s  error="dial udp 1.1.1.1:53: i/o timeout"
+```
+
+---
+
+## 附录 B：加密协议（DoH/DoT/DoQ）分流路径分析
+
+### B.1 入站侧：协议监听层
+
+所有协议的监听层虽然实现不同，但最终都会汇聚到同一套处理流程。
+
+#### UDP / TCP（明文）
+
+| 协议 | 监听入口 | 处理函数 | 汇聚点 |
+|------|----------|----------|--------|
+| UDP | `udpPacketLoop` | `udpHandlePacket` | `handleDNSRequest` |
+| TCP | `tcpPacketLoop(proto=ProtoTCP)` | `handleTCPConnection` | `handleDNSRequest` |
+
+#### DoT（DNS-over-TLS）
+
+**文件**：`dnsproxy/proxy/servertcp.go:66` (`initTLSListeners`)
+
+DoT 复用 TCP 的处理框架，仅在监听时包装 TLS：
+```go
+l := tls.NewListener(tcpListen, p.TLSConfig)  // TLS 包装
+tcpPacketLoop(proto=ProtoTLS)                // 复用 TCP 循环
+handleTCPConnection(proto=ProtoTLS)          // 复用 TCP 连接处理
+```
+
+#### DoH（DNS-over-HTTPS）
+
+**文件**：`dnsproxy/proxy/serverhttps.go:187` (`ServeHTTP`)
+
+DoH 有独立的 HTTP 服务器，但最终同样汇聚：
+```
+HTTP 请求到达
+    │
+    ▼
+ServeHTTP
+    ├─ 基础认证检查（可选）
+    ├─ 解析 DNS 请求（GET/POST 两种方式）
+    ├─ 提取真实客户端 IP（X-Forwarded-For 等）
+    ├─ newDNSContext(ProtoHTTPS)
+    └─ handleDNSRequest  ← 同一汇聚点
+```
+
+支持的 HTTP 版本：HTTP/1.1、HTTP/2、HTTP/3（h3:// 前缀）
+
+#### DoQ（DNS-over-QUIC）
+
+**文件**：`dnsproxy/proxy/serverquic.go:123` (`quicPacketLoop`)
+
+DoQ 使用 QUIC 协议，有独立的连接和流处理：
+```
+QUIC 连接到达
+    │
+    ▼
+handleQUICConnection
+    ├─ 接受 QUIC 流（每个查询一个流）
+    ├─ 解析 DNS 请求（带 2 字节长度前缀）
+    ├─ newDNSContext(ProtoQUIC)
+    └─ handleDNSRequest  ← 同一汇聚点
+```
+
+### B.2 汇聚点：`handleDNSRequest`
+
+**文件**：`dnsproxy/proxy/requesthandler.go:13`
+
+所有协议经过各自的监听层解析后，都会调用：
+```go
+func (p *Proxy) handleDNSRequest(ctx context.Context, d *DNSContext) (err error)
+```
+
+`handleDNSRequest` 的处理流程：
+1. 检查请求有效性
+2. 检查是否是递归查询（Recursion Desired）
+3. 调用 `p.RequestHandler.ServeDNS(ctx, p, d)`
+   - **这会回调到 AdGuard Home 的 `dnsforward.Server.ServeDNS`**
+4. 调用 `respondUDP/TCP/HTTPS/QUIC` 按原协议发送响应
+
+### B.3 分流路径一致性验证
+
+**结论：所有入站协议共享完全相同的上游分流逻辑**
+
+```
+[UDP]  ──┐
+[TCP]  ──┤
+[DoT]  ──┤
+[DoH]  ──┼─► handleDNSRequest ──► ServeDNS (dnsforward) ──► 同一套分流
+[DoQ]  ──┤                            │
+[DNSCrypt] ─┘                      ▼
+                             处理链 + prx.Resolve
+                                  │
+                                  ▼
+                             selectUpstreams
+                             getUpstreamsForDomain
+                             exchangeUpstreams
+                                  │
+                                  ▼
+                             上游协议（UDP/TCP/DoT/DoH/DoQ）
+```
+
+### B.4 出站侧：上游协议多样性
+
+虽然入站分流逻辑统一，但出站上游可以是任意协议类型：
+
+| 上游协议 | URL 前缀 | 实现文件 |
+|----------|----------|----------|
+| 明文 UDP | `udp://` 或无 | `upstream/plain.go` |
+| 明文 TCP | `tcp://` | `upstream/plain.go` |
+| DoT | `tls://` | `upstream/dot.go` |
+| DoH | `https://` | `upstream/doh.go` |
+| DoQ | `quic://` | `upstream/doq.go` |
+| DNSCrypt | `sdns://` | `upstream/dnscrypt.go` |
+
+所有上游类型都实现了相同的 `Upstream` 接口：
+```go
+type Upstream interface {
+    Exchange(req *dns.Msg) (resp *dns.Msg, err error)
+    Address() string
+    Close() error
+}
+```
+
+因此分流逻辑（按域名选择哪个上游列表）与上游实际使用的协议完全解耦。
+
+### B.5 协议特有的行为差异
+
+虽然分流路径统一，但不同协议在交换时有一些差异：
+
+| 特性 | UDP | TCP | DoT | DoH | DoQ |
+|------|-----|-----|-----|-----|-----|
+| 连接复用 | ❌ | ✅ | ✅ | ✅ | ✅ |
+| 自动重试 | ✅（TCP 回退） | ❌ | ❌ | ❌ | ❌ |
+| 超时控制 | 独立 | 独立 | 独立 | 独立 | 独立 |
+| EDNS0 支持 | ✅ | ✅ | ✅ | ✅ | ✅ |
+| 管道化请求 | ❌ | ✅ | ✅ | ✅ | ✅ |
+
+**注意**：明文 UDP 上游在响应被截断（TC=1）时，会自动回退到 TCP 重试。
+
+---
+
+## 附录 C：健康检查与负载均衡实现细节
+
+### C.1 健康检查机制
+
+**重要结论：AdGuard Home 没有主动健康检查**
+
+系统采用**被动故障检测**机制，而非主动探活。
+
+#### 被动故障检测原理
+
+1. **正常请求作为探测**：每个发往上有的 DNS 查询同时也是一次健康检测
+2. **失败即标记**：如果查询超时或失败，该上游被视为"不健康"
+3. **RTT 加权降级**：失败的上游会被记录一个较大的 RTT（默认超时时间），从而降低其被选中的概率
+
+**文件**：`dnsproxy/proxy/exchange.go:53-64`
+
+```go
+resp, elapsed, err = p.exchange(u, req)
+if err == nil {
+    // 成功：更新实际 RTT
+    p.updateRTT(u.Address(), elapsed)
+    return resp, u, nil
+}
+
+// 失败：用默认超时时间更新 RTT，降低权重
+p.updateRTT(u.Address(), defaultTimeout)
+```
+
+`defaultTimeout` 为 10 秒（硬编码），远大于正常 RTT，因此失败的上游权重会急剧下降。
+
+#### 无主动探活的影响
+
+| 优点 | 缺点 |
+|------|------|
+| 无需额外带宽 | 故障检测依赖实际请求，可能导致用户请求失败 |
+| 实现简单 | 静默故障（上游不响应但连接正常）检测慢 |
+| 反映真实用户体验 | 无流量时无法检测故障 |
+
+### C.2 负载均衡算法详解
+
+#### 负载均衡模式（默认）
+
+**文件**：`dnsproxy/proxy/exchange.go:47`
+
+算法核心：**基于历史 RTT 的加权随机采样**
+
+```go
+w := sampleuv.NewWeighted(p.calcWeights(ups), p.randSrc)
+for i, ok := w.Take(); ok; i, ok = w.Take() {
+    // 按权重从高到低依次尝试
+}
+```
+
+#### 权重计算公式
+
+**文件**：`dnsproxy/proxy/exchange.go:129` (`calcWeights`)
+
+```
+对于每个上游 u：
+    如果没有历史统计（rttSum == 0 或 reqNum == 0）：
+        weight = 1.0  // 默认权重
+    否则：
+        avgRTT = rttSum / reqNum           // 平均响应时间（微秒）
+        weight = 1.0 / avgRTT              // 权重与平均 RTT 成反比
+```
+
+**示例**：
+- 上游 A：平均 RTT = 10ms → 权重 = 1/10000 = 0.0001
+- 上游 B：平均 RTT = 50ms → 权重 = 1/50000 = 0.00002
+- 上游 C：刚失败 → RTT = 10000ms → 权重 = 1/10000000 = 0.0000001
+
+归一化后的选择概率：
+- A: 0.0001 / 0.0001201 ≈ **83.3%**
+- B: 0.00002 / 0.0001201 ≈ **16.6%**
+- C: 0.0000001 / 0.0001201 ≈ **0.1%**
+
+#### RTT 统计结构
+
+**文件**：`dnsproxy/proxy/exchange.go:107`
+
+```go
+type upstreamRTTStats struct {
+    rttSum float64  // 所有 RTT 之和（微秒）
+    reqNum float64  // 请求次数
+}
+```
+
+统计是**累积式**的，没有滑动窗口或过期机制。随着时间推移，新的 RTT 样本会逐渐稀释旧样本的影响。
+
+#### 故障转移行为
+
+在负载均衡模式下，故障转移是**自动且渐进**的：
+
+```
+上游 A 故障（超时）
+    │
+    ▼
+updateRTT(A, 10000ms)  ← 权重急剧下降
+    │
+    ▼
+下一次请求：
+    calcWeights() → A 的权重远低于其他上游
+    w.Take() → 大概率选择其他上游
+    │
+    ├─ 其他上游成功 → 正常响应
+    │
+    └─ 所有上游都失败 → 按权重顺序逐个尝试
+        │
+        ├─ 尝试 1：权重最高的上游（最可能成功）
+        ├─ 尝试 2：次高权重的上游
+        └─ ... 直到全部失败
+```
+
+#### 并行查询模式
+
+**文件**：`dnsproxy/upstream/parallel.go:24` (`ExchangeParallel`)
+
+```go
+func ExchangeParallel(ups []Upstream, req *dns.Msg) (...) {
+    resCh := make(chan any, upsNum)
+    for _, f := range ups {
+        go exchangeAsync(f, copyReq, resCh)  // 所有上游同时发送
+    }
+
+    for range ups {
+        r, err := receiveAsyncResult(resCh)
+        if err == nil {
+            return r.Resp, r.Upstream, nil  // 返回第一个成功的
+        }
+    }
+    // 全部失败
+}
+```
+
+**行为特点**：
+- ✅ 延迟最低：取第一个成功响应
+- ❌ 带宽消耗大：N 个上游就有 N 倍流量
+- ⚠️ 失败检测慢：需要等待所有上游都失败才返回错误
+- ✅ 无故障转移延迟：同时发送，无需等待超时
+
+#### 最快地址模式
+
+仅适用于 A/AAAA 查询，在负载均衡模式的基础上额外增加 IP 连通性检测：
+
+```
+1. 并行查询所有上游，获取所有 IP 结果
+2. 对每个返回的 IP 地址进行 TCP ping（80 端口）
+3. 选择 RTT 最低的 IP 对应的响应
+4. 非 A/AAAA 查询降级到负载均衡模式
+```
+
+### C.3 故障恢复机制
+
+由于是被动检测，故障恢复同样是**渐进式**的：
+
+```
+上游 A 恢复正常
+    │
+    ▼
+某次请求（低概率）选中了 A
+    │
+    ▼
+查询成功，elapsed = 15ms
+    │
+    ▼
+updateRTT(A, 15ms)  ← 权重开始回升
+    │
+    ▼
+后续请求中 A 的权重逐渐恢复到正常水平
+```
+
+**恢复速度**取决于该上游被选中的频率，通常需要几次成功查询才能完全恢复权重。
+
+### C.4 运营建议
+
+| 场景 | 建议配置 | 原因 |
+|------|----------|------|
+| 上游可靠性高 | 负载均衡模式（默认） | 兼顾稳定性和带宽 |
+| 上游可靠性差 | 并行查询模式 + 少量上游（2-3个） | 降低故障影响 |
+| 对延迟极度敏感 | 最快地址模式（仅 A/AAAA） | 额外 IP 测速开销 |
+| 上游数量 ≥ 4 | 负载均衡模式 | 并行模式带宽开销过大 |
+| 关键业务 | 配置 Fallback 上游 | 主上游全挂时兜底 |
+| 不同上游质量差异大 | 负载均衡模式 | RTT 加权自动优选 |
