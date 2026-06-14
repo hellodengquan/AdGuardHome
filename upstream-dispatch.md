@@ -872,3 +872,433 @@ updateRTT(A, 15ms)  ← 权重开始回升
 | 上游数量 ≥ 4 | 负载均衡模式 | 并行模式带宽开销过大 |
 | 关键业务 | 配置 Fallback 上游 | 主上游全挂时兜底 |
 | 不同上游质量差异大 | 负载均衡模式 | RTT 加权自动优选 |
+
+---
+
+## 附录 D：生产流量切分日志格式与可观测性接入
+
+### D.1 查询日志（Query Log）
+
+#### 日志存储
+
+**文件**：`internal/querylog/qlog.go`
+
+查询日志以 JSON 行格式存储在 `data/querylog.json`，写入流程：
+
+```
+请求完成
+    │
+    ▼
+processQueryLogsAndStats  (dnsforward/stats.go:19)
+    │
+    ├─ s.logQuery()  →  queryLog.Add(params)
+    │    │
+    │    ├─ newLogEntry()  构建日志条目
+    │    └─ buffer.Push(entry)  推入内存环形缓冲区
+    │         │
+    │         └─ 缓冲区满 → flushLogBuffer() 写入磁盘
+    │
+    └─ s.updateStats()  →  stats.Update(entry)  统计更新
+```
+
+#### 日志条目 JSON 结构
+
+**文件**：`internal/querylog/qlog.go:183` (`newLogEntry`)、`internal/querylog/decode.go`
+
+每条日志以单行 JSON 写入，字段使用缩写键名节省空间：
+
+```json
+{
+  "T": "2025-06-14T10:30:00Z",
+  "QH": "example.com",
+  "QT": "A",
+  "QC": "IN",
+  "CP": "doh",
+  "CID": "client-abc",
+  "IP": "192.168.1.100",
+  "ECS": "192.168.1.0/24",
+  "Upstream": "https://dns.google/dns-query",
+  "Cached": false,
+  "AD": true,
+  "Elapsed": 45000000,
+  "Result": {
+    "IsFiltered": false,
+    "Reason": 0,
+    "Rules": [{"FilterListID": 1, "Text": "||ad.example.com^"}],
+    "IPList": ["1.2.3.4"],
+    "DNSRewriteResult": {"RCode": 0, "Response": {}}
+  },
+  "Answer": "<base64-encoded DNS response>",
+  "OrigAnswer": "<base64-encoded original response>"
+}
+```
+
+#### 关键字段说明
+
+| 字段 | JSON 键 | 类型 | 说明 |
+|------|---------|------|------|
+| 时间 | `T` | RFC3339 | 请求处理完成时间 |
+| 查询域名 | `QH` | string | 归一化后的 FQDN |
+| 查询类型 | `QT` | string | A/AAAA/MX/TXT 等 |
+| 查询类 | `QC` | string | 通常是 IN |
+| 客户端协议 | `CP` | string | `doh`/`doq`/`dot`/`dnscrypt`/空(明文) |
+| 客户端 ID | `CID` | string | DoH/DoQ/DoT 中的 Device ID |
+| 客户端 IP | `IP` | string | 可选匿名化处理 |
+| EDNS Client Subnet | `ECS` | string | CIDR 格式 |
+| **上游地址** | `Upstream` | string | 实际解析的上游 URL（含协议） |
+| **是否缓存** | `Cached` | bool | 命中缓存时为 true |
+| **AD 位** | `AD` | bool | DNSSEC 验证通过 |
+| **处理耗时** | `Elapsed` | int64 | 纳秒，完整处理耗时 |
+| 响应体 | `Answer` | base64 | 发送给客户端的响应 |
+| 原始响应 | `OrigAnswer` | base64 | 上游原始响应（被过滤修改时） |
+| 过滤结果 | `Result` | object | 过滤规则命中信息 |
+
+#### 上游分流关键字段
+
+运营复盘时，以下字段组合可完整还原流量切分路径：
+
+```
+Upstream + Cached + CP + CID
+```
+
+| 排查场景 | 关键字段组合 | 用法 |
+|----------|-------------|------|
+| 哪些请求走了某个上游 | `Upstream == "tls://dns.example.com:853"` | 确认域名分流是否生效 |
+| 缓存命中率 | `Cached == true` 占比 | 评估缓存效果 |
+| 客户端自定义上游是否生效 | `CID + Upstream` | 确认特定客户端是否走了专属上游 |
+| 加密协议分布 | `CP` 分组统计 | 评估 DoH/DoT/DoQ 采纳率 |
+| DNSSEC 验证状态 | `AD == true` 占比 | 评估 DNSSEC 启用影响 |
+| 响应延迟 P99 | `Elapsed` 按 `Upstream` 分组 | 识别慢上游 |
+| 过滤规则命中率 | `Result.IsFiltered + Result.Rules` | 评估过滤效果 |
+
+### D.2 HTTP API 接入
+
+**文件**：`internal/querylog/http.go:64`
+
+| API | 方法 | 用途 |
+|-----|------|------|
+| `/control/querylog` | GET | 查询日志（支持搜索、分页、过滤） |
+| `/control/querylog/config` | GET | 获取日志配置 |
+| `/control/querylog/config/update` | PUT | 更新日志配置 |
+| `/control/querylog_clear` | POST | 清空日志 |
+
+查询参数：
+
+```
+GET /control/querylog?search=example.com&response_status=filtered&limit=100&offset=0&older_than=2025-06-14T00:00:00Z
+```
+
+| 参数 | 说明 |
+|------|------|
+| `search` | 域名搜索（支持 IDNA） |
+| `response_status` | 过滤状态：`filtered`/`not_filtered`/`blocked` |
+| `reason` | 过滤原因（可多个） |
+| `limit` | 返回条数 |
+| `offset` | 偏移量 |
+| `older_than` | 时间游标分页 |
+
+### D.3 上游统计（UpstreamStatistics）
+
+**文件**：`dnsproxy/proxy/stats.go:143`
+
+每次请求完成后，dnsproxy 层会收集详细的上游统计信息，可通过 `DNSContext.QueryStatistics()` 获取：
+
+```go
+type UpstreamStatistics struct {
+    Error         error        // 查询错误（如果有）
+    Address       string       // 上游地址
+    QueryDuration time.Duration // 查询耗时
+    IsCached      bool         // 是否命中缓存
+}
+```
+
+统计数据的收集场景：
+
+| 场景 | Main 统计 | Fallback 统计 |
+|------|-----------|---------------|
+| 主上游成功 | 成功上游的耗时 | 空 |
+| 主上游成功（最快地址模式） | 所有上游的耗时/错误 | 空 |
+| 主上游失败，Fallback 成功 | 所有主上游的错误 | 成功 Fallback 的耗时 |
+| 全部失败 | 所有主上游的错误 | 所有 Fallback 的错误 |
+| 命中缓存 | IsCached=true 的单条 | 空 |
+
+### D.4 统计模块（Stats）
+
+**文件**：`internal/dnsforward/stats.go:142`
+
+统计模块记录聚合指标，写入 `stats.Entry`：
+
+```go
+type Entry struct {
+    UpstreamStats  []*proxy.UpstreamStatistics
+    Domain         string
+    Result         Result  // RNotFiltered/RSafeBrowsing/RParental/RSafeSearch/RFiltered
+    ProcessingTime time.Duration
+    Client         string  // ClientID 或 IP
+}
+```
+
+### D.5 可观测性接入点汇总
+
+```
+请求进入
+    │
+    ├─ [抓点1] dnsproxy slog 日志
+    │   ├─ "sending request"    addr= upstream= proto= qtype= qname=
+    │   ├─ "response received"  addr= proto= status=ok/timeout
+    │   ├─ "exchange failed"    upstream= question= duration= error=
+    │   ├─ "using fallback"     error=
+    │   └─ "replying from cache" source= ecs_enabled=
+    │
+    ├─ [抓点2] dnsproxy RTT 统计（内存）
+    │   └─ upstreamRTTStats[address] → {rttSum, reqNum}
+    │
+    ├─ [抓点3] QueryStatistics（每次请求）
+    │   └─ DNSContext.QueryStatistics() → Main[] + Fallback[]
+    │
+    ▼
+请求完成
+    │
+    ├─ [抓点4] QueryLog（持久化）
+    │   └─ /control/querylog API + querylog.json 文件
+    │
+    ├─ [抓点5] Stats（聚合统计）
+    │   └─ /control/stats API
+    │
+    └─ [抓点6] dnsforward slog 日志
+        └─ 各模块 Debug/Error 级别日志
+```
+
+---
+
+## 附录 E：IPv6 上游路径分析
+
+### E.1 核心结论：IPv6 与 IPv4 共用同一套调度链路
+
+AdGuard Home 的上游分流逻辑**不区分 IPv4 和 IPv6**。无论是 A 记录查询还是 AAAA 记录查询，都走完全相同的 `selectUpstreams` → `getUpstreamsForDomain` → `exchangeUpstreams` 路径。
+
+代码中没有任何基于查询类型（A vs AAAA）来选择不同上游的逻辑。
+
+### E.2 AAAA 查询的特殊处理
+
+唯一与 IPv6 相关的特殊处理在 **dnsforward 层的过滤阶段**，而非上游选择阶段：
+
+**文件**：`internal/dnsforward/process.go:117`
+
+```go
+if s.conf.AAAADisabled && qt == dns.TypeAAAA {
+    // AAAA 查询被拦截，返回空响应，不转发到上游
+}
+```
+
+当 `AAAADisabled`（即 UI 中的"禁止 IPv6"选项）开启时：
+
+```
+AAAA 查询到达
+    │
+    ├─ AAAADisabled == true？
+    │   └─ 是 → 返回空 AAAA 响应（NODATA），不进入上游转发
+    │
+    └─ 否 → 走正常分流路径（与 A 查询完全相同）
+```
+
+### E.3 IPv6 地址在上游配置中的使用
+
+IPv6 地址可以作为上游地址使用，与 IPv4 地址地位完全平等：
+
+```
+# IPv4 上游
+1.1.1.1
+8.8.8.8
+
+# IPv6 上游
+2606:4700:4700::1111
+[2606:4700:4700::1111]:53
+
+# DoH IPv6 上游
+https://[2606:4700:4700::1111]/dns-query
+```
+
+所有上游地址都通过 `AddressToUpstream` 解析，IPv4 和 IPv6 的处理路径完全相同。
+
+### E.4 Bootstrap 解析中的 IPv6 偏好
+
+**文件**：`internal/dnsforward/http.go:737`、`dnsproxy/upstream/upstream.go:409`
+
+当上游地址是域名（而非 IP）时，Bootstrap 解析器会解析该域名。有一个 `PreferIPv6` 选项：
+
+```go
+// PreferIPv6 tells the bootstrapper to prefer IPv6 addresses for an upstream.
+PreferIPv6 bool
+```
+
+- 默认为 `false`，Bootstrap 优先返回 IPv4 地址
+- 设置为 `true` 时，Bootstrap 优先返回 IPv6 地址
+- 这只影响 Bootstrap 解析上游域名时的地址选择，不影响 DNS 请求的分流
+
+### E.5 DNS64 合成中的 IPv6 特殊路径
+
+**文件**：`dnsproxy/proxy/proxy.go:602`
+
+DNS64 功能是一个与 IPv6 相关的特殊路径：
+
+```
+DNS64 合成流程：
+    │
+    ├─ 客户端发送 AAAA 查询
+    ├─ 上游返回空 AAAA 响应（无 AAAA 记录）
+    ├─ 自动发起 A 查询获取 IPv4 地址
+    ├─ 将 IPv4 地址映射为 IPv6 地址（使用配置的 NAT64 前缀）
+    └─ 返回合成的 AAAA 响应
+```
+
+但 DNS64 合成**发生在上游交换之后**，不影响上游选择逻辑。A 查询和 AAAA 查询都走相同的上游。
+
+### E.6 最快地址模式对 IPv6 的影响
+
+在最快地址模式下，AAAA 查询返回的 IPv6 地址同样参与测速：
+
+```
+AAAA 查询 → 所有上游并行查询 → 收集 IPv6 地址
+    │
+    ├─ 对每个 IPv6 地址进行 TCP ping（80 端口）
+    └─ 选择 RTT 最低的 IPv6 地址
+```
+
+注意：测速使用 TCP 连接到端口 80，IPv6 地址的连通性可能不如 IPv4 稳定，这可能导致最快地址模式对 IPv6 结果的选择存在偏差。
+
+---
+
+## 附录 F：DNSSEC 验证对加密协议响应延迟的影响评估
+
+### F.1 AdGuard Home 的 DNSSEC 处理模式
+
+**核心结论：AdGuard Home 不执行 DNSSEC 验证，只传递 DNSSEC 记录**
+
+AdGuard Home 是**递归代理**而非**验证解析器**。它不会对响应进行 DNSSEC 验证，而是：
+
+1. 在发往上游的请求中设置 DO（DNSSEC OK）位
+2. 将上游返回的 DNSSEC 记录（RRSIG、DNSKEY、DS、NSEC 等）原样传递给客户端
+3. 将上游返回的 AD（Authenticated Data）位按规则传递
+
+### F.2 DO 位的设置逻辑
+
+**文件**：`dnsproxy/proxy/proxy.go:673` (`addDO`)、`dnsproxy/proxy/proxy.go:700-711` (`Resolve`)
+
+```
+Resolve 入口
+    │
+    ├─ 缓存启用？
+    │   └─ 是 → addDO(req)  设置 DO 位
+    │       │
+    │       ├─ DNSSECEnabled == true？
+    │       │   └─ 是 → 强制设置 DO=1（无论客户端是否请求）
+    │       │
+    │       └─ DNSSECEnabled == false？
+    │           └─ 仅当客户端请求中 DO=1 时保留
+    │
+    └─ 缓存未启用？
+        └─ DO 位取决于客户端请求（不修改）
+```
+
+### F.3 AD 位和 DNSSEC 记录的过滤逻辑
+
+**文件**：`dnsproxy/proxy/cache.go:641` (`filterMsg`)
+
+响应返回给客户端前，会根据客户端的 DO 和 AD 位过滤：
+
+```go
+func filterMsg(dst, m *dns.Msg, ad, do bool, ttl uint32) {
+    // AD 位仅在客户端请求了 AD 或 DO 时才保留
+    dst.AuthenticatedData = dst.AuthenticatedData && (ad || do)
+
+    // DNSSEC RR 仅在客户端请求了 DO 时才保留
+    dst.Answer = filterRRSlice(m.Answer, do, ttl, qtype)
+    dst.Ns = filterRRSlice(m.Ns, do, ttl, dns.TypeNone)
+    dst.Extra = filterRRSlice(m.Extra, do, ttl, dns.TypeNone)
+}
+```
+
+| 客户端 DO 位 | 客户端 AD 位 | 响应中 AD 位 | DNSSEC RR |
+|-------------|-------------|-------------|-----------|
+| 0 | 0 | **清除** | **移除** |
+| 0 | 1 | 保留 | 移除 |
+| 1 | 0 | 保留 | **保留** |
+| 1 | 1 | 保留 | 保留 |
+
+### F.4 对响应延迟的影响分析
+
+#### 直接延迟影响：DNSSEC 记录增大响应体积
+
+DNSSEC 记录会显著增加响应报文大小：
+
+| 查询类型 | 无 DNSSEC | 有 DNSSEC | 增量 |
+|----------|-----------|-----------|------|
+| A 记录 | ~60 bytes | ~500 bytes | +440 bytes |
+| AAAA 记录 | ~70 bytes | ~550 bytes | +480 bytes |
+| DNSKEY | ~100 bytes | ~1200 bytes | +1100 bytes |
+
+#### 按协议的延迟影响
+
+| 协议 | DNSSEC 对延迟的影响 | 原因 |
+|------|---------------------|------|
+| **UDP** | ⚠️ **高** | 响应可能超过 EDNS0 UDP 大小（默认 2048），触发 TCP 回退，增加 1-2 个 RTT |
+| **TCP** | 低 | 支持 64KiB 报文，无截断问题 |
+| **DoT** | 低 | 基于 TCP，无截断问题 |
+| **DoH** | 低 | HTTP 传输无大小限制 |
+| **DoQ** | 低 | QUIC 流无大小限制 |
+
+**UDP 回退场景**（延迟影响最大）：
+```
+1. 客户端发送 UDP 查询（DO=1）
+2. AdGuard Home 转发到上游（DO=1）
+3. 上游返回带 DNSSEC 的响应，大小 > UDP 缓冲区
+4. 响应被截断（TC=1 标志）
+5. AdGuard Home 自动回退到 TCP 重新查询
+6. 返回完整响应给客户端
+
+额外延迟 = 1次 TCP 握手 + 1次 TCP 查询
+         ≈ 1-3ms（本地网络）/ 50-200ms（远程上游）
+```
+
+#### DNSSEC 启用对缓存的影响
+
+当 `DNSSECEnabled=true` 时，缓存行为有所不同：
+
+1. **缓存命中率降低**：DNSSEC 记录会随 RRSIG 过期而失效，即使 TTL 未到期
+2. **缓存空间占用增大**：带 DNSSEC 的响应体积更大
+3. **CD（Checking Disabled）位不缓存**：客户端设置 CD 位时，响应不会被缓存，防止缓存污染
+
+### F.5 延迟影响量化估算
+
+#### 场景1：DNSSEC 关闭 vs 开启（UDP 客户端）
+
+| 阶段 | DNSSEC 关闭 | DNSSEC 开启 | 差异 |
+|------|-------------|-------------|------|
+| 请求发送 | ~0.1ms | ~0.1ms | 无 |
+| 上游查询 | 10-50ms | 10-50ms | 无（上游处理时间不变） |
+| 响应传输 | ~0.5ms | ~0.5ms | 无（多数情况） |
+| TCP 回退 | 无 | 可能 +50-200ms | **最大差异** |
+| **总延迟** | 10-50ms | 10-250ms | 最坏 +200ms |
+
+#### 场景2：加密协议（DoH/DoT/DoQ）
+
+| 阶段 | DNSSEC 关闭 | DNSSEC 开启 | 差异 |
+|------|-------------|-------------|------|
+| 连接建立 | 已复用 | 已复用 | 无 |
+| 请求发送 | ~0.5ms | ~0.5ms | 无 |
+| 上游查询 | 10-50ms | 10-50ms | 无 |
+| 响应传输 | ~1ms | ~1-2ms | +0-1ms（报文稍大） |
+| **总延迟** | 12-52ms | 12-53ms | **几乎无影响** |
+
+### F.6 运营建议
+
+| 场景 | 建议 | 原因 |
+|------|------|------|
+| 客户端主要使用 UDP | 谨慎开启 DNSSEC | 可能触发 TCP 回退，增加延迟 |
+| 客户端主要使用加密协议 | 可安全开启 DNSSEC | 无截断风险，延迟影响极小 |
+| 缓存命中率优先 | 谨慎开启 DNSSEC | RRSIG 过期导致缓存提前失效 |
+| 客户端需要 DNSSEC 验证 | 必须开启 | 客户端需要 RRSIG 等记录进行验证 |
+| 混合协议环境 | 开启 DNSSEC + 增大 UDP 缓冲区 | 减少 TCP 回退概率 |
+
+**增大 UDP 缓冲区的方式**：在客户端请求的 EDNS0 中 UDP Size 通常为 4096，AdGuard Home 默认请求 2048。如果上游支持，较大的 UDP Size 可以避免 DNSSEC 响应被截断。
