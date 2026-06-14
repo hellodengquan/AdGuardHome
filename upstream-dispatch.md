@@ -1302,3 +1302,673 @@ DNSSEC 记录会显著增加响应报文大小：
 | 混合协议环境 | 开启 DNSSEC + 增大 UDP 缓冲区 | 减少 TCP 回退概率 |
 
 **增大 UDP 缓冲区的方式**：在客户端请求的 EDNS0 中 UDP Size 通常为 4096，AdGuard Home 默认请求 2048。如果上游支持，较大的 UDP Size 可以避免 DNSSEC 响应被截断。
+
+---
+
+## 附录 G：响应缓存命中策略与上游分流的关系
+
+### G.1 缓存与上游分流的执行顺序
+
+**文件**：`dnsproxy/proxy/proxy.go:695` (`Resolve`)
+
+```
+Resolve 入口
+    │
+    ├─ 步骤1：EDNS Client Subnet 处理
+    │
+    ├─ 步骤2：DO 位设置（DNSSEC 相关）
+    │
+    ├─ 步骤3：缓存检查（replyFromCache）⭐
+    │   │
+    │   ├─ 命中缓存？
+    │   │   │
+    │   │   ├─ 是 → 直接返回缓存结果
+    │   │   │   │
+    │   │   │   └─ 乐观缓存且过期？
+    │   │   │       └─ 是 → 后台 goroutine 异步刷新缓存（仍走上游选择）
+    │   │   │
+    │   │   └─ 否 → 继续下一步
+    │   │
+    │   └─ **关键结论：缓存命中时，不触发上游选择**
+    │
+    └─ 步骤4：上游选择与交换（replyFromUpstream）
+         │
+         ├─ selectUpstreams
+         ├─ exchangeUpstreams
+         └─ Fallback 回退
+```
+
+### G.2 缓存命中时的行为细节
+
+**文件**：`dnsproxy/proxy/proxycache.go:19` (`replyFromCache`)
+
+当缓存命中时，系统会：
+
+1. **跳过所有上游选择逻辑**：`selectUpstreams`、`getUpstreamsForDomain`、`exchangeUpstreams` 都不会执行
+2. **设置响应**：`d.Res = ci.m` 直接从缓存取出响应
+3. **记录统计**：`d.queryStatistics = cachedQueryStatistics(ci.u)` 记录为缓存命中
+4. **日志记录**：`"replying from cache" source="general cache" ecs_enabled=false`
+
+缓存条目存储了原始解析的上游地址，日志中可以看到该请求最初由哪个上游解析：
+```go
+type cacheItem struct {
+    m   *dns.Msg  // 缓存的响应报文
+    u   string    // 原始解析的上游地址（如 "tls://dns.google:853"）
+    ttl uint32    // 剩余 TTL
+}
+```
+
+### G.3 乐观缓存（Optimistic Cache）的特殊行为
+
+**文件**：`dnsproxy/proxy/proxycache.go:49-63`、`dnsproxy/proxy/optimisticresolver.go`
+
+当 `CacheOptimistic` 启用时，已过期的缓存条目仍会返回给客户端，同时**在后台触发一次上游刷新**：
+
+```
+缓存命中但已过期（乐观缓存启用）
+    │
+    ├─ 前台：立即返回过期缓存给客户端（不阻塞）
+    │
+    └─ 后台：启动 goroutine 异步刷新
+         │
+         └─ go p.shortFlighter.resolveOnce(minCtxClone, key, logger)
+              │
+              ├─ 检查是否已有相同请求在刷新（防重复）
+              │
+              └─ 正常执行完整的上游选择流程：
+                   ├─ replyFromUpstream
+                   │   ├─ selectUpstreams
+                   │   ├─ getUpstreamsForDomain
+                   │   └─ exchangeUpstreams
+                   │
+                   └─ 成功 → cacheResp 更新缓存
+```
+
+**关键**：后台刷新会走完整的上游选择逻辑，**会应用最新的分流策略**。
+
+### G.4 缓存隔离：普通缓存 vs 自定义上游缓存
+
+**文件**：`dnsproxy/proxy/proxycache.go:9` (`cacheForContext`)
+
+不同配置的客户端使用独立的缓存，不会互相干扰：
+
+```go
+func (p *Proxy) cacheForContext(d *DNSContext) (c *cache) {
+    if d.CustomUpstreamConfig != nil && d.CustomUpstreamConfig.cache != nil {
+        // 有自定义上游配置的客户端，使用独立缓存
+        return d.CustomUpstreamConfig.cache
+    }
+    // 默认使用全局缓存
+    return p.cache
+}
+```
+
+这意味着：
+- 普通客户端共享一份全局缓存
+- 有自定义上游的客户端有自己独立的缓存
+- 按客户端分流后的响应不会污染全局缓存
+
+### G.5 缓存 Key 计算
+
+缓存 Key 区分以下维度：
+
+| 维度 | 说明 |
+|------|------|
+| 查询域名 | 归一化后的 FQDN |
+| 查询类型 | A/AAAA/MX 等 |
+| 查询类 | 通常是 IN |
+| EDNS Client Subnet | 有 ECS 时使用独立的子网缓存 |
+| DO 位 | DNSSEC 请求有 DO 位时使用独立缓存 |
+
+因此，同一个域名的 A 查询和 AAAA 查询会有独立的缓存条目，不会互相影响上游分流统计。
+
+### G.6 缓存未命中后的上游选择
+
+当缓存未命中时，执行完整的上游选择流程，此时分流策略完全生效。
+
+**注意**：如果两个相同请求同时到达且都未命中缓存，只有第一个会发往上有，第二个会等待第一个完成后复用结果（见附录 H.3 合并请求机制）。
+
+### G.7 对分流统计的影响
+
+缓存命中对上游分流统计的影响：
+
+1. **查询日志**：`Cached=true`，`Upstream` 字段记录原始解析的上游地址
+2. **RTT 统计**：缓存命中不会更新 `upstreamRTTStats`，只有实际上游查询才会更新
+3. **QueryStatistics**：标记为 `IsCached=true`
+
+运营分析时需要注意：
+- `Cached=true` 的请求不计入上游实际流量
+- 高缓存命中率会降低上游分流策略的实际生效比例
+- 上游切换后，缓存中的旧条目仍会被使用直到过期
+
+---
+
+## 附录 H：超时上游的 In-Flight Goroutine 与并发控制
+
+### H.1 整体并发上限控制
+
+**文件**：`dnsproxy/proxy/proxy.go:72` (`requestsSema`)、`dnsproxy/proxy/proxy.go:255-260`
+
+AdGuard Home 通过**信号量**控制同时处理的最大请求数，防止 goroutine 无限制增长：
+
+```go
+type Proxy struct {
+    // requestsSema limits the number of simultaneous requests.
+    requestsSema syncutil.Semaphore
+}
+
+// 初始化时
+if p.MaxGoroutines > 0 {
+    p.requestsSema = syncutil.NewChanSemaphore(p.MaxGoroutines)
+} else {
+    p.requestsSema = syncutil.EmptySemaphore{}  // 不限制
+}
+```
+
+#### MaxGoroutines 配置
+
+**文件**：`dnsproxy/proxy/config.go:162`
+
+```go
+// MaxGoroutines is the maximum number of goroutines processing DNS
+// requests simultaneously.  The proxy relies on the Go runtime's ability to
+// handle a large number of goroutines.  The value of zero means that the
+// number of goroutines is unlimited.
+MaxGoroutines uint
+```
+
+### H.2 各协议的信号量获取逻辑
+
+所有入站协议在处理请求前都会尝试获取信号量：
+
+#### UDP 协议
+**文件**：`dnsproxy/proxy/serverudp.go:85-114`
+
+```go
+func (p *Proxy) udpPacketLoop(ctx context.Context, conn *net.UDPConn, reqSema syncutil.Semaphore) {
+    for p.isStarted() {
+        n, _, _, err := proxynetutil.UDPRead(conn, b, p.udpOOBSize)
+        if n > 0 {
+            // 先获取信号量
+            sErr := reqSema.Acquire(ctx)
+            if sErr != nil {
+                break  // 获取失败，停止监听
+            }
+            // 获取成功后才启动 goroutine 处理
+            go func() {
+                defer reqSema.Release()  // 处理完成释放
+                p.udpHandlePacket(ctx, packet, localIP, remoteAddr, conn)
+            }()
+        }
+    }
+}
+```
+
+#### TCP / DoT 协议
+**文件**：`dnsproxy/proxy/servertcp.go:92`
+
+逻辑与 UDP 相同，也是在处理每个连接前获取信号量。
+
+#### DoQ 协议
+**文件**：`dnsproxy/proxy/serverquic.go:124`、`dnsproxy/proxy/serverquic.go:211`
+
+QUIC 有两处获取信号量：连接建立时和流处理时。
+
+#### DoH 协议
+**文件**：`dnsproxy/proxy/serverhttps.go:252`
+
+HTTP 服务器在 `ServeHTTP` 中获取信号量。
+
+### H.3 合并相同请求（Pending Requests）
+
+**文件**：`dnsproxy/proxy/pending.go`
+
+在并发场景下，相同的请求会被合并，避免重复发往上有：
+
+```go
+type pendingRequests interface {
+    // 入队请求，如果已有相同请求在处理，阻塞等待其完成
+    queue(ctx context.Context, dctx *DNSContext) (loaded bool, err error)
+    // 请求完成，唤醒等待的请求
+    done(ctx context.Context, dctx *DNSContext, err error)
+}
+```
+
+**执行流程**：
+
+```
+请求A（example.com A）到达 → 未命中缓存
+    │
+    ├─ pending.queue() → 无相同请求，返回 loaded=false
+    │
+    ├─ 执行上游选择与交换（耗时 100ms）
+    │
+    └─ pending.done() → 存储结果，关闭 finish channel
+
+请求B（example.com A）到达（请求A进行中）
+    │
+    ├─ pending.queue() → 发现已有相同请求
+    │
+    └─ <-pending.finish  → 阻塞等待 80ms
+         │
+         └─ 请求A完成 → 复用请求A的响应
+```
+
+**Key 组成**：
+- 无 ECS：域名 + 查询类型 + 查询类 + DO 位
+- 有 ECS：域名 + 查询类型 + 查询类 + DO 位 + ECS 子网 + 前缀长度
+
+### H.4 上游超时与 In-Flight Goroutine
+
+**文件**：`dnsproxy/proxy/exchange.go:40`、`dnsproxy/upstream/upstream.go`
+
+每个上游查询有独立的超时控制，超时后 goroutine 不会立即退出：
+
+#### 负载均衡模式
+```go
+for i, ok := w.Take(); ok; i, ok = w.Take() {
+    u := ups[i]
+    resp, elapsed, err = p.exchange(u, req)
+    if err == nil {
+        p.updateRTT(u.Address(), elapsed)
+        return resp, u, nil
+    }
+    // 失败：用默认超时（10秒）更新 RTT，降低权重
+    p.updateRTT(u.Address(), defaultTimeout)
+    // 继续尝试下一个上游
+}
+```
+
+**关键**：当前上游超时后，goroutine 会立即尝试下一个上游，不会阻塞等待。失败的上游连接由 Go 运行时的网络库在后台处理超时。
+
+#### 并行查询模式
+**文件**：`dnsproxy/upstream/parallel.go:24`
+
+```go
+func ExchangeParallel(ups []Upstream, req *dns.Msg) (*dns.Msg, Upstream, error) {
+    resCh := make(chan any, upsNum)
+    for _, f := range ups {
+        // 所有上游同时启动 goroutine
+        go exchangeAsync(f, copyReq, resCh)
+    }
+
+    for range ups {
+        r, err := receiveAsyncResult(resCh)
+        if err == nil {
+            return r.Resp, r.Upstream, nil  // 第一个成功就返回
+        }
+    }
+    // 所有失败才返回
+}
+```
+
+**问题**：第一个上游成功返回后，其他仍在运行的 goroutine 不会被取消，会继续执行直到超时或完成。这可能导致短时间内有大量 in-flight goroutine。
+
+### H.5 In-Flight Goroutine 数量计算
+
+最坏情况下的 goroutine 数量估算：
+
+```
+同时处理的请求数 = MaxGoroutines
+
+每个请求的 goroutine 数：
+  - UDP/TCP/DoT/DoQ：1 个主 goroutine
+  - 并行查询模式：1 + N（上游数量）个 goroutine
+  - 乐观缓存：可能额外 1 个后台 goroutine
+  - 合并请求：相同请求只产生 1 组查询 goroutine
+
+最坏情况（并行查询 + 10 个上游 + MaxGoroutines=0 不限）：
+  并发 1000 请求 × 10 上游 = 10,000 in-flight goroutine
+```
+
+Go 运行时可以轻松处理数万 goroutine，但内存占用需要关注：
+- 每个 goroutine 初始栈 = 2KB
+- 10,000 goroutine ≈ 20MB 内存（栈）+ 报文缓冲区
+
+### H.6 超时控制层级
+
+| 层级 | 超时设置 | 说明 |
+|------|----------|------|
+| 请求上下文 | `p.reqCtx.New(ctx)` | 总请求超时（由配置决定） |
+| 上游交换 | `defaultTimeout = 10s` | 单个上游查询的硬超时（硬编码） |
+| 连接超时 | `upstream.timeout` | TCP/TLS 连接建立超时 |
+| 读写超时 | 上游实现内部 | 单次网络读写超时 |
+
+### H.7 故障转移时的 Goroutine 行为
+
+| 模式 | 上游超时后的行为 | In-Flight Goroutine |
+|------|-----------------|---------------------|
+| 负载均衡 | 立即尝试下一个上游 | N（顺序尝试，同一时间只有1个活跃） |
+| 并行查询 | 继续等待其他上游结果 | N（同时活跃，直到全部返回或超时） |
+| 最快地址 | 先等所有上游返回，再测速 | N（同时活跃） |
+| Fallback 回退 | 先等所有主上游失败，再并行查 Fallback | N 主 + M Fallback |
+
+### H.8 运营建议
+
+| 场景 | 建议配置 | 原因 |
+|------|----------|------|
+| 高并发环境 | 设置 `MaxGoroutines`（如 1000） | 防止 goroutine 爆炸 |
+| 上游数量多（≥5） | 使用负载均衡模式 | 减少 in-flight goroutine |
+| 对延迟敏感 | 并行查询 + 少量上游（2-3） | 控制 goroutine 数量 |
+| 高可靠性要求 | 启用合并请求 + 合理超时 | 减少重复查询 |
+| 内存受限 | 增大上游超时（>10s）或减少上游数 | 减少积压的 goroutine |
+
+---
+
+## 附录 I：自定义上游规则的匹配优先级与冲突策略
+
+### I.1 规则匹配优先级总览
+
+**文件**：`dnsproxy/proxy/upstreams.go:382` (`getUpstreamsForDomain`)
+
+配置语法示例：
+```
+# 1. 精确匹配：只有 www.example.com 走这个上游
+[/www.example.com/]1.1.1.1
+
+# 2. 保留域匹配：example.com 及其所有子域走这个上游
+[/example.com/]2.2.2.2
+
+# 3. 仅子域匹配：*.example.com 走这个，但 example.com 本身不走
+[/*.example.com/]3.3.3.3
+
+# 4. 排除域：maps.example.com 走默认上游
+[/maps.example.com/]#
+
+# 5. 单标签域名走专用上游
+[/ /]4.4.4.4
+
+# 6. 默认上游
+8.8.8.8
+9.9.9.9
+```
+
+匹配优先级从高到低：
+
+```
+优先级 1：精确域名匹配（SpecifiedDomainUpstreams）
+    ↓
+优先级 2：子域排除 + 上级保留匹配（SubdomainExclusions）
+    ↓
+优先级 3：域名保留匹配（DomainReservedUpstreams）
+    ↓
+优先级 4：逐级向上匹配（父域匹配）
+    ↓
+优先级 5：默认上游（Upstreams）
+```
+
+### I.2 核心匹配逻辑详解
+
+**文件**：`dnsproxy/proxy/upstreams.go:382-411`
+
+```go
+func (uc *UpstreamConfig) getUpstreamsForDomain(fqdn string) (ups []upstream.Upstream) {
+    // 快速路径：没有任何域特定规则，直接返回默认上游
+    if len(uc.DomainReservedUpstreams) == 0 {
+        return uc.Upstreams
+    }
+
+    fqdn = strings.ToLower(fqdn)
+
+    // 优先级 2：检查是否在子域排除集合中
+    if uc.SubdomainExclusions.Has(fqdn) {
+        return uc.lookupSubdomainExclusion(fqdn)
+    }
+
+    // 优先级 1+3：先精确匹配，再保留域匹配
+    ups, ok := uc.lookupUpstreams(fqdn)
+    if ok {
+        return ups
+    }
+
+    // 优先级 4：逐级向上匹配
+    firstLabel, fqdn, _ := strings.Cut(fqdn, labelSep)
+    if firstLabel != "" && fqdn == "" {
+        fqdn = UnqualifiedNames  // 单标签域名的特殊键
+    }
+
+    for fqdn != "" {
+        if ups, ok = uc.lookupUpstreams(fqdn); ok {
+            return ups
+        }
+        _, fqdn, _ = strings.Cut(fqdn, labelSep)
+    }
+
+    // 优先级 5：默认上游兜底
+    return uc.Upstreams
+}
+```
+
+### I.3 精确匹配 vs 保留域匹配
+
+**文件**：`dnsproxy/proxy/upstreams.go:449` (`lookupUpstreams`)
+
+```go
+func (uc *UpstreamConfig) lookupUpstreams(name string) (ups []upstream.Upstream, ok bool) {
+    // 先查 DomainReservedUpstreams（包含精确和保留域）
+    ups, ok = uc.DomainReservedUpstreams[name]
+    if !ok {
+        return ups, false
+    }
+
+    if len(ups) == 0 {
+        // 空列表表示该域被排除，回退到默认上游
+        ups = uc.Upstreams
+    }
+
+    return ups, true
+}
+```
+
+**精确匹配**（`SpecifiedDomainUpstreams`）和**保留域匹配**（`DomainReservedUpstreams`）的区别在配置解析阶段确定：
+- `[/www.example.com/]1.1.1.1` → 存入 `SpecifiedDomainUpstreams["www.example.com."]`
+- `[/example.com/]2.2.2.2` → 存入 `DomainReservedUpstreams["example.com."]`
+
+两者在同一个 map 中查找，精确匹配的优先级体现在先查找完整域名。
+
+### I.4 子域排除规则详解
+
+**文件**：`dnsproxy/proxy/upstreams.go:431` (`lookupSubdomainExclusion`)
+
+子域排除规则（`[/*.example.com/]`）的匹配逻辑：
+
+```go
+func (uc *UpstreamConfig) lookupSubdomainExclusion(host string) (u []upstream.Upstream) {
+    // 步骤1：先尝试精确匹配该子域
+    ups, ok := uc.SpecifiedDomainUpstreams[host]
+    if ok && len(ups) > 0 {
+        return ups
+    }
+
+    // 步骤2：没有精确匹配，使用父域的保留配置
+    h := strings.SplitAfterN(host, labelSep, 2)
+    ups, ok = uc.DomainReservedUpstreams[h[1]]
+    if ok && len(ups) > 0 {
+        return ups
+    }
+
+    // 步骤3：父域也没有，回退到默认上游
+    return uc.Upstreams
+}
+```
+
+**示例**：配置 `[/*.example.com/]3.3.3.3`
+
+| 查询域名 | 匹配结果 | 说明 |
+|----------|---------|------|
+| `sub.example.com` | 3.3.3.3 | 子域，使用子域排除配置 |
+| `www.sub.example.com` | 3.3.3.3 | 先匹配自身（不在 SubdomainExclusions），然后逐级向上匹配到 `sub.example.com`（在 SubdomainExclusions），再匹配到父域 `example.com` 的子域排除配置 |
+| `example.com` | 2.2.2.2 | 自身不在 SubdomainExclusions，走正常保留域匹配 |
+
+### I.5 排除域（空上游列表）
+
+配置 `[/maps.example.com/]#` 会在 `DomainReservedUpstreams` 中存储一个空列表：
+
+```go
+DomainReservedUpstreams["maps.example.com."] = []Upstream{}
+```
+
+匹配时（`lookupUpstreams`）检测到空列表，会回退到默认上游：
+```go
+if len(ups) == 0 {
+    ups = uc.Upstreams  // 回退到默认上游
+}
+```
+
+### I.6 多规则冲突场景分析
+
+#### 场景1：精确匹配 vs 保留域
+
+```
+配置：
+[/www.example.com/]1.1.1.1  (精确)
+[/example.com/]2.2.2.2      (保留)
+```
+
+| 查询域名 | 命中规则 | 使用上游 |
+|----------|---------|----------|
+| `www.example.com` | 精确匹配 | 1.1.1.1 |
+| `sub.example.com` | 保留域 `example.com` | 2.2.2.2 |
+| `example.com` | 保留域 `example.com` | 2.2.2.2 |
+
+#### 场景2：子域排除 vs 保留域
+
+```
+配置：
+[/*.example.com/]3.3.3.3    (仅子域)
+[/example.com/]2.2.2.2      (保留)
+```
+
+| 查询域名 | 命中规则 | 使用上游 |
+|----------|---------|----------|
+| `sub.example.com` | 子域排除 + 父域保留 | 3.3.3.3 |
+| `example.com` | 保留域 | 2.2.2.2 |
+
+#### 场景3：子域精确匹配 vs 父域子域排除
+
+```
+配置：
+[/www.example.com/]1.1.1.1  (精确)
+[/*.example.com/]3.3.3.3    (仅子域)
+```
+
+| 查询域名 | 命中规则 | 使用上游 |
+|----------|---------|----------|
+| `www.example.com` | 子域排除 → 精确匹配 | 1.1.1.1 |
+| `sub.example.com` | 子域排除 → 父域保留 | 3.3.3.3 |
+
+#### 场景4：排除域 vs 保留域
+
+```
+配置：
+[/maps.example.com/]#       (排除)
+[/example.com/]2.2.2.2      (保留)
+[/com/]5.5.5.5              (顶级域保留)
+```
+
+| 查询域名 | 命中规则 | 使用上游 |
+|----------|---------|----------|
+| `maps.example.com` | 精确匹配到空列表 → 回退默认 | 8.8.8.8 |
+| `www.example.com` | 保留域 `example.com` | 2.2.2.2 |
+| `other.com` | 保留域 `com` | 5.5.5.5 |
+
+#### 场景5：多级保留域
+
+```
+配置：
+[/sub.example.com/]4.4.4.4  (子域保留)
+[/example.com/]2.2.2.2      (父域保留)
+[/com/]5.5.5.5              (顶级域保留)
+```
+
+| 查询域名 | 命中规则 | 使用上游 |
+|----------|---------|----------|
+| `deep.sub.example.com` | 逐级向上匹配到 `sub.example.com` | 4.4.4.4 |
+| `sub.example.com` | 保留域 `sub.example.com` | 4.4.4.4 |
+| `other.example.com` | 保留域 `example.com` | 2.2.2.2 |
+| `example.com` | 保留域 `example.com` | 2.2.2.2 |
+| `other.com` | 保留域 `com` | 5.5.5.5 |
+| `unknown.local` | 无匹配 → 默认 | 8.8.8.8 |
+
+#### 场景6：单标签域名
+
+```
+配置：
+[/ /]4.4.4.4  (单标签)
+[/example.com/]2.2.2.2
+```
+
+| 查询域名 | 命中规则 | 使用上游 |
+|----------|---------|----------|
+| `printer` | 单标签 → `UnqualifiedNames` | 4.4.4.4 |
+| `localhost` | 单标签 | 4.4.4.4 |
+| `www.example.com` | 保留域 | 2.2.2.2 |
+
+### I.7 自定义上游 vs 全局上游的冲突
+
+**文件**：`dnsproxy/proxy/proxy.go:549` (`selectUpstreams`)
+
+客户端自定义上游的优先级高于全局上游：
+
+```go
+func (p *Proxy) selectUpstreams(d *DNSContext) (ups []upstream.Upstream, isPrivate bool) {
+    // ... 私有上游检查 ...
+
+    // 分支2：有自定义上游配置？
+    if d.CustomUpstreamConfig != nil {
+        // 从自定义配置中按域名匹配
+        ups = d.CustomUpstreamConfig.getUpstreamsForDomain(host)
+        if len(ups) > 0 {
+            return ups, isPrivate  // 找到就返回，不用全局
+        }
+        // 自定义配置中没找到，继续使用全局配置
+    }
+
+    // 分支3：使用全局默认配置
+    return p.UpstreamConfig.getUpstreamsForDomain(host), isPrivate
+}
+```
+
+**关键**：自定义上游配置中找不到匹配的域名时，会**降级**到全局配置继续匹配，而不是直接使用自定义的默认上游。
+
+### I.8 DS 查询的特殊匹配
+
+**文件**：`dnsproxy/proxy/upstreams.go:422` (`getUpstreamsForDS`)
+
+DS（Delegation Signer）查询会去掉第一个标签后匹配：
+
+```go
+func (uc *UpstreamConfig) getUpstreamsForDS(fqdn string) (ups []upstream.Upstream) {
+    _, fqdn, _ = strings.Cut(fqdn, labelSep)
+    if fqdn == "" {
+        return uc.Upstreams
+    }
+    return uc.getUpstreamsForDomain(fqdn)
+}
+```
+
+**示例**：查询 `sub.example.com` 的 DS 记录，实际匹配 `example.com` 的规则。
+
+### I.9 冲突解决原则总结
+
+| 原则 | 说明 |
+|------|------|
+| **精确优先** | 精确域名匹配优先于通配/保留域匹配 |
+| **长域名优先** | 更长的域名匹配优先于更短的父域匹配 |
+| **子域排除优先** | 子域排除规则优先于父域保留规则 |
+| **自定义优先** | 客户端自定义上游优先于全局上游 |
+| **空列表降级** | 匹配到空列表时，回退到默认上游 |
+| **逐级回溯** | 当前域无匹配时，向父域查找 |
+| **默认兜底** | 所有规则都不匹配时，使用默认上游 |
+
+### I.10 运营配置建议
+
+| 场景 | 建议配置方式 | 避免的问题 |
+|------|-------------|-----------|
+| 大部分域名走通用上游，少量走专用 | 先配置默认上游，再添加少数精确匹配规则 | 避免规则爆炸 |
+| 整个部门的域名走专用上游 | 使用保留域匹配 `[/dept.example.com/]` | 不用为每个子域单独配置 |
+| 某子域需要走不同上游 | 组合使用：`[/example.com/]2.2.2.2` + `[/special.example.com/]1.1.1.1` | 精确匹配会覆盖保留域 |
+| 内网域名不对外 | `[/corp.local/]internal-dns`，确保单标签也能匹配 | 防止内网查询泄漏到公网上游 |
+| 需要临时屏蔽某域名 | 使用排除规则 `[/bad.com/]#` | 比修改过滤规则更直接 |
+| 多个子域需要相似配置 | 先配父域保留，再用少数精确匹配覆盖 | 减少配置冗余 |
+
