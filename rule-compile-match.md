@@ -85,6 +85,112 @@ updatesLoop()
                  └─ removeOldFilterFile()  // 清理 .old 临时文件
 ```
 
+### 1.5 订阅源拉取调度的详细机制
+
+#### 1.5.1 刷新频率配置
+
+刷新间隔由 `FiltersUpdateIntervalHours`（`filtering.go:177`）全局控制，单位为小时：
+
+| 配置项 | 默认值 | 说明 |
+|---|---|---|
+| `FiltersUpdateIntervalHours` | 可配置（YAML: `filters_update_interval`） | 0 表示禁用自动刷新 |
+| 最小检查粒度 | 5 秒 | `updatesLoop` 的定时器退避起点 |
+| 最大检查间隔 | 1 小时 | `periodicallyRefreshFilters` 中的 `maxInterval` 常量 |
+
+**判定逻辑**（`listsToUpdate()`，`filter.go:277`）：
+```
+规则：now >= flt.LastUpdated + FiltersUpdateIntervalHours
+```
+即每条订阅源独立计算自己的到期时间，并非全局定时批量更新。例如，A 列表 10:00 更新，B 列表 10:30 更新，间隔为 24 小时，则次日 10:00 触发 A，10:30 触发 B。
+
+#### 1.5.2 触发时机全景
+
+规则刷新有 **5 种触发路径**：
+
+| 触发方式 | 入口函数 | 同步/异步 | 适用场景 |
+|---|---|---|---|
+| **启动加载** | `New()` → `initFiltering()` | 同步 | 进程启动时 |
+| **定时轮询** | `updatesLoop` → `periodicallyRefreshFilters` | 异步（后台 goroutine） | 日常自动更新 |
+| **手动刷新 API** | `handleFilteringRefresh()` → `tryRefreshFilters(force=true)` | 同步 | Web 界面「立即更新」按钮 |
+| **新增订阅** | `handleFilteringAddURL()` → `d.update()` | 同步 | 添加新订阅源时立即下载 |
+| **修改订阅配置** | `filterSetProperties()` → `EnableFilters()` | 异步（async=true） | 修改 URL/启用状态后重新编译 |
+
+> **运营注意**：`force=true` 模式会忽略 `LastUpdated` 时间戳，强制重新下载所有启用的订阅源，即使内容未变化也会更新 mtime。
+
+#### 1.5.3 失败重试与退避策略
+
+刷新失败时的处理逻辑（`periodicallyRefreshFilters()`，`filtering.go:1115`）：
+
+```
+周期检查开始
+  │
+  ├─ FiltersUpdateIntervalHours == 0 → 跳过，返回原间隔
+  │
+  ├─ 调用 tryRefreshFilters(force=false)
+  │    ├─ refreshLock.TryLock() 失败 → 已有更新在进行，跳过
+  │    └─ refreshFiltersIntl() 执行实际更新
+  │
+  ├─ 全部失败（isNetErr=true）→ 指数退避
+  │    └─ nextIvl = min(ivl * 2, maxInterval)
+  │         // 如：5s → 10s → 20s → ... → 最大 1h
+  │
+  └─ 部分成功或全部成功 → 重置间隔
+       └─ nextIvl = time.Duration(FiltersUpdateIntervalHours) * time.Hour
+```
+
+**关键特性**：
+- **退避触发条件**：`isNetErr = true` 即**所有**订阅源全部更新失败时才退避（`failNum == len(updateFilters)`）
+- **退避速度**：每次失败间隔翻倍（指数退避）
+- **退避上限**：`maxInterval = 1 hour`
+- **恢复机制**：一旦有任何一个订阅源更新成功，立即重置为配置的完整间隔
+
+> **设计权衡**：只在全部失败时才退避，部分失败不影响其他源的正常刷新节奏。这意味着单个订阅源持续失败不会拖慢其他源的更新频率。
+
+#### 1.5.4 内容完整性校验体系
+
+下载的规则文本经过 **4 层校验**，确保内容正确可用：
+
+| 校验层级 | 实现位置 | 检查内容 | 失败处理 |
+|---|---|---|---|
+| **第 1 层：HTTP 状态码** | `readFromHTTP()` (`filter.go`) | `resp.StatusCode == 200` | 返回错误，不保存 |
+| **第 2 层：文件大小限制** | `ioutil.LimitReader` + `MaxHTTPSize` | 不超过 `MaxHTTPSize`（默认 256 MB） | 截断并报错 |
+| **第 3 层：格式校验** | `rulelist.Parser.Parse()` | 检测 HTML 页面、二进制内容、单行超长 | 返回 `ErrHTML` 或行解析错误 |
+| **第 4 层：内容去重** | `updateIntl()` (`filter.go`) | 比较新旧 `checksum`（CRC-32） | 无变化则仅更新 mtime，跳过重新编译 |
+
+**HTML 误判防护**（`parser.go`）：
+- 仅检查**第 1 行**是否以 `<html` 或 `<!doctype` 开头（不区分大小写）
+- 如果第 1 行是正常规则，后续行即使包含 HTML 标签也不会报错（作为普通规则处理）
+- 这是为了避免误伤包含 "html" 关键字的真实规则
+
+**CRC-32 校验的作用**：
+- 增量计算：每条有效规则行参与 `crc32.Update`
+- 更新时比较：新旧 checksum 相同 → `updated = false` → 跳过 `EnableFilters` 重新编译
+- 性能优化：避免"内容未变但反复编译"的资源浪费
+
+#### 1.5.5 并发安全与互斥机制
+
+刷新流程使用 **两把锁** 保障并发安全：
+
+| 锁 | 类型 | 保护范围 |
+|---|---|---|
+| `refreshLock` | `sync.Mutex`（使用 TryLock） | 防止多个刷新任务同时执行 |
+| `d.conf.filtersMu` | `sync.RWMutex` | 保护配置中过滤器列表的读写 |
+
+**TryLock 模式**（`tryRefreshFilters()`，`filter.go:265`）：
+- 若 `refreshLock.TryLock()` 失败，说明已有更新在进行，直接返回 `ok=false`
+- 这是一种"忙则放弃"策略，避免刷新请求堆积
+
+**更新流程的锁顺序**：
+```
+1. refreshLock.Lock()           ← 全程持有，防止并发刷新
+2. conf.filtersMu.RLock()       ← 读取待更新列表
+3. 执行 HTTP 下载 + Parser 解析  ← 不持锁，允许读请求继续
+4. conf.filtersMu.Lock()        ← 写锁，更新配置中的过滤器元数据
+5. EnableFilters(async)         ← 触发引擎重新编译
+6. conf.filtersMu.Unlock()
+7. refreshLock.Unlock()
+```
+
 ---
 
 ## 2. 第二阶段：解析与编译（文本 → 可匹配结构）
@@ -319,6 +425,97 @@ filters[0] = Filter{
 ```
 
 然后 `IDCustom`（值为 0）这个 Filter 被追加到 `blockFilters` 列表最前面，参与 `newRuleStorage()` 的统一编译，因此**自定义规则优先级最高**（在同一引擎中，先加入的规则先匹配）。
+
+### 2.7 多订阅列表的去重与优先级冲突
+
+当用户配置了多份订阅源（如 EasyList + EasyPrivacy + 自定义规则 + 多份第三方列表）时，相同规则可能在多个列表中重复出现，且优先级可能相互冲突。
+
+#### 2.7.1 订阅源级别的去重
+
+**去重位置**：`deduplicateFilters()` (`filter.go:245`)，在 `New()` 初始化时调用。
+
+**去重策略**：
+- **按 URL 去重**：使用 `container.MapSet[string]` 记录已出现的 URL
+- **保留先出现的**：遍历列表时，首次出现的保留，后续重复的丢弃
+- **分组去重**：黑名单（`Filters`）和白名单（`WhitelistFilters`）**分别独立去重**，互不影响
+
+```go
+// 伪代码逻辑
+urls := NewMapSet[string]()
+for _, filter := range filters {
+    if !urls.Has(filter.URL) {
+        urls.Add(filter.URL)
+        result = append(result, filter)  // 保留
+    }
+    // 重复的直接跳过
+}
+```
+
+> **局限**：只按 URL 字符串匹配去重，不做内容级去重。如果两个不同 URL 但内容相同的订阅源，不会被去重。
+
+#### 2.7.2 规则级别的优先级体系
+
+当同一条规则（或冲突的规则）出现在多个订阅列表中时，按以下层级决定最终效果：
+
+**第 1 层：引擎隔离（allow vs block）**
+- allowlist 引擎和 blocklist 引擎是**完全独立**的两台 DNSEngine
+- allowlist 先检查，命中即放行（短路）
+- 同一规则不会同时出现在 allow 和 block 引擎中
+
+**第 2 层：列表顺序优先级**
+在同一引擎内部，`RuleStorage` 按 `filters` 切片的顺序加载规则：
+- **先加载的列表优先级更高**
+- 当多条规则都匹配时，`MatchRequest()` 返回的 `NetworkRule` 通常来自优先级更高的列表
+
+**列表优先级顺序**（从高到低）：
+| 优先级 | 列表 ID | 来源 | 说明 |
+|---|---|---|---|
+| 1（最高） | `IDCustom = 0` | 用户自定义规则 | 始终排在 blockFilters 最前面 |
+| 2 | 按配置顺序 | `Config.Filters[N]` | YAML 中排列越靠前，优先级越高 |
+| 3（最低） | 末尾的列表 | 最后添加的订阅源 | — |
+
+**白名单侧的优先级**：
+- 用户白名单自定义规则优先级最高
+- 然后按 `WhitelistFilters` 配置顺序排列
+
+#### 2.7.3 冲突解决策略
+
+当不同订阅列表中的规则发生冲突时，按以下机制处理：
+
+**场景 1：同一域名同时命中多条拦截规则**
+- 引擎内部按"修饰符优先级"决出最高优先级的 1 条 NetworkRule（详见 3.3.3 节）
+- `$important` 规则优先于普通规则
+- `$dnsrewrite` 规则优先于普通拦截
+- 同级别下，**先加载列表中的规则胜出**
+
+**场景 2：白名单 vs 黑名单（跨引擎）**
+- allowlist 引擎先检查 → 命中直接放行
+- 但 `$important` 拦截规则可以"穿透"普通白名单
+- 只有 `@@...$important` 白名单才能覆盖 `$important` 拦截规则
+
+**场景 3：hosts 规则 vs Adblock 规则**
+- NetworkRule（Adblock 语法）优先级高于 HostRule（hosts 格式）
+- 即 `||example.com^`（Adblock）比 `0.0.0.0 example.com`（hosts）优先返回
+- 代码证据：`matchHostProcessDNSResult()` 中先检查 `NetworkRule != nil`
+
+**场景 4：不同列表的 hosts 规则**
+- HostRule 返回的是**数组**（所有匹配的规则都返回），而非单条
+- `resultFromHostRules()` 会返回所有匹配的 IP
+- 不会覆盖，而是全部累加
+
+#### 2.7.4 规则内容去重的缺失与设计考量
+
+**当前系统不做规则内容去重**，原因可能包括：
+
+1. **性能考量**：百万级规则的内容级去重（计算每条规则的 hash）会增加编译时间
+2. **语义复杂**：不同写法的规则可能语义等价（如 `||example.com^` 和 `example.com^`），判断等价需要语法解析
+3. **可接受的冗余**：重复规则对匹配性能影响不大（哈希/Trie 查找时重复规则会被合并或按顺序返回）
+4. **列表 ID 溯源**：保留每条规则的原始列表 ID，便于在 UI 上展示"哪条规则命中"
+
+**实际影响**：
+- 内存浪费：重复规则会多占用一些内存（但通常只占总量的几个百分点）
+- 匹配性能：对哈希查找和 Trie 查找影响可忽略；对正则规则列表有线性影响
+- 结果展示：`Result.Rules` 中可能出现多条文本相同但 `FilterListID` 不同的规则
 
 ---
 
@@ -636,6 +833,209 @@ type Result struct {
 | `Rewritten` (9) | 传统 Rewrite 规则 |
 | `RewrittenAutoHosts` (10) | /etc/hosts 重写 |
 | `RewrittenRule` (11) | `$dnsrewrite` 规则重写 |
+
+### 3.6 拦截命中后的响应生成（自定义拦截页面）
+
+当规则匹配且判定为拦截（`IsFiltered = true`）时，DNS 响应的内容由 `BlockingMode`（拦截模式）决定。这相当于 DNS 层面的"拦截页面"——将用户指向特定的 IP 或返回错误码。
+
+#### 3.6.1 五种拦截模式
+
+`BlockingMode` 定义在 `filtering.go:197`，共 5 种模式：
+
+| 拦截模式 | 枚举值 | A 查询响应 | AAAA 查询响应 | 其他类型 |
+|---|---|---|---|---|
+| **Null IP**（默认 Adblock 规则） | `null_ip` | `0.0.0.0` | `::` | 空 NOERROR |
+| **Default**（混合模式） | `default` | hosts 规则有 IP 则返回 IP，否则 `0.0.0.0` | 同左，否则 `::` | 空 NOERROR |
+| **Custom IP**（自定义 IP） | `custom_ip` | 用户配置的 `BlockingIPv4` | 用户配置的 `BlockingIPv6` | 空 NOERROR |
+| **NXDOMAIN** | `nxdomain` | `NXDOMAIN` 错误码 | 同左 | 同左 |
+| **REFUSED** | `refused` | `REFUSED` 错误码 | 同左 | 同左 |
+
+> **Default vs Null IP 的区别**：对于 `/etc/hosts` 格式的规则（如 `1.2.3.4 example.com`），`default` 模式会返回规则中指定的 IP，而 `null_ip` 模式总是返回零 IP。Adblock 风格规则在两种模式下都返回零 IP。
+
+#### 3.6.2 响应生成的完整流程
+
+**入口**：`genDNSFilterMessage()` (`dnsforward/msg.go:51`)
+
+```
+filterDNSRequest 命中拦截规则（IsFiltered = true）
+  │
+  └─ s.genDNSFilterMessage(ctx, l, pctx, res)
+       │
+       ├─ 非 A/AAAA/HTTPS 查询？
+       │    ├─ NullIP 模式 → 空 NOERROR 响应
+       │    └─ 其他模式 → NODATA 响应
+       │
+       └─ 按 Reason 分支：
+            │
+            ├─ FilteredSafeBrowsing → genBlockedHost(SafeBrowsingBlockHost)
+            │    ├─ 配置的 BlockHost 是 IP → 直接返回该 IP
+            │    └─ 配置的 BlockHost 是域名 → 递归解析该域名，替换 Answer 中的名称
+            │
+            ├─ FilteredParental → genBlockedHost(ParentalBlockHost)
+            │    └─ 同上，使用家长控制拦截域名
+            │
+            ├─ FilteredSafeSearch → getCNAMEWithIPs
+            │    ├─ 添加 CNAME 记录（CanonName）
+            │    └─ 追加对应 IP 记录（从规则中提取）
+            │
+            └─ default（其他拦截原因：BlockList / BlockedService / Rewritten 等）
+                 └─ genForBlockingMode(ipsFromRules(res.Rules))
+                      │
+                      ├─ CustomIP:
+                      │    ├─ A 查询 → 返回 BlockingIPv4
+                      │    └─ AAAA 查询 → 返回 BlockingIPv6
+                      │
+                      ├─ Default:
+                      │    ├─ 规则中有 IP（hosts 规则）→ 返回规则中 IP
+                      │    └─ 无 IP → NullIP（零地址）
+                      │
+                      ├─ NullIP → 0.0.0.0 / ::
+                      │
+                      ├─ NXDOMAIN → Rcode=NXDOMAIN，附 SOA 记录
+                      │
+                      └─ REFUSED → Rcode=REFUSED
+```
+
+#### 3.6.3 自定义拦截 IP 的配置链路
+
+```
+用户在 Web 界面设置"拦截模式"和"自定义 IP"
+  │
+  ▼
+handleDnsConfigSet()（HTTP API）
+  │
+  ├─ s.dnsFilter.SetBlockingMode(mode, bIPv4, bIPv6)
+  │    └─ 更新 d.conf.BlockingMode / BlockingIPv4 / BlockingIPv6
+  │
+  └─ s.conf.BlockingIPv4 / BlockingIPv6
+       └─ genForBlockingMode() 实时读取这些配置
+```
+
+**TTL 控制**：所有拦截响应的 TTL 由 `BlockedResponseTTL`（`filtering.go:181`）控制，默认 3600 秒。NXDOMAIN/REFUSED 响应中的 SOA 记录也使用此 TTL。
+
+#### 3.6.4 拦截模式的业务影响
+
+| 模式 | 用户体验 | 优点 | 缺点 |
+|---|---|---|---|
+| **Null IP** | 浏览器显示"无法访问" | 简单直接，标准做法 | 客户端可能缓存零 IP |
+| **Custom IP** | 跳转到自定义拦截页（需配合 Web 服务器） | 可展示友好的拦截提示 | 需要额外的 Web 服务；HTTPS 站点会报证书错误 |
+| **NXDOMAIN** | 浏览器显示"找不到服务器" | 客户端重试少 | 部分应用可能反复重试 |
+| **REFUSED** | 类似 NXDOMAIN | 明确拒绝 | 某些客户端可能认为 DNS 服务器故障 |
+| **Default** | 取决于规则类型 | 兼容性好（hosts 规则保留原始 IP） | 行为不一致 |
+
+> **注意**：AdGuardHome 的"拦截页面"本质是 **DNS 级别的重定向**，将被拦截域名解析到指定 IP。真正的 HTML 拦截页面需要在该 IP 上部署 Web 服务器（HTTPS 还需要证书），否则浏览器访问 HTTPS 站点时会出现证书错误。
+
+### 3.7 白名单命中（bypass）的处理链路
+
+当请求命中白名单规则时，会走一条与拦截完全不同的处理路径——**快速放行**。
+
+#### 3.7.1 白名单的两种形态
+
+| 白名单类型 | 实现位置 | 匹配时机 | 效果 |
+|---|---|---|---|
+| **Allowlist 引擎** | `filteringEngineAllow`（独立 DNSEngine） | `matchHost()` 中最先检查 | 命中则整个域名放行，短路所有后续检查 |
+| **`@@` 白名单规则** | 嵌入在 blocklist 引擎的 NetworkRule 中 | NetworkRule 匹配时内部判定 | 同一条规则的白名单形式，仅覆盖同名黑名单 |
+
+> **关键区别**：Allowlist 引擎是**独立的第二台引擎**，规则独立加载；而 `@@` 规则是**黑名单引擎内部**的"反规则"。两者在 urlfilter 内部的优先级逻辑不同。
+
+#### 3.7.2 Allowlist 引擎的匹配流程
+
+**位置**：`matchHost()` (`filtering.go:884`) 中的 allowlist 检查
+
+```
+matchHost(host, rrtype, setts)
+  │
+  ├─ ProtectionEnabled && filteringEngineAllow != nil
+  │    │
+  │    ├─ ufReq 构造（同 blocklist 检查）
+  │    ├─ filteringEngineAllow.MatchRequest(ufReq)
+  │    │
+  │    └─ 命中 (ok=true)？
+  │         │
+  │         ├─ 是 → matchHostProcessAllowList(ctx, host, dnsres)
+  │         │    │
+  │         │    ├─ 构造 Result:
+  │         │    │    ├─ IsFiltered = false
+  │         │    │    ├─ Reason = NotFilteredAllowList
+  │         │    │    └─ Rules: 填充命中的白名单规则（含 Text / FilterListID）
+  │         │    │
+  │         │    └─ 【特殊】白名单中的 $dnsrewrite 规则
+  │         │         └─ 处理白名单侧的 DNS 重写（较少见）
+  │         │
+  │         └─ 直接 return Result（不进入 blocklist 检查）
+  │
+  └─ 未命中 allowlist → 继续 blocklist 检查
+```
+
+**核心特性**：
+- Allowlist 是**独立引擎**，有自己的规则集、自己的编译过程
+- 命中即**短路**：不会进入 blocklist 引擎，也不会进入后续的 blocked services / safebrowsing 等检查器
+- 但 `$important` 修饰符可以反转这一行为（详见 3.3.3 节）
+
+#### 3.7.3 白名单命中后的 DNS 处理
+
+白名单命中（`Reason = NotFilteredAllowList`）后，`filterDNSRequest()` 的行为：
+
+```
+filterDNSRequest 拿到 Result
+  │
+  ├─ res.Reason == Rewritten？→ 应用重写结果（替换响应）
+  │
+  ├─ res.Reason == RewrittenAutoHosts？→ 应用 hosts 重写
+  │
+  ├─ res.IsFiltered == true？→ genDNSFilterMessage() 生成拦截响应
+  │
+  └─ 其他情况（含 NotFilteredAllowList）→ 放行，继续正常 DNS 解析
+       │
+       └─ 走正常的上游 DNS 查询流程
+            ├─ 选择上游服务器
+            ├─ 发送 DNS 请求
+            └─ 返回原始解析结果
+```
+
+即：**白名单命中 = 正常解析**，唯一区别是 `Result.Reason` 标记为 `NotFilteredAllowList`，用于日志和查询统计。
+
+#### 3.7.4 Allowlist 引擎的加载与编译
+
+Allowlist 引擎的构建过程与 blocklist 完全对称：
+
+```
+initFiltering()
+  │
+  ├─ 【block 侧】newRuleStorage(blockFilters) → filteringEngine
+  │
+  └─ 【allow 侧】newRuleStorage(allowFilters) → filteringEngineAllow
+       │
+       └─ allowFilters 来源：
+            ├─ Config.WhitelistFilters （YAML 配置的白名单订阅列表）
+            └─ 用户白名单自定义规则？→ 不单独存储，通过 allowlist 订阅实现
+```
+
+> **注意**：用户界面的"白名单"（添加例外域名）实际上是添加到 whitelist 订阅列表中，还是通过其他方式？需结合 UI 层代码确认。从当前代码看，`DNSFilter` 结构中没有专门的 `UserAllowRules` 字段，白名单规则通过 `WhitelistFilters` 列表管理。
+
+#### 3.7.5 白名单的优先级与穿透
+
+完整的优先级链（从高到低）：
+
+```
+1. $important 白名单（allowlist 引擎中带 $important 的 @@ 规则）
+2. 普通白名单（allowlist 引擎中普通 @@ 规则）
+3. $important 拦截规则（blocklist 引擎中带 $important 的拦截规则）
+     ↓ 可以穿透 #2 的普通白名单
+4. 普通拦截规则（blocklist 引擎中普通规则）
+5. HostRule（hosts 格式）
+```
+
+**穿透示例**：
+```
+订阅 A（白名单引擎）：@@||example.com^           ← 普通白名单
+订阅 B（黑名单引擎）：||ads.example.com^$important ← 重要拦截规则
+
+访问 ads.example.com:
+  → allowlist 引擎检查：@@||example.com^ 命中
+  → 但 blocklist 中 $important 规则可以穿透普通白名单
+  → 最终结果：拦截（FilteredBlockList）
+```
 
 ---
 
