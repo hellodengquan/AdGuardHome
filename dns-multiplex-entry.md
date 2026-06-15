@@ -1433,38 +1433,482 @@ DNS 请求进入管道
 
 ---
 
-## 13. 架构演进：`next/dnssvc` 新架构
+## 13. DNS 过滤规则引擎完整匹配链路
 
-位于 `internal/next/dnssvc/dnssvc.go`，展现了未来更简洁的设计方向（目前仅用于内部子系统）：
+AdGuardHome 过滤系统采用 **"前置拦截 + 后置补漏"** 的双阶段模型，围绕 `filtering.DNSFilter` 核心引擎展开。
+
+### 13.1 过滤引擎核心：`DNSFilter` 与 hostChecker 链
+
+`filtering/filtering.go:252` 的 `DNSFilter` 是过滤子系统的门面：
 
 ```go
-func New(c *Config) (svc *Service, err error) {
-    // 更清晰的分层：地址转换 → 上游构建 → Proxy 创建
-    upstreams, resolvers, err := addressesToUpstreams(...)
+type DNSFilter struct {
+    // 核心匹配引擎（基于 urlfilter 库）
+    rulesStorage        *filterlist.RuleStorage   // 黑名单规则存储
+    filteringEngine     *urlfilter.DNSEngine      // 黑名单 DNS 匹配引擎
+    rulesStorageAllow   *filterlist.RuleStorage   // 白名单规则存储
+    filteringEngineAllow *urlfilter.DNSEngine     // 白名单 DNS 匹配引擎
 
-    svc.proxy, err = proxy.New(&proxy.Config{
-        // 直接传入监听地址
-        UDPListenAddr:  udpAddrs(c.Addresses),
-        TCPListenAddr:  tcpAddrs(c.Addresses),
-        // 中间件链更简洁
-        RequestHandler: rlMw.Wrap(proxy.DefaultHandler{}),
-        // ...
-    })
+    // 六大 hostChecker，按顺序执行
+    hostCheckers []hostChecker   // 见下文
+    // ...
+}
+
+// hostChecker 是过滤管道的最小单元接口
+type hostChecker struct {
+    check func(host string, qtype uint16, setts *Settings) (Result, error)
+    name  string
 }
 ```
 
-### 13.1 新旧架构对比
+六大 `hostChecker` 在 `filtering.go:994`（DNSFilter 创建时）按以下顺序注册：
 
-| 特性 | 旧架构 (`dnsforward`) | 新架构 (`next/dnssvc`) |
-|------|----------------------|-----------------------|
-| 功能完整度 | 完整（过滤、统计、日志、DHCP 联动等） | 精简版（仅代理转发） |
-| 处理管道 | 9 个处理模块 | 依赖 `proxy.DefaultHandler` |
-| 配置耦合度 | 高（与全局 Context 深度耦合） | 低（纯函数式创建） |
-| 中间件 | 3 层（Rate + Log + Wrap） | 1 层（Rate） |
+| 序号 | 检查器 | 名称 | 功能 |
+|:---:|--------|------|------|
+| 1 | `matchSysHosts` | hosts container | 系统 /etc/hosts 与用户自定义 DNS 重写（A/AAAA 记录） |
+| 2 | `matchHost` | filtering | 主过滤引擎：黑名单/白名单规则（基于 urlfilter） |
+| 3 | `matchBlockedServicesRules` | blocked services | 被屏蔽服务（如 Facebook、Twitter）的规则匹配 |
+| 4 | `checkSafeBrowsing` | safe browsing | 安全浏览哈希前缀检查（远程恶意域名库） |
+| 5 | `checkParental` | parental | 家长控制：成人内容过滤 |
+| 6 | `checkSafeSearch` | safe search | 搜索引擎强制安全搜索（Google、Bing、YouTube 等） |
+
+**匹配短路规则**：`CheckHost()` 按顺序调用每个 checker，只要返回 `Result.Reason.Matched() == true` 就立即返回，不再执行后续 checker。
+
+### 13.2 前置过滤：`processFilteringBeforeRequest()`
+
+位于 `internal/dnsforward/process.go:395`，执行在 **上游转发之前**，能拦截的请求绝不转发到公网。
+
+```
+请求进入
+   │
+   ├── 私有 PTR 查询 → 关闭 SafeBrowsing/Parental/SafeSearch（优化）
+   │
+   ├── pctx.Res 已被前序模块设置（DHCP/DDR等） → 跳过
+   │
+   ▼
+filterDNSRequest(ctx, l, dctx)
+   │
+   ├── 第 1 阶段：DNSFilter.CheckHost(host, qtype, setts)
+   │     │
+   │     ├── processRewrites() → 检查 Legacy DNS Rewrites
+   │     │     (仅命中 Rewritten 类型，有 CanonName/IPList 就立即返回)
+   │     │
+   │     └── 六大 hostChecker 依次执行（短路返回）
+   │           │
+   │           ├─ matchSysHosts → 用户 hosts 条目 / etc/hosts
+   │           ├─ matchHost → urlfilter 黑白名单
+   │           ├─ matchBlockedServicesRules → 服务屏蔽规则
+   │           ├─ checkSafeBrowsing → 安全浏览
+   │           ├─ checkParental → 家长控制
+   │           └─ checkSafeSearch → 强制安全搜索
+   │
+   ├── 第 2 阶段：按 Result.Reason 生成响应或改写请求
+   │
+   ├── 分支 A: isRewrittenCNAME() → CNAME 重写无 IP
+   │     ├─ 保存原 Question 到 dctx.origQuestion
+   │     └─ 将 Req.Question[0].Name 改为 CanonName，继续上游解析此新域名
+   │
+   ├── 分支 B: res.IsFiltered → 明确拦截
+   │     └─ genDNSFilterMessage() 按 BlockingMode 生成响应
+   │         (Default/NXDOMAIN/REFUSED/自定义 IP / 空响应)
+   │
+   └── 分支 C: 其他 Matched Reason
+         ├─ FilteredSafeSearch / Rewritten
+         │   └─ getCNAMEWithIPs() → CNAME + IP 联合响应
+         └─ RewrittenAutoHosts / RewrittenRule
+             └─ filterDNSRewrite() → 应用 DNS 重写规则
+```
+
+关键代码位于 `internal/dnsforward/filter.go:28` 的 `filterDNSRequest()`：
+
+```go
+func (s *Server) filterDNSRequest(...) (res *filtering.Result, err error) {
+    resVal, err := s.dnsFilter.CheckHost(host, q.Qtype, dctx.setts)
+    res = &resVal
+
+    // CNAME-only 重写（无 IP）：修改请求域名交给上游
+    if isRewrittenCNAME(res) {
+        dctx.origQuestion = q                    // 保存原问题
+        req.Question[0].Name = dns.Fqdn(res.CanonName)  // 替换查询域
+        checkReason = false
+    } else if res.IsFiltered {
+        pctx.Res = s.genDNSFilterMessage(ctx, l, pctx, res)  // 直接生成阻断响应
+        checkReason = false
+    }
+
+    // 其他命中类型：SafeSearch / Rewritten / AutoHosts / Rule
+    switch res.Reason {
+    case FilteredSafeSearch, Rewritten:
+        pctx.Res = s.getCNAMEWithIPs(ctx, req, res.IPList, res.CanonName)
+    case RewrittenAutoHosts, RewrittenRule:
+        err = s.filterDNSRewrite(ctx, req, res, pctx)
+    }
+    return res, err
+}
+```
+
+### 13.3 后置过滤：`processFilteringAfterResponse()`
+
+位于 `process.go:542`，执行在 **上游响应回来之后**，主要处理两类情况：CNAME 重写链补全，以及响应 IP/CNAME 的黑名单检查。
+
+```
+上游返回响应
+   │
+   ├── 分支 A: 原请求被 CNAME 重写过（dctx.origQuestion 非空）
+   │     │
+   │     ├── NotFilteredAllowList → 放行
+   │     ├── Rewritten / RewrittenRule / FilteredSafeSearch
+   │     │     ├── 恢复 Req.Question 和 Res.Question 为原始域名
+   │     │     ├── 插入 CNAME 记录：原域名 → CanonName
+   │     │     └── 上游返回的 A/AAAA 记录追加在 CNAME 之后
+   │     │
+   │     └── 其他 Reason → 调用 filterAfterResponse()
+   │
+   └── 分支 B: 默认 → filterAfterResponse(ctx, l, dctx)
+         │
+         ├── protectionEnabled && responseFromUpstream → 继续
+         │
+         └── filterDNSResponse()
+               ├── 遍历 Res.Answer 每个 RR
+               │   ├─ CNAME 记录 → CheckHostRules() 匹配
+               │   ├─ A/AAAA 记录 → IP 黑名单（Bogus NXDOMAIN）检查
+               │   └─ HTTPS/SVCB 记录 → Hint IP 检查
+               └── 命中 → 用 BlockingMode 重新生成响应
+```
+
+关键代码位于 `process.go:579` 的 `filterAfterResponse()` → `filterDNSResponse()`（`filter.go:116`）：
+
+```go
+func (s *Server) filterDNSResponse(...) (err error) {
+    // 遍历响应 Answer，按 RR 类型分别检查
+    for _, rr := range pctx.Res.Answer {
+        switch rr := rr.(type) {
+        case *dns.CNAME:
+            // 递归检查 CNAME 目标是否命中黑名单
+            cnameHost := strings.TrimSuffix(rr.Target, ".")
+            if res, err = s.checkHostRules(cnameHost, qt, setts); res.IsFiltered {
+                dctx.result = res
+                pctx.Res = s.genDNSFilterMessage(ctx, l, pctx, res)
+                return nil
+            }
+        case *dns.A:
+            // 检查 Bogus NXDOMAIN（虚假 IP 黑名单）
+            if setts.ClientSafeSearch.BogusNXDomain.Contains(rr.A) {
+                pctx.Res = s.genDNSFilterMessage(ctx, l, pctx, dctx.result)
+                return nil
+            }
+        case *dns.AAAA:
+            // 同上 IPv6
+        case *dns.HTTPS:
+            // 检查 HTTPS/SVCB RR 的 IP Hint
+        }
+    }
+    return nil
+}
+```
+
+### 13.4 CNAME 重写的往返链路
+
+DNS 重写（DNS Rewrite）是 AdGuardHome 最常用的功能之一，其生命周期跨越前后两个过滤阶段：
+
+```
+客户端请求 my-pc.local → IN A
+
+ ┌── processFilteringBeforeRequest
+ │    filterDNSRequest():
+ │      ├─ CheckHost() → 命中 RewrittenRule
+ │      │   CanonName = "my-pc.lan"
+ │      │   IPList = [] (无 IP，只有 CNAME)
+ │      ├─ isRewrittenCNAME() = true
+ │      ├─ dctx.origQuestion = {Name: "my-pc.local.", Type: A}
+ │      └─ req.Question[0].Name = "my-pc.lan."  ← 修改请求域名
+ │
+ ├── processUpstream():
+ │    prx.Resolve() → 将 "my-pc.lan." 转发到上游，拿到其 IP
+ │    pctx.Res.Answer = [A 192.168.1.100]
+ │
+ └── processFilteringAfterResponse
+      processFilteringAfterResponse():
+        ├─ dctx.origQuestion 非空
+        ├─ 恢复 Question 为 "my-pc.local."
+        ├─ 插入 CNAME: my-pc.local. → my-pc.lan.
+        └─ 保留上游返回的 A 记录
+          
+最终响应给客户端：
+  my-pc.local.  CNAME  my-pc.lan.
+  my-pc.lan.    A      192.168.1.100
+```
 
 ---
 
-## 14. 关键文件索引
+## 14. Cache 层与 TTL 策略
+
+AdGuardHome 的 DNS 缓存完全由 `dnsproxy` 库的 `proxy.Cache` 组件提供，`dnsforward` 层仅透传配置。
+
+### 14.1 缓存配置的透传链路
+
+**旧架构 dnsforward** 经 `newProxyConfig()` → `proxy.Config`：
+```go
+// 透传由 config.go 的 newProxyConfig() 完成
+conf = &proxy.Config{
+    CacheEnabled:   s.conf.CacheEnabled,   // 总开关
+    CacheSizeBytes: s.conf.CacheSize,      // 缓存容量（字节）
+    CacheMinTTL:    s.conf.CacheTTLMin,    // 最小 TTL（秒）
+    CacheMaxTTL:    s.conf.CacheTTLMax,    // 最大 TTL（秒）
+    CacheOptimistic: s.conf.CacheOptimistic, // 乐观缓存（过期后仍尝试异步刷新）
+}
+```
+
+**新架构 next/dnssvc** 直接从外部配置注入（`dnssvc.go:77`）：
+```go
+svc.proxyConf: &proxy.Config{
+    CacheSizeBytes: c.CacheSize,
+    CacheEnabled:   c.CacheEnabled,  // CacheSize > 0 自动为 true
+}
+```
+
+### 14.2 TTL 四策略
+
+dnsproxy 的缓存对 TTL 提供四层控制（按优先级排序）：
+
+| 策略 | 字段 | 作用 | 默认值 |
+|------|------|------|:------:|
+| 1. 最大 TTL 封顶 | `CacheMaxTTL` | 上游返回 TTL 超过此值时，截断为该值（防止过长缓存） | 0 = 不限制 |
+| 2. 最小 TTL 保底 | `CacheMinTTL` | 上游返回 TTL 低于此值时，延长到该值（防止过度刷新） | 0 = 不限制 |
+| 3. 乐观缓存 | `CacheOptimistic` | 条目过期后仍返回给客户端，同时异步刷新（低延迟优先） | false |
+| 4. 阻断响应固定 TTL | `BlockedResponseTTL` | 被过滤/拦截的响应统一 TTL（由 DNSFilter 自己设置，与 proxy.Cache 独立） | 3600 秒 |
+
+### 14.3 阻断响应的独立 TTL
+
+被 AdGuardHome 主动拦截的响应（广告、恶意域名、SafeSearch 等）不走 dnsproxy 的缓存系统，而是由过滤层直接设置固定 TTL：
+
+```go
+// filtering.go:181
+type Config struct {
+    // TTL (秒) 用于所有被过滤阻断的响应
+    BlockedResponseTTL uint32  // 默认 3600
+}
+
+// dnsforward 使用时
+func (s *Server) BlockedResponseTTL() (ttl uint32) {
+    return s.dnsFilter.BlockedResponseTTL()
+}
+
+// 生成阻断响应时设置
+func (s *Server) NewMsgNXDOMAIN(req *dns.Msg) (resp *dns.Msg) {
+    resp = s.replyCompressed(req)
+    resp.Rcode = dns.RcodeNameError
+    if len(resp.Ns) > 0 {
+        resp.Ns[0].Header().Ttl = s.BlockedResponseTTL()
+    }
+    return resp
+}
+```
+
+### 14.4 缓存条目淘汰（Eviction）
+
+dnsproxy 内部采用 **LRU（Least Recently Used）+ 字节数硬限制** 的混合淘汰策略：
+- 每次写入缓存时检查 `CacheSizeBytes`，超过容量就淘汰最久未使用的条目
+- 由 `golibs/cache`（LRU）底层实现，按时间戳排序双向链表维护访问热度
+- 乐观缓存模式下，过期条目不会立即删除，而是命中时触发异步 goroutine 刷新
+
+### 14.5 绕过缓存的情况
+
+以下请求不会进入缓存：
+- 被 AdGuardHome 本地拦截的响应（filter 阻断、DHCP、DDR、Rewrite） — 直接返回，由 BlockedResponseTTL 控制客户端侧缓存
+- 非 IN Class 的请求
+- 请求设置了 `CD`（Checking Disabled）或 `DO`（DNSSEC OK）位且代理启用了 DNSSEC — 为防止缓存污染
+
+---
+
+## 15. next/dnssvc 新架构 Entry Point 与切换路径
+
+`internal/next/` 目录是 AdGuardHome 下一代架构的试验场，目前已实现一个可独立运行的精简 DNS 服务。
+
+### 15.1 新架构总入口：`internal/next/cmd`
+
+#### (1) Main 函数：`cmd/cmd.go:21`
+
+```go
+func Main(embeddedFrontend fs.FS) {
+    ctx := context.Background()
+    baseLogger := newBaseLogger(opts)
+
+    // 1. 创建配置管理器（读 YAML → 组装 Service）
+    confMgrConf := &configmgr.Config{
+        BaseLogger: baseLogger,
+        Frontend:   frontend,
+        FileName:   opts.confFile,   // AdGuardHome.yaml
+        // ...
+    }
+
+    // 2. 服务管理器管理 Web + DNS 两大服务
+    svc, err := newServiceMgr(ctx, &serviceMgrConfig{
+        confMgrConf: confMgrConf,
+        logger:      baseLogger.With("svc"),
+    })
+
+    // 3. 启动全部服务
+    errors.Check(svc.Start(startCtx))
+
+    // 4. 信号处理（SIGHUP 触发 Refresh，SIGINT/SIGTERM 触发 Shutdown）
+    sigHdlr := service.NewSignalHandler(...)
+    sigHdlr.AddService(svc)
+    os.Exit(sigHdlr.Handle(ctx))
+}
+```
+
+#### (2) 服务管理器：`cmd/service.go:61`
+
+```go
+func (s *serviceMgr) Start(ctx context.Context) (err error) {
+    var errs []error
+    // 并行启动 Web UI + DNS
+    errs = append(errs, s.confMgr.Web().Start(ctx))   // websvc.Service
+    errs = append(errs, s.confMgr.DNS().Start(ctx))   // dnssvc.Service
+    return errors.Join(errs...)
+}
+
+// SIGHUP 热重载
+func (s *serviceMgr) Refresh(ctx context.Context) (err error) {
+    _ = s.Shutdown(ctx)         // 1. 停掉旧服务
+    _ = s.updConfMgr(ctx)       // 2. 重新读配置，重建 Manager + Services
+    return s.Start(ctx)         // 3. 启动新服务（暴力全重启模式）
+}
+```
+
+### 15.2 ConfigManager：配置 → 服务实例的装配器
+
+`internal/next/configmgr/configmgr.go:101` 是架构核心的 **纯函数式装配器**，负责：
+
+```
+磁盘 YAML
+   │
+   ▼ read() → config 结构体
+   │
+   ▼ assemble()
+   │    ├─ 解析 DNS 配置 → dnssvc.Config
+   │    │     ├─ dnssvc.New(c)  → 创建 *dnssvc.Service
+   │    │     └─ m.dns = svc
+   │    │
+   │    └─ 解析 Web 配置 → websvc.Config
+   │          ├─ websvc.New(c) → 创建 *websvc.Service
+   │          └─ m.web = svc
+   │
+   ▼ Manager {dns, web, current, fileName}
+```
+
+关键装配函数 `assemble()` (`configmgr.go:152`)：
+
+```go
+func (m *Manager) assemble(ctx, conf, frontend, webAddr, start) (err error) {
+    // DNS 服务装配：纯数据驱动
+    dnsConf := &dnssvc.Config{
+        Logger:              m.baseLogger.With("dnssvc"),
+        UpstreamMode:        conf.DNS.UpstreamMode,
+        Addresses:           conf.DNS.Addresses,
+        BootstrapServers:    conf.DNS.BootstrapDNS,
+        UpstreamServers:     conf.DNS.UpstreamDNS,
+        CacheSize:           conf.DNS.CacheSize,
+        CacheEnabled:        conf.DNS.CacheSize > 0,
+        // ...
+    }
+    err = m.updateDNS(ctx, dnsConf)  // Shutdown 旧的 → dnssvc.New() 创建新的
+
+    // Web 服务装配（同样是数据驱动 + 重建）
+    webSvcConf := &websvc.Config{ ConfigManager: m, ... }
+    err = m.updateWeb(ctx, webSvcConf)
+}
+```
+
+### 15.3 DNS 服务内部 Entry Point：`dnssvc.New()`
+
+`internal/next/dnssvc/dnssvc.go:62`：
+
+```go
+func New(c *Config) (svc *Service, err error) {
+    // 1. RateLimit 中间件（唯一的中间件）
+    rlMw, err := newRatelimitMw(c.Logger, c.Ratelimit)
+
+    svc = &Service{
+        logger: c.Logger,
+        proxyConf: &proxy.Config{  // 保存以便 Config() 回读
+            CacheEnabled: c.CacheEnabled,
+            CacheSizeBytes: c.CacheSize,
+            // ...
+        },
+    }
+
+    // 2. 地址 + 上游 解析
+    upstreams, resolvers, err := addressesToUpstreams(
+        c.Logger, c.UpstreamServers, c.BootstrapServers, ...)
+    svc.bootstrapResolvers = resolvers
+
+    // 3. 直接创建 proxy.Proxy（对比 dnsforward：省略了 Prepare → Start 两步）
+    svc.proxy, err = proxy.New(&proxy.Config{
+        UpstreamConfig:  &proxy.UpstreamConfig{Upstreams: upstreams},
+        UDPListenAddr:   udpAddrs(c.Addresses),  // 一次性地址转换
+        TCPListenAddr:   tcpAddrs(c.Addresses),
+        RequestHandler:  rlMw.Wrap(proxy.DefaultHandler{}),  // 精简中间件链
+        CacheEnabled:    c.CacheEnabled,
+        DNSSECEnabled:   c.DNSSECEnabled,
+        UseDNS64:        c.UseDNS64,
+    })
+    return svc, nil
+}
+```
+
+### 15.4 Web API 动态重配：热切换路径
+
+`internal/next/websvc/dns.go:63` 的 `handlePatchSettingsDNS()` 展示了新架构下 DNS 配置热更新的路径：
+
+```
+PATCH /api/v1/settings/dns
+   │
+   ▼ handlePatchSettingsDNS(w, r)
+   │
+   ├── 1. 取当前 DNS 服务配置副本
+   │     dnsSvc := svc.confMgr.DNS()
+   │     newConf := dnsSvc.Config()
+   │
+   ├── 2. JSON Patch 增量修改
+   │     req.UpstreamMode.Set(&newConf.UpstreamMode)
+   │     req.CacheSize > 0 → newConf.CacheEnabled = true
+   │     // ...
+   │
+   ├── 3. 交给 ConfigManager 更新
+   │     svc.confMgr.UpdateDNS(ctx, newConf)
+   │        │
+   │        ├── Manager.updateDNS()
+   │        │     ├── prev.Shutdown(ctx)         // 关闭旧 dnssvc.Service
+   │        │     └── dnssvc.New(c) → m.dns = svc  // 生成全新实例
+   │        │
+   │        ├── Manager.updateCurrentDNS(c)     // 更新内存配置镜像
+   │        └── Manager.write(ctx)              // 序列化到 YAML 文件
+   │
+   └── 4. 启动新 DNS 服务
+         newSvc := svc.confMgr.DNS()   // 拿到刚创建的新实例
+         newSvc.Start(ctx)             // 启动监听
+```
+
+### 15.5 新旧架构实现对比
+
+| 维度 | 旧架构 `dnsforward.Server` | 新架构 `next/dnssvc.Service` |
+|------|:------------------------:|:--------------------------:|
+| **启动模式** | `New()` → `Prepare()` → `Start()` 三阶段分离 | `New()` 内部同时创建 proxy 实例，外部再 `Start()` |
+| **配置修改** | `Reconfigure()` 内部热切换，尽量复用实例 | 始终 `Shutdown 旧 → New 新 → Start 新`，纯不可变 |
+| **配置存储** | 直接持有 `*ServerConfig`，全局指针耦合 | 通过 `configmgr.Manager` 统一管理，Service 仅持有创建参数 |
+| **处理功能** | 9 模块管道 + 6 Checker 过滤 + DHCP + 日志/统计 + ipset | 仅依赖 `proxy.DefaultHandler`（转发 + 缓存） |
+| **中间件链** | RateLimit → Logging → Server.Wrap (3 层) | 仅 RateLimit (1 层) |
+| **客户端能力** | ClientID + 自定义上游 + 按客户端过滤 | 无 |
+| **入口文件** | `internal/home/dns.go`（嵌在 globalContext 中） | `internal/next/cmd/cmd.go`（独立二进制） |
+| **热更新策略** | 局部更新（部分字段支持运行时改） | 全量重建服务（简单可靠） |
+
+新架构的核心设计哲学：**"配置即数据，服务即实例"**。每次配置变更都生成全新的 Service 对象，消除了旧架构中因运行时状态交织带来的复杂度代价，是未来 AdGuardHome 重构的方向。
+
+---
+
+## 16. 关键文件索引（完整）
 
 | 功能模块 | 文件路径 | 关键行号/函数 |
 |---------|---------|-------------|
@@ -1475,46 +1919,59 @@ func New(c *Config) (svc *Service, err error) {
 | ClientID 提取实现 | `internal/dnsforward/clientid.go` | `clientIDFromClientServerName()` (L20), `clientIDFromDNSContextHTTPS()` (L63), `clientServerName()` (L91), `clientServerNameFromHTTP()` (L130) |
 | 访问控制引擎 | `internal/dnsforward/access.go` | `accessManager` (L22), `processAccessClients()` (L39), `newAccessCtx()` (L66), `allowlistMode()` (L108), `isBlockedClientID()` (L113), `isBlockedIP()` (L141) |
 | 处理管道 & 上游转发 & DHCP 解析 | `internal/dnsforward/process.go` | `processDHCPHosts()` (L275), `processDHCPAddrs()` (L345), `processUpstream()` (L441), `setCustomUpstream()` (L516), `dhcpHostFromRequest()` (L494) |
+| 过滤规则引擎 (前后置) | `internal/dnsforward/filter.go` | `filterDNSRequest()` (L28), `filterDNSResponse()` (L116), `filterAfterResponse()` (L97) |
+| DNS 过滤核心 | `internal/filtering/filtering.go` | `DNSFilter` 结构体 (L252), `hostChecker` (L337), `CheckHost()` (L1787) |
 | 上游配置构造 | `internal/dnsforward/upstreams.go` | `newBootstrap()` (L27), `newUpstreamConfig()` (L60), `newPrivateConfig()` (L97), `setProxyUpstreamMode()` (L143) |
 | 客户端专属上游 | `internal/client/upstreammanager.go` | `customUpstreamConfig()` (L122), `newCustomUpstreamConfig()` (L209) |
 | DoH 主路由注册 | `internal/home/dns.go` | `initDNS()` (L46), `newServerConfig()` (L263), `registerDoHHandlers()` (L598) |
 | DoH 鉴权豁免 | `internal/home/authhttp.go` | `isDoHRoute()` (L327), `authMiddlewareDefault.Wrap()` (L404) |
 | DoH 路由默认配置 | `internal/home/config.go` | `doHConfig` 结构体 (L209), 默认 routes (L469) |
 | 日志统计 | `internal/dnsforward/stats.go` | `processQueryLogsAndStats()` (L19) |
-| 新架构实现 | `internal/next/dnssvc/dnssvc.go` | `New()` (L62) |
+| 新架构 dnssvc 实现 | `internal/next/dnssvc/dnssvc.go` | `New()` (L62), `Config()` (L158), `Start()` (L173) |
+| 新架构总入口 | `internal/next/cmd/cmd.go` | `Main()` (L21) |
+| 新架构服务管理 | `internal/next/cmd/service.go` | `serviceMgr` (L61), `Start()` (L79), `Refresh()` (L144) |
+| 新架构配置管理 | `internal/next/configmgr/configmgr.go` | `Manager` (L101), `assemble()` (L152), `UpdateDNS()` (L216), `updateDNS()` (L351) |
+| 新架构 Web API | `internal/next/websvc/dns.go` | `handleGetSettingsDNS()` (L40), `handlePatchSettingsDNS()` (L63) |
 | DoH API 配置 | `internal/dnsforward/http.go` | `registerHandlers()` (L823), HTTP 控制接口 |
 
 ---
 
-## 15. 总结
+## 17. 总结
 
-AdGuardHome 的 DNS 多协议统一架构，通过四层核心设计、三个关键扩展机制、两组业务协同链路，实现了协议透明性与业务可扩展性的平衡：
+AdGuardHome 的 DNS 多协议统一架构，通过五层核心设计、四个关键扩展机制、两组业务协同链路、两大深层系统与一条演进路径，实现了协议透明性、业务可扩展性与长期可演进性的平衡：
 
-### 核心四层设计
+### 核心五层设计
 
 1. **协议抽象层**（dnsproxy 库提供）：6 种协议监听器 → 统一 `DNSContext`，对上层完全屏蔽协议差异，同时注入 `IsPrivateClient` / `RequestedPrivateRDNS` 供上层使用
 2. **中间件装饰层**（3 层洋葱模型）：速率限制 → 日志注入 → ClientID 提取 + 访问控制，在进入主处理管道之前完成横切关注点
 3. **统一入口层**：`ServeDNS()` 方法，所有 DNS 查询必经的单点入口
 4. **模块化管道层**：9 个独立处理模块依次执行，按需提前短路返回
+5. **过滤规则引擎层**：前后置双阶段过滤（processFilteringBeforeRequest + processFilteringAfterResponse），6 大 hostChecker 顺序执行并短路匹配
 
-### 三个关键扩展机制
+### 四个关键扩展机制
 
-5. **上游分流层**（五层优先级链）：客户端专属 → 精确域名匹配 → 通配域名匹配 → 默认上游组 → Fallback 兜底，每一层都支持独立的域名分流语法与上游模式
-6. **DoH 双入口复用**：dnsproxy 独立 HTTPS 监听器 + 主 Web 路由挂载，两条路径最终汇聚到同一个 `proxy.Proxy.ServeHTTP()` → `RequestHandler` → `ServeDNS()`，实现 DNS 处理逻辑的 100% 复用
-7. **ClientID 跨协议识别**：DoH 优先从 URL 路径 `{ClientID}` 占位符提取 → DoH/DoT/DoQ 回退从 SNI 直接子域前缀提取 → 注入 context 供访问控制、自定义上游、日志统计使用
+6. **上游分流层**（五层优先级链）：客户端专属 → 精确域名匹配 → 通配域名匹配 → 默认上游组 → Fallback 兜底，每一层都支持独立的域名分流语法与上游模式
+7. **DoH 双入口复用**：dnsproxy 独立 HTTPS 监听器 + 主 Web 路由挂载，两条路径最终汇聚到同一个 `proxy.Proxy.ServeHTTP()` → `RequestHandler` → `ServeDNS()`，实现 DNS 处理逻辑的 100% 复用
+8. **ClientID 跨协议识别**：DoH 优先从 URL 路径 `{ClientID}` 占位符提取 → DoH/DoT/DoQ 回退从 SNI 直接子域前缀提取 → 注入 context 供访问控制、自定义上游、日志统计使用
+9. **缓存与 TTL 策略层**：dnsproxy 内置 LRU + 字节数硬限制的混合淘汰策略，四层 TTL 控制（最大封顶 / 最小保底 / 乐观缓存异步刷新 / 阻断响应固定 TTL）
 
 ### 两组业务协同链路
 
-8. **访问控制双维度检查**（Wrap 中间件）：IP 白/黑名单（精确 + CIDR） + ClientID 白/黑名单 + 域名黑名单，白名单模式自动切换，支持协议差异化阻断
-9. **DHCP ↔ DNS 双向解析联动**：DNS 通过 `DHCP` interface 解耦依赖 DHCP，前向 `*.lan` A/AAAA 查询经 `IPByHost()` 查租约返回，反向私有网段 PTR 查询经 `HostByIP()` 查租约返回，安全开关依赖 dnsproxy 注入的私有网段标识
+10. **访问控制双维度检查**（Wrap 中间件）：IP 白/黑名单（精确 + CIDR） + ClientID 白/黑名单 + 域名黑名单，白名单模式自动切换，支持协议差异化阻断
+11. **DHCP ↔ DNS 双向解析联动**：DNS 通过 `DHCP` interface 解耦依赖 DHCP，前向 `*.lan` A/AAAA 查询经 `IPByHost()` 查租约返回，反向私有网段 PTR 查询经 `HostByIP()` 查租约返回，安全开关依赖 dnsproxy 注入的私有网段标识
+
+### 一条演进路径
+
+12. **next/dnssvc 新架构迁移**：通过 `configmgr.Manager` 实现纯函数式装配 —— "配置即数据，服务即实例"，每次变更全量 Shutdown 旧服务 + New 新服务 + Start，以换取配置解耦与不可变性；简化中间件链至单一层，依托 `proxy.DefaultHandler` 完成核心转发与缓存
 
 ### 整体优势
 
 - **可扩展性**：新增协议只需在 dnsproxy 中实现 Listener，上层逻辑零改动
 - **一致性**：所有协议使用相同的过滤、统计、日志逻辑，行为一致
 - **可测试性**：各模块独立可测，不依赖具体协议
-- **演进能力**：通过 Wrap 模式可无限扩展横切关注点（如 tracing、鉴权等）
+- **演进能力**：通过 Wrap 模式可无限扩展横切关注点（如 tracing、鉴权等），新架构纯函数式装配进一步降低状态耦合
 - **灵活性**：上游分流支持按客户端、域名多级精细化调度，Fallback 保障解析可靠性
 - **部署弹性**：DoH 双入口模式可在独立专用端口与共享 Web 端口之间自由选择
-- **安全性**：私有网段 DHCP 解析对外部客户端屏蔽，UDP 阻断采用丢包避免放大攻击
-- **解耦性**：DNS 与 DHCP 通过 interface 解耦，支持独立替换与测试
+- **安全性**：私有网段 DHCP 解析对外部客户端屏蔽，UDP 阻断采用丢包避免放大攻击，Bogus NXDOMAIN 检查过滤虚假响应
+- **解耦性**：DNS 与 DHCP 通过 interface 解耦，支持独立替换与测试；新架构 ConfigManager 将配置读写与服务生命周期解耦
+- **性能可控**：Cache 支持 TTL 上下限、乐观缓存、LRU 淘汰，阻断响应独立 TTL 控制下游客户端缓存行为
