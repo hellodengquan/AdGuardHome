@@ -864,7 +864,217 @@ Goroutine A (查询):          Goroutine B (替换):
 - 但替换期间到达的查询会排队等待，造成短暂延迟
 - 由于引擎替换频率很低（最快 1 小时一次），且耗时很短（内存指针赋值），实际影响可忽略
 
-### 10.6 待确认的隐患（代码 TODO）
+### 10.6 热替换失败时：旧引擎保留 vs 半切换中间态的分支分析
+
+关键问题：`initFiltering()` 构建新引擎的过程可能在多个阶段失败，失败后旧引擎是否还在？是否出现"黑名单已切换、白名单未切换"的半切换状态？
+
+#### 10.6.1 失败分支的完整分析
+
+`initFiltering()` 的代码结构（`filtering.go:746-777`）：
+
+```go
+func (d *DNSFilter) initFiltering(ctx context.Context, allowFilters, blockFilters []Filter) (err error) {
+    // 阶段 1：构建黑名单 storage
+    rulesStorage, err := newRuleStorage(blockFilters)
+    if err != nil {
+        return err          // ← 失败点 1：黑名单 storage 构建失败
+    }
+
+    // 阶段 2：构建白名单 storage
+    rulesStorageAllow, err := newRuleStorage(allowFilters)
+    if err != nil {
+        return err          // ← 失败点 2：白名单 storage 构建失败
+                            //   ⚠️ 注意：此时 rulesStorage 已创建但未被任何地方引用！
+    }
+
+    // 阶段 3：构建 DNS 引擎对象（纯内存操作，通常不失败）
+    filteringEngine := urlfilter.NewDNSEngine(rulesStorage)
+    filteringEngineAllow := urlfilter.NewDNSEngine(rulesStorageAllow)
+
+    // 阶段 4：原子替换指针（在写锁内执行）
+    func() {
+        d.engineLock.Lock()
+        defer d.engineLock.Unlock()
+
+        d.reset(ctx)               // 释放旧引擎
+        d.rulesStorage = rulesStorage
+        d.filteringEngine = filteringEngine
+        d.rulesStorageAllow = rulesStorageAllow
+        d.filteringEngineAllow = filteringEngineAllow
+    }()
+
+    return nil
+}
+```
+
+#### 10.6.2 各失败点的状态分析
+
+| 失败点 | 触发条件 | 旧引擎状态 | 新对象状态 | 是否半切换 | 资源泄漏风险 |
+|-------|---------|-----------|-----------|-----------|------------|
+| **失败点 1** | 黑名单 storage 构建失败（如 filter 文件格式错误、内存不足） | ✅ **完整保留** | 未创建任何对象 | ❌ 无半切换 | ✅ 无泄漏 |
+| **失败点 2** | 白名单 storage 构建失败 | ✅ **完整保留** | rulesStorage 已创建，但未被赋值给 `d.*` 字段，**无法被 `reset()` 释放** | ❌ 无半切换 | ⚠️ **rulesStorage 泄漏**：已分配但没有引用，GC 会回收，但其中打开的文件句柄可能未被 Close |
+| **阶段 4 写锁内** | `d.reset()` 中旧 storage.Close() 报错 | ⚠️ 旧引擎已被 reset 释放，但新指针已赋值完毕 | 新指针已全部赋值 | ❌ 仍然是原子切换（要么全旧要么全新） | ✅ reset 的错误只打日志不 return，继续赋值新指针 |
+
+**结论**：
+1. **不存在半切换状态**：`rulesStorage`/`filteringEngine` 等指针的赋值都在**同一个写锁保护**下完成，外部观察者看不到中间状态
+2. **失败点 1、2 的旧引擎完整保留**：因为失败 return 发生在写锁之外，`d.*` 字段完全未被触碰
+3. **存在 resources 泄漏隐患**：失败点 2 处 `rulesStorage` 已分配但未 Close，依赖 GC 回收；如果 `RuleStorage` 持有 mmap 或文件句柄，可能出现延迟释放
+
+#### 10.6.3 新架构 rulelist.Engine.Refresh() 的失败回滚
+
+新架构的回滚逻辑更简洁（`rulelist/engine.go:138-153`）：
+
+```go
+ruleLists, errs := engRefr.process(ctx, filtersToRefresh)
+if isOneTimeoutError(errs) {
+    return err          // ← 纯超时：直接返回，不碰引擎
+}
+
+storage, err := filterlist.NewRuleStorage(ruleLists)
+if err != nil {
+    errs = append(errs, fmt.Errorf("creating rule storage: %w", err))
+    return errors.Join(errs...)   // ← storage 构建失败：直接返回，不碰引擎
+}
+
+// 只有以上都成功，才执行替换
+e.resetStorage(ctx, storage)
+```
+
+**新架构的失败策略**：
+- `ctx` 取消/超时：**完全不替换**，旧引擎原样保留
+- 部分订阅源刷新失败（非超时）：**继续构建**，使用成功的 ruleLists 构建 storage 并替换，失败的订阅源被跳过
+- storage 构建失败：**完全不替换**，旧引擎原样保留
+- 所有订阅源都成功：正常替换
+
+**注意新架构的"部分成功"语义**：如果 10 个订阅源有 3 个失败、7 个成功，会用那 7 个成功的构建新引擎并替换，旧引擎丢弃。这意味着：
+- 失败的订阅源的规则会从新引擎中**消失**（不再生效）
+- 错误通过 `errors.Join` 返回给调用方，但只打日志，不影响替换决策
+
+### 10.7 长查询持读锁期间：如何感知 ctx 取消信号
+
+关键问题：DNS 查询在 `matchHost()` 中持有 `engineLock.RLock()` 期间，如果上层 ctx（比如客户端关闭连接、HTTP 请求超时）被取消，查询能否提前退出并释放读锁？
+
+#### 10.7.1 结论先行：完全不感知 ctx 取消
+
+逐层追踪 ctx 的传递链路：
+
+**第一层：`CheckHost()` 入口（`filtering.go:505-537`）**
+
+```go
+func (d *DNSFilter) CheckHost(
+    host string,
+    qtype uint16,
+    setts *Settings,
+) (res Result, err error) {
+    // ❌ 没有 ctx 参数！
+    // ctx 在函数签名中完全缺失
+```
+
+**第二层：`CheckHostRules()` → `matchHost()`（`filtering.go:884-948`）**
+
+```go
+func (d *DNSFilter) matchHost(
+    host string,
+    rrtype uint16,
+    setts *Settings,
+) (res Result, err error) {
+    ctx := context.TODO()   // ← 内部创建 TODO ctx，不接受外部传入
+    // ...
+    d.engineLock.RLock()
+    defer d.engineLock.RUnlock()
+    // ... 同步执行 MatchRequest
+    dnsres, ok := d.filteringEngineAllow.MatchRequest(ufReq)  // ← 同步阻塞调用
+    dnsres, matchedEngine := d.filteringEngine.MatchRequest(ufReq)
+    // ... 整个过程没有 select ctx.Done()
+```
+
+**第三层：`urlfilter.DNSEngine.MatchRequest()`**
+
+这是纯 CPU 的内存匹配操作（哈希查找、前缀/后缀匹配），没有 IO、没有 select、没有 `ctx.Done()` 检查。
+
+#### 10.7.2 完整 ctx 缺失情况汇总
+
+| 函数 | 是否有 ctx 参数 | 是否在持锁期间检查 ctx.Done() |
+|------|----------------|---------------------------|
+| `CheckHost()` | ❌ 无 | —— |
+| `CheckHostRules()` | ❌ 无 | —— |
+| `matchHost()` | ❌ 无（内部用 `context.TODO()`） | ❌ 不检查 |
+| `matchHostProcessAllowList()` | ✅ 有 ctx 参数 | ❌ 只用于打日志 |
+| `processRewrites()` | ❌ 无（内部用 `context.TODO()`） | —— |
+| `urlfilter.DNSEngine.MatchRequest()` | ❌ 无 | —— |
+
+**唯一检查 ctx 的场景**：新架构 `rulelist/engine.go:209-211` 的**刷新过程**中（不是查询过程）：
+
+```go
+// engineRefresh.process(): 刷新循环中的 ctx 检查
+select {
+case <-ctx.Done():
+    return nil, []error{fmt.Errorf("timeout after updating %d filters: %w", i, ctx.Err())}
+default:
+    // Go on.
+}
+```
+
+这是**刷新过程**的取消，不是**查询过程**的取消。
+
+#### 10.7.3 典型场景推演：热替换时的长查询
+
+假设：某个查询持读锁后，`MatchRequest()` 因规则量巨大执行了 100ms（极端情况），此时热替换的写锁到来。
+
+```
+时间轴（ms）→
+
+  0ms  查询 Goroutine A:
+          RLock() ← 获取读锁
+          engine.MatchRequest() ← 开始长匹配（~100ms）
+
+ 10ms  刷新 Goroutine B:
+          构建新引擎完成
+          engineLock.Lock() ← 阻塞！因为有读锁持有者 A
+
+ 50ms  客户端关闭连接，上层 ctx 被取消
+         ❌ 查询 Goroutine A 完全感知不到！
+            它还在 MatchRequest() 内部做哈希查找...
+
+100ms  查询 Goroutine A:
+          MatchRequest() 返回
+          RUnlock() ← 释放读锁
+
+101ms  刷新 Goroutine B:
+          Lock() 成功
+          reset() + 赋值新指针
+          Unlock()
+```
+
+**关键后果**：
+1. **ctx 被取消后，长查询仍然完整执行到底**：不会提前释放读锁
+2. **热替换被长查询阻塞的时间 = 查询剩余执行时间**：理论上最坏情况 = 最长单次查询耗时
+3. **上层（如 dnsforward）可能已经丢弃了查询响应**：客户端早已关闭连接，但匹配还在进行，CPU 被浪费
+
+#### 10.7.4 与新架构 rulelist 的对比
+
+新架构查询路径 `Engine.FilterRequest()`（`rulelist/engine.go:88-92`）：
+
+```go
+func (e *Engine) FilterRequest(req *urlfilter.DNSRequest) (res *urlfilter.DNSResult, hasMatched bool) {
+    return e.currentEngine().MatchRequest(req)
+}
+
+func (e *Engine) currentEngine() (engine *urlfilter.DNSEngine) {
+    e.mu.RLock()
+    defer e.mu.RUnlock()
+    return e.engine   // ← 读完就释放锁！
+}
+```
+
+**重要差异**：新架构的读锁只在"获取引擎指针"瞬间持有，`MatchRequest()` 调用发生在锁释放之后。这意味着：
+- 即使 `MatchRequest()` 执行 100ms，也**不阻塞写者**
+- 热替换可以随时进行，不用等查询完成
+- 但旧引擎的释放需要等 GC（因为 `MatchRequest()` 还在持有引擎对象的引用）
+
+旧架构（当前运行）的读锁持有范围覆盖整个 `MatchRequest()` 执行期，新架构则缩小到"指针读取"瞬间。
+
+### 10.8 待确认的隐患（代码 TODO）
 
 代码注释中有一个待确认的问题（`filtering.go:905-908`）：
 
@@ -1127,7 +1337,89 @@ d.EnableFilters(true)
 - `LastUpdated` 概念（通过刷新时间推断）
 - 日志记录刷新事件
 
-### 12.6 小结：当前监控现状与改进空间
+### 12.6 Prometheus / expvar 暴露路径的代码级追踪
+
+沿着代码库逐层查找，确认过滤刷新模块是否接入了全局 metrics 基础设施。
+
+#### 12.6.1 全局 HTTP mux 的 handler 注册链路
+
+Web UI 的 HTTP 框架走两层注册：
+
+**第一层：各子模块通过 `aghhttp.Registrar` 注册**（`filtering/http.go:721`）
+
+```go
+// filtering/http.go:721
+registerHTTP := d.conf.HTTPReg.Register
+
+// 注册所有 /control/filtering/* 端点
+registerHTTP(http.MethodGet, "/control/filtering/status", d.handleFilteringStatus)
+registerHTTP(http.MethodPost, "/control/filtering/refresh", d.handleFilteringRefresh)
+// ... 共约 30 个端点
+```
+
+**第二层：`aghhttp.Registrar` 最终把 handler 挂到全局 `*http.ServeMux`**（`home/web.go:191-193`）
+
+```go
+mux := conf.mux  // 全局 *http.ServeMux
+mux.Handle("/", withMiddlewares(clientFS, gziphandler.GzipHandler, w.postInstallHandler))
+```
+
+全局 mux 上只注册了三类路由：
+- `/` → 前端静态资源 + 所有 `/control/*`（通过各子模块的 Registrar 注册）
+- `/debug/pprof/*` → `httputil.RoutePprof(mux)` 注册的 Go pprof 调试端点（`web.go:452`）
+
+#### 12.6.2 关键结论：没有 `/metrics` 和 `/debug/vars` 端点
+
+对全局代码库做三重排查：
+
+| 排查维度 | 代码搜索结果 | 结论 |
+|---------|-------------|------|
+| `prometheus.Register` / `MustRegister` / `promhttp` | **0 处命中** | 没有导入 `prometheus/client_golang` 库 |
+| `expvar.Handler` / `/debug/vars` | **0 处命中** | 没有使用 Go 标准库 `expvar` 包 |
+| `/metrics` handler 注册 | **0 处命中** | `ServeMux` 上没有挂载 metrics 路径 |
+
+项目中 `golibs/httputil.RoutePprof` 只挂载了 `net/http/pprof` 标准调试端点（`/debug/pprof/heap`、`/debug/pprof/goroutine` 等），**不包含任何业务 metrics**。
+
+#### 12.6.3 rulelist 新架构的 import 分析
+
+`rulelist/rulelist_test.go` 的 import 列表：
+
+```go
+import (
+    // ... 标准库 + golibs + urlfilter
+    // ❌ 无 prometheus/client_golang
+    // ❌ 无 expvar
+)
+```
+
+`rulelist/engine.go` 的 import：
+
+```go
+import (
+    "context"
+    "fmt"
+    "log/slog"
+    "net/http"
+    "sync"
+    // 只有 golibs/errors、urlfilter 等，无 metrics 相关库
+)
+```
+
+**确认：rulelist 新架构同样没有任何 metrics 注册代码。**
+
+#### 12.6.4 可观测性的唯一间接来源：日志导出
+
+上游运维系统如果要采集刷新成功率、耗时，唯一可行路径：
+
+```
+过滤刷新 → slog.Logger 输出结构化日志 → 
+外部采集器（Loki/Promtail）→ 日志聚合系统 → 
+通过 LogQL/PromQL 间接计算 metrics
+```
+
+即：**metrics 层完全缺位，只能靠日志旁路重建。**
+
+### 12.7 小结：当前监控现状与改进空间
 
 | 维度 | 现状 | 可改进方向 |
 |------|------|-----------|
@@ -1137,6 +1429,8 @@ d.EnableFilters(true)
 | 调度间隔 | ⚠️ 可通过 status API 间接推断 | 增加下次刷新时间戳 |
 | 引擎规则总数 | ✅ 通过 status API 可获得 | 保持现状 |
 | Prometheus 格式 | ❌ 完全没有 | 增加 `/metrics` 端点或接入全局 metrics |
+| expvar 暴露 | ❌ 完全没有 | 如需接入，导入 `expvar` 并注册变量 |
+| handler/register 路径 | ✅ Registrar → ServeMux 链路清晰 | 扩展时只需在 Registrar 上注册新 handler |
 
 ---
 
@@ -1431,3 +1725,20 @@ func (d *DNSFilter) finalizeUpdate(...) (err error) {
 | `filterSetProperties` 设属性 | `internal/filtering/filter.go:220` |
 | `filterAdd` 添加订阅源 | `internal/filtering/filter.go:200` |
 | `filterDel` 删除订阅源 | `internal/filtering/filter.go:228` |
+| **热替换失败回滚相关** | |
+| `initFiltering()` 失败点1/2（storage 构建） | `internal/filtering/filtering.go:748-755` |
+| `rulelist.Engine.Refresh()` 失败策略判断 | `internal/filtering/rulelist/engine.go:138-153` |
+| `isOneTimeoutError()` 超时识别 | `internal/filtering/rulelist/engine.go:177-185` |
+| `resetStorage()` 引擎替换 + 旧 storage Close | `internal/filtering/rulelist/engine.go:158-173` |
+| **ctx 取消感知相关** | |
+| `CheckHost()` 入口（无 ctx 参数） | `internal/filtering/filtering.go:505` |
+| `matchHost()` 内部创建 `context.TODO()` | `internal/filtering/filtering.go:893` |
+| `rulelist.Engine.currentEngine()` 持锁范围 | `internal/filtering/rulelist/engine.go:95-100` |
+| `engineRefresh.process()` 刷新循环中 ctx 检查 | `internal/filtering/rulelist/engine.go:209-211` |
+| **metrics 暴露路径相关** | |
+| HTTP 端点注册（filtering 子模块） | `internal/filtering/http.go:721-760` |
+| 全局 mux 路由挂载 | `internal/home/web.go:191-193` |
+| pprof 端点注册（RoutePprof） | `internal/home/web.go:452` |
+| `filteringConfig` 响应结构（status API 字段） | `internal/filtering/http.go:415-421` |
+| `filterJSON` 结构（无 last_error 字段） | `internal/filtering/http.go:404-413` |
+| stats 模块 HTTP 注册（仅 DNS 查询指标） | `internal/stats/http.go:302-309` |
