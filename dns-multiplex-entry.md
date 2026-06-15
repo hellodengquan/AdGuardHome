@@ -1908,11 +1908,604 @@ PATCH /api/v1/settings/dns
 
 ---
 
-## 16. 关键文件索引（完整）
+## 16. 查询日志（Query Log）写入链路
+
+查询日志是 AdGuardHome 审计与排障的核心，采用 **"内存缓冲 → 异步刷盘 → 轮转归档"** 的三级流水线。
+
+### 16.1 日志入口：`processQueryLogsAndStats()`
+
+`internal/dnsforward/stats.go:19` 是所有 DNS 请求的日志与统计分叉点，统一由处理管道第9模块调用：
+
+```go
+func (s *Server) processQueryLogsAndStats(ctx, l, dctx) (rc resultCode) {
+    pctx := dctx.proxyCtx
+    host := aghnet.NormalizeDomain(pctx.Req.Question[0].Name)
+    processingTime := time.Since(dctx.startTime)
+
+    // 1. 构造客户端标识（ClientID 优先于 IP）
+    ip := pctx.Addr.Addr().AsSlice()
+    s.anonymizer.Load()(ip)    // 可配置的 IP 匿名化
+    ipStr := net.IP(ip).String()
+    ids := []string{ipStr}
+    if dctx.clientID != "" {
+        ids = []string{dctx.clientID, ipStr}
+    }
+
+    s.serverLock.RLock()
+    defer s.serverLock.RUnlock()
+
+    // 2. 分流写入 Query Log
+    if s.shouldLog(host, qt, cl, ids) {
+        s.logQuery(dctx, ip, processingTime)
+    }
+    // 3. 分流写入 Stats（见下一章）
+    if s.shouldCountStat(host, qt, cl, ids) {
+        s.updateStats(dctx, ipStr, processingTime)
+    }
+}
+```
+
+`shouldLog()` 检查条件：
+- 非 TypeANY 查询（若 `RefuseAny` 开启）
+- 客户端 `IgnoreQueryLog` 标志未设置
+- 域名不在忽略名单（`IgnoreEngine`）
+
+### 16.2 Query Log Writer：`logQuery()` → `queryLog.Add()`
+
+`internal/dnsforward/stats.go:99` 的 `logQuery()` 将 DNS 上下文转换为 `querylog.AddParams` 后提交：
+
+```go
+func (s *Server) logQuery(dctx *dnsContext, ip net.IP, processingTime time.Duration) {
+    p := &querylog.AddParams{
+        Question:   pctx.Req,
+        Answer:     pctx.Res,
+        OrigAnswer: dctx.origResp,      // 过滤前的原始上游响应（用于审计）
+        Result:     dctx.result,
+        ClientID:   dctx.clientID,
+        ClientIP:   ip,
+        Elapsed:    processingTime,
+        Cached:     p.Cached,           // 缓存命中标记
+    }
+    // 协议类型标记（DoH/DoQ/DoT/DNSCrypt/Plain）
+    p.ClientProto = protocolMap[pctx.Proto]
+    // 上游地址（含缓存命中标识）
+    p.Upstream = pctx.Upstream.Address()
+    s.queryLog.Add(p)
+}
+```
+
+### 16.3 内存缓冲：RingBuffer + 异步刷盘
+
+`internal/querylog/qlog.go:26` 的 `queryLog` 结构体是日志写入的核心：
+
+```go
+type queryLog struct {
+    // 环形内存缓冲区（容量 = MemSize，默认 1000）
+    buffer *container.RingBuffer[*logEntry]
+
+    bufferLock    sync.RWMutex     // 保护 buffer 并发写入
+    fileFlushLock sync.Mutex       // 防止刷盘 goroutine 重入
+    fileWriteLock sync.Mutex       // 保护文件追加写入
+    flushPending  bool             // 刷盘进行中标记
+}
+```
+
+写入路径 `queryLog.Add()` (`qlog.go:219`)：
+
+```
+调用 queryLog.Add(p)
+   │
+   ├── 参数校验 → newLogEntry() 构造 logEntry
+   │     ├── Time: time.Now()
+   │     ├── QHost/QType/QClass: 标准化问题
+   │     ├── addResponse(Answer) → 解析响应中的 IP/CNAME
+   │     └── addResponse(OrigAnswer, true) → 保存原始响应
+   │
+   ├── bufferLock.Lock()
+   ├── buffer.Push(entry)               // 写入环形缓冲
+   │
+   ├── 触发条件：!flushPending && FileEnabled && buffer.Len() >= MemSize
+   │     └── go l.flushLogBuffer()      // 异步刷盘 goroutine
+   │
+   └── bufferLock.Unlock()
+```
+
+### 16.4 刷盘与压缩：`flushLogBuffer()` → `flushToFile()`
+
+`internal/querylog/querylogfile.go:19`：
+
+```
+flushLogBuffer(ctx)
+   ├── fileFlushLock.Lock()          // 单 goroutine 刷盘
+   ├── encodeEntries(ctx)
+   │     ├── bufferLock.Lock()
+   │     ├── Range 遍历 buffer，json.Encode 每个 entry
+   │     ├── buffer.Clear()
+   │     ├── flushPending = false
+   │     └── bufferLock.Unlock()
+   │
+   └── flushToFile(ctx, b)
+         ├── fileWriteLock.Lock()
+         ├── os.OpenFile(O_WRONLY|O_CREATE|O_APPEND)
+         ├── f.Write(b.Bytes())      // 追加 JSON Lines 格式
+         └── f.Close()
+```
+
+**JSON 行格式**：每行一条 JSON，包含完整的 DNS 请求响应信息：
+```json
+{"T":"2026-06-15T10:30:00Z","QH":"example.com","QT":"A","QC":"IN",
+ "IP":"192.168.1.100","CP":"doh","ANS":[{"Type":"A","TTL":300,"V":"93.184.216.34"}],
+ "C":"rfilter","IN":false,"TM":"10ms"}
+```
+
+### 16.5 日志轮转与归档：`periodicRotate()`
+
+`qlog.go:150` 每小时检查一次，超过 `RotationIvl`（支持 6h/1d/7d/30d/90d）则轮转：
+
+```
+periodicRotate(ctx)
+   ├── 每小时触发 checkAndRotate(ctx)
+   │     ├── 读 querylog.json 首条记录的时间戳
+   │     ├── 若 oldest.Add(rotationIvl) < now → rotate()
+   │     └── os.Rename("querylog.json", "querylog.json.1")
+   │
+   └── 循环至 ctx 取消
+```
+
+**存储文件**：
+- `querylog.json` — 当前日志（JSON Lines 格式）
+- `querylog.json.1` — 上一个周期的归档日志
+
+### 16.6 Query Log 写入全链路时序
+
+```
+          DNS 请求处理完成
+                  │
+                  ▼
+    processQueryLogsAndStats(stats.go:19)
+                  │
+       ┌──────────┴──────────┐
+       │ Query Log 分支      │ Stats 分支
+       ▼                     ▼
+ logQuery(stats.go:99)   updateStats(...)
+       │
+       ▼
+ queryLog.Add(p) (qlog.go:219)
+       │
+       ├─► newLogEntry() → 生成 logEntry
+       │
+       ├─► RingBuffer.Push(entry)  ──┐
+       │                              │ 环形缓冲满
+       │                      buffer.Len() >= MemSize
+       │                              │
+       └──────────────────────────────┘
+                      │
+                      ▼
+          go flushLogBuffer() (异步 goroutine)
+                      │
+                      ├─► encodeEntries() → JSON 序列化
+                      │
+                      └─► flushToFile() → 追加到 querylog.json
+                                    │
+                      ┌─────────────┘
+                      │ 每小时检查
+                      ▼
+              periodicRotate()
+                      │
+                      └─► os.Rename → querylog.json.1
+```
+
+---
+
+## 17. 统计指标（Stats）上报与 DB Schema
+
+统计系统为 Dashboard 提供数据支撑，采用 **"内存聚合 + BoltDB 持久化 + 按小时分片"** 的架构。
+
+### 17.1 统计入口：`updateStats()`
+
+`internal/dnsforward/stats.go:143` 从 DNS 上下文提取关键指标：
+
+```go
+func (s *Server) updateStats(dctx *dnsContext, clientIP string, processingTime time.Duration) {
+    pctx := dctx.proxyCtx
+
+    // 收集上游统计（主 + fallback）
+    qs := pctx.QueryStatistics()
+    var upstreamStats []*proxy.UpstreamStatistics
+    if qs != nil {
+        upstreamStats = append(upstreamStats, qs.Main()...)
+        upstreamStats = append(upstreamStats, qs.Fallback()...)
+    }
+
+    e := &stats.Entry{
+        Client:         or(dctx.clientID, clientIP),
+        Domain:         aghnet.NormalizeDomain(pctx.Req.Question[0].Name),
+        UpstreamStats:  upstreamStats,
+        ProcessingTime: processingTime,
+        Result:         mapFilteringResultToStatResult(dctx.result.Reason),
+    }
+    s.stats.Update(e)
+}
+```
+
+结果映射：
+| 过滤原因 | 统计结果枚举 |
+|---------|------------|
+| FilteredBlockList/Invalid/BlockedService | `RFiltered` |
+| FilteredSafeBrowsing | `RSafeBrowsing` |
+| FilteredParental | `RParental` |
+| FilteredSafeSearch | `RSafeSearch` |
+| 其他 | `RNotFiltered` |
+
+### 17.2 Stats 内存聚合：`unit` 结构
+
+`internal/stats/unit.go:95` 的 `unit` 是每小时的内存聚合单元：
+
+```go
+type unit struct {
+    // 计数器 Maps（string → uint64）
+    domains            map[string]uint64   // 各域名请求数（未过滤）
+    blockedDomains     map[string]uint64   // 各域名请求数（已过滤）
+    clients            map[string]uint64   // 各客户端请求数
+    upstreamsResponses map[string]uint64   // 各上游响应数
+    upstreamsTimeSum   map[string]uint64   // 各上游总耗时（微秒）
+
+    nResult            []uint64            // 按结果分类计数 [RNotFiltered..RParental]
+    nTotal             uint64              // 总请求数
+    timeSum            uint64              // 总处理时间（微秒）
+    id                 uint32              // UnitID = UNIX时间戳 / 3600
+}
+```
+
+**聚合逻辑 `unit.add(e)`** (`unit.go:318`)：
+
+```go
+func (u *unit) add(e *Entry) {
+    // 1. 按结果分类计数
+    u.nResult[e.Result]++
+
+    // 2. 域名计数（分过滤/未过滤）
+    if e.Result == RNotFiltered {
+        u.domains[e.Domain]++
+    } else {
+        u.blockedDomains[e.Domain]++
+    }
+
+    // 3. 客户端计数
+    u.clients[e.Client]++
+
+    // 4. 总耗时累加（用于平均计算）
+    u.timeSum += uint64(e.ProcessingTime.Microseconds())
+    u.nTotal++
+
+    // 5. 上游耗时统计（跳过缓存命中和错误）
+    for _, s := range e.UpstreamStats {
+        if s.IsCached || s.Error != nil { continue }
+        u.upstreamsResponses[s.Address]++
+        u.upstreamsTimeSum[s.Address] += uint64(s.QueryDuration.Microseconds())
+    }
+}
+```
+
+### 17.3 数据库持久化：BoltDB Schema
+
+`internal/stats/stats.go:108` 使用 **BoltDB（嵌入式 KV 数据库）**，Schema 设计极简：
+
+```
+stats.db (BoltDB 文件)
+├── Bucket "00000000000005A8"   // 8字节 BigEndian UnitID
+│   └── Key "0x00" → Value = GOB 编码的 unitDB
+│
+├── Bucket "00000000000005A9"
+│   └── Key "0x00" → Value = GOB 编码的 unitDB
+│
+└── ...
+```
+
+`unitDB` 是数据库中的序列化结构（`unit.go:155`，注意 GOB 编码依赖字段名，不可重命名）：
+
+```go
+type unitDB struct {
+    NResult            []uint64     // 结果分类计数
+    Domains            []countPair  // Top 100 域名（已排序）
+    BlockedDomains     []countPair  // Top 100 被拦截域名
+    Clients            []countPair  // Top 100 客户端
+    UpstreamsResponses []countPair  // Top 100 上游响应数
+    UpstreamsTimeSum   []countPair  // Top 100 上游耗时总和
+    NTotal             uint64       // 总请求数
+    TimeAvg            uint32       // 平均耗时（微秒）= timeSum / nTotal
+}
+
+type countPair struct {
+    Name  string   // 域名/客户端/上游标识
+    Count uint64   // 计数
+}
+```
+
+**序列化 `unit.serialize()`** (`unit.go:258`)：
+```go
+func (u *unit) serialize() (udb *unitDB) {
+    return &unitDB{
+        NTotal:  u.nTotal,
+        NResult: append([]uint64{}, u.nResult...),
+        // Top N 裁剪（各取前100）
+        Domains:            convertMapToSlice(u.domains, 100),
+        BlockedDomains:     convertMapToSlice(u.blockedDomains, 100),
+        Clients:            convertMapToSlice(u.clients, 100),
+        UpstreamsResponses: convertMapToSlice(u.upstreamsResponses, 100),
+        UpstreamsTimeSum:   convertMapToSlice(u.upstreamsTimeSum, 100),
+        TimeAvg:            uint32(u.timeSum / u.nTotal),  // 计算平均值
+    }
+}
+```
+
+### 17.4 定时刷盘：`periodicFlush()`
+
+`stats.go:496` 每秒检查一次，是否跨小时：
+
+```
+periodicFlush()
+   ├── flush()
+   │     ├── id = newUnitID()  // 当前小时 ID
+   │     ├── 若 curr.id != id 说明跨小时了
+   │     │
+   │     └── flushDB(id, limit, curr)
+   │           ├── 序列化 curr → udb
+   │           ├── Begin(true) 事务
+   │           ├── flushUnitToDB(udb, tx, curr.id)
+   │           │     ├── CreateBucketIfNotExists(idToUnitName(curr.id))
+   │           │     └── Put(key=0x00, value=GOB(udb))
+   │           │
+   │           ├── 删除过期 Bucket（id - limit 之前的）
+   │           ├── curr = newUnit(id)  // 新建当前小时单元
+   │           └── Commit 事务
+   │
+   └── 循环：每秒检查，跨小时则刷盘
+```
+
+### 17.5 Stats 全链路时序
+
+```
+          DNS 请求处理完成
+                  │
+                  ▼
+    processQueryLogsAndStats(stats.go:19)
+                  │
+       ┌──────────┴──────────┐
+       │ Query Log 分支      │ Stats 分支
+       ▼                     ▼
+    logQuery(...)      stats.Update(e) (stats.go:278)
+                             │
+                             ├─► currMu.Lock()
+                             │
+                             └─► unit.add(e) → 内存聚合
+                                        │
+                      ┌─────────────────┘
+                      │ 每秒检查：跨小时？
+                      ▼
+              periodicFlush()
+                      │
+                      ├─► 跨小时 → curr.serialize() → unitDB
+                      │
+                      ├─► BoltDB 事务
+                      │   ├─ CreateBucket(unitID)
+                      │   ├─ Put(GOB(unitDB))
+                      │   ├─ DeleteBucket(过期unit)
+                      │   └─ Commit
+                      │
+                      └─► curr = newUnit(新小时ID)
+```
+
+### 17.6 查询读取路径（Dashboard 用）
+
+`stats.getData(limit)` → `loadUnits(limit)` → 从 BoltDB 读取最近 N 个 unit 聚合后返回：
+
+```
+GET /control/stats?limit=24
+   │
+   └─► StatsCtx.getData(limit=24)
+         ├─► loadUnits(24) → 读最近24个 Bucket + 当前内存 unit
+         ├─► dataFromUnits(units)
+         │    ├─► 聚合 Top N：域名 / 被拦截域名 / 客户端 / 上游
+         │    ├─► 聚合时间序列：按小时/天统计
+         │    └─► 汇总总数：总请求 / 拦截数 / 安全浏览 / 家长控制 / 平均耗时
+         └─► 返回 JSON 给前端 Dashboard
+```
+
+---
+
+## 18. Admin 与 Config 实时 Hot Reload 触发链
+
+AdGuardHome 提供 **Web API + 信号 + 新架构纯函数式** 三条配置热重载路径。
+
+### 18.1 旧架构：Web API 触发 `Reconfigure()`
+
+**入口**：`POST /control/dns_config` → `handleSetConfig()` (`internal/dnsforward/http.go:539`)
+
+```
+POST /control/dns_config (JSON Body)
+   │
+   ▼ handleSetConfig(w, r)
+   │
+   ├── 1. Decode JSON → jsonDNSConfig{}
+   │    所有字段都是指针，支持增量更新（只更新设置的字段）
+   │
+   ├── 2. validate() 校验：
+   │    - 上游可连通性
+   │    - 阻止自指配置（避免把自己设为上游）
+   │    - 缓存大小合理性
+   │
+   ├── 3. s.setConfig(req) → (shouldRestart bool)
+   │    │
+   │    ├── 非重启字段立即生效（无需重建服务）
+   │    │    ├── BlockingMode → dnsFilter.SetBlockingMode()
+   │    │    ├── BlockedResponseTTL → dnsFilter.SetBlockedResponseTTL()
+   │    │    ├── ProtectionEnabled → dnsFilter.SetProtectionEnabled()
+   │    │    ├── UpstreamMode → s.conf.UpstreamMode
+   │    │    └── DNSSECEnabled / AAAADisabled → s.conf 直接赋值
+   │    │
+   │    └── setConfigRestartable(dc) → 检查是否需要重启
+   │         ├── 检查字段组：Upstreams / Bootstrap / Fallback / Cache* /
+   │         │              EDNSCS / Ratelimit / ResolveClients
+   │         └── 任一变更 → shouldRestart = true
+   │
+   ├── 4. s.conf.ConfModifier.Apply(ctx)
+   │    │    持久化配置到磁盘（AdGuardHome.yaml）
+   │    └─► defaultConfigModifier.Apply() → config.write() → 写 YAML
+   │
+   └── 5. if restart: s.Reconfigure(ctx, nil)
+        │
+        └─► Server.Reconfigure() (dnsforward.go:848)
+             ├── serverLock.Lock()
+             ├── stopLocked(ctx) → dnsProxy.Shutdown()
+             ├── time.Sleep(100ms) → 等待 fd 释放
+             ├── s.Prepare(ctx, conf) → 重新准备 proxy / upstreams / addrProc
+             └── s.startLocked(ctx) → 重启监听 + 协程
+```
+
+**重启字段 vs 非重启字段**：
+
+| 非重启（立即生效） | 需重启（重建服务） |
+|-------------------|------------------|
+| BlockingMode      | UpstreamDNS 列表 |
+| BlockedResponseTTL | BootstrapDNS 列表 |
+| ProtectionEnabled | FallbackDNS 列表 |
+| UpstreamMode      | CacheEnabled / Size / TTL |
+| DNSSECEnabled     | EDNSCS 配置 |
+| AAAADisabled      | Ratelimit 配置 |
+| EDNSCSCustomIP    | ResolveClients |
+| (仅设置)          | UsePrivateRDNS |
+
+### 18.2 信号触发：SIGHUP 部分 reload
+
+`internal/home/signal.go:94` 提供信号驱动的配置刷新：
+
+```
+kill -SIGHUP <pid>
+   │
+   ▼ signalHandler.handle(ctx)
+   │
+   └── reloadConfig(ctx) (signal.go:117)
+        │
+        ├── 1. clientStorage.ReloadARP(ctx)
+        │    重新扫描 ARP 表更新客户端信息（runtime client）
+        │
+        └── 2. tlsManager.Refresh(ctx)
+             重新加载 TLS 证书和密钥（支持证书热替换）
+```
+
+> **注意**：SIGHUP 只刷新 ARP 客户端和 TLS 证书，**不会触发 DNS 服务全量 Reconfigure**。DNS 配置变更必须走 Web API。
+
+### 18.3 新架构：Web API 纯函数式热更新
+
+**入口**：`PATCH /api/v1/settings/dns` → `handlePatchSettingsDNS()` (`internal/next/websvc/dns.go:63`)
+
+```
+PATCH /api/v1/settings/dns (JSON Patch)
+   │
+   ▼ handlePatchSettingsDNS(w, r)
+   │
+   ├── 1. Decode → ReqPatchSettingsDNS{}
+   │    使用 jsonpatch.NonRemovable<T> 类型，区分"未设置"与"设为零值"
+   │
+   ├── 2. 取当前 DNS 服务配置副本（值语义，深拷贝）
+   │    dnsSvc := svc.confMgr.DNS()
+   │    newConf := dnsSvc.Config()  // 返回值拷贝，不影响正在运行的实例
+   │
+   ├── 3. 增量更新 newConf（Set 方法只修改被请求的字段）
+   │    req.UpstreamMode.Set(&newConf.UpstreamMode)
+   │    req.Addresses.Set(&newConf.Addresses)
+   │    req.CacheSize > 0 → newConf.CacheEnabled = true
+   │    ...
+   │
+   ├── 4. ConfigManager 更新
+   │    svc.confMgr.UpdateDNS(ctx, newConf)
+   │    │
+   │    └─► configmgr.Manager.updateDNS() (configmgr.go:351)
+   │         ├── prev := m.dns          // 旧服务实例
+   │         ├── prev.Shutdown(ctx)    // 关闭旧服务（释放端口）
+   │         ├── dnssvc.New(c)         // 创建全新实例（纯函数）
+   │         └── m.dns = svc           // 原子替换指针
+   │
+   ├── 5. 持久化配置
+   │    m.updateCurrentDNS(c)          // 更新内存配置镜像
+   │    m.write(ctx)                   // 写 YAML 到磁盘
+   │
+   └── 6. 启动新服务
+        newSvc := svc.confMgr.DNS()    // 拿到刚创建的新实例
+        newSvc.Start(ctx)              // 启动监听
+```
+
+### 18.4 配置持久化：`defaultConfigModifier.Apply()`
+
+`internal/home/config.go:1009` 是旧架构的配置写入统一入口：
+
+```go
+func (cm *defaultConfigModifier) Apply(ctx context.Context) {
+    // 收集所有子系统当前配置 → 完整 YAML → 写磁盘
+    err := cm.config.write(ctx, cm.logger, cm.tlsMgr, cm.auth, cm.workDir, cm.confPath)
+}
+```
+
+所有子系统（dnsforward / querylog / stats / filtering）通过 `WriteDiskConfig()` 将运行时配置写回 `*configuration` 结构体，然后统一序列化到 `AdGuardHome.yaml`。
+
+### 18.5 新旧架构 Hot Reload 对比
+
+| 维度 | 旧架构 dnsforward | 新架构 next/dnssvc |
+|------|:-----------------:|:------------------:|
+| **触发入口** | `POST /control/dns_config` + `handleSetConfig` | `PATCH /api/v1/settings/dns` + `handlePatchSettingsDNS` |
+| **更新模型** | 字段分组（重启/非重启） + 增量修改内存对象 | 纯不可变：取配置副本 → 修改 → 创建新实例 → 替换指针 |
+| **重启粒度** | 部分字段无需重启，部分字段 `stop → Prepare → start` | 每次变更全量 `Shutdown 旧 → New 新 → Start 新` |
+| **配置拷贝** | 指针语义，原地修改 | 值语义，每次生成全新 `dnssvc.Config` 副本 |
+| **持久化时机** | `ConfModifier.Apply()` 在 API 处理中显式调用 | `configmgr.UpdateDNS()` 内部自动调用 `write()` |
+| **原子性** | `serverLock` 全局锁，`stop → Prepare → start` 非原子 | `Shutdown 旧 → New 新` 两步，期间服务短暂不可用 |
+| **信号支持** | SIGHUP 只刷新 ARP/TLS，不触发 DNS 配置重载 | `serviceMgr.Refresh()` 暴力全重启（读 YAML → 重建所有服务） |
+| **配置存储** | 全局 `*configuration` 单例 + 各子系统内部状态 | `configmgr.Manager` 统一持有 `current` 配置镜像 |
+
+### 18.6 热更新全链路对比图
+
+**旧架构**：
+```
+POST /control/dns_config
+       │
+       ▼
+ jsonDNSConfig → 校验 → setConfig()
+       │
+       ├─► 非重启字段：直接写内存 ✓
+       │
+       ├─► ConfModifier.Apply() → 写 YAML 磁盘
+       │
+       └─► 需重启字段：Reconfigure(ctx, nil)
+                      │
+                      └─► stop → Prepare → start (重建 proxy)
+```
+
+**新架构**：
+```
+PATCH /api/v1/settings/dns
+       │
+       ▼
+ ReqPatchSettingsDNS → Config() 深拷贝 → 增量修改
+       │
+       ▼
+ configmgr.UpdateDNS(ctx, newConf)
+       │
+       ├─► prev.Shutdown(ctx)
+       ├─► dnssvc.New(newConf) → 全新实例
+       ├─► m.dns = svc (原子替换)
+       └─► write(ctx) → 持久化 YAML
+       │
+       ▼
+ newSvc.Start(ctx) → 新实例启动监听
+```
+
+---
+
+## 19. 关键文件索引（完整）
 
 | 功能模块 | 文件路径 | 关键行号/函数 |
 |---------|---------|-------------|
-| DNS 服务器主体 & DHCP 接口 | `internal/dnsforward/dnsforward.go` | `DHCP` interface (L64), `Server` 结构体 (L99), `Start()` (L463), `ServeHTTP()` (L888), `setupFallbackDNS()` (L679) |
+| DNS 服务器主体 & DHCP 接口 | `internal/dnsforward/dnsforward.go` | `DHCP` interface (L64), `Server` 结构体 (L99), `Start()` (L463), `ServeHTTP()` (L888), `setupFallbackDNS()` (L679), `Reconfigure()` (L848) |
 | 监听器配置 | `internal/dnsforward/config.go` | `newProxyConfig()` (L331), `prepareTLS()` (L710), `preparePlain()` (L812), `loadUpstreams()` (L530), `filterOutAddrs()` (L630) |
 | 统一入口 | `internal/dnsforward/requesthandler.go` | `ServeDNS()` (L18) |
 | 中间件 & 访问控制 & ClientID 入口 | `internal/dnsforward/middleware.go` | `Wrap()` (L24), `serveBlockedResponse()` (L59), `isBlockedHost()` (L73), `clientIDFromDNSContext()` (L99), `logMiddleware.Wrap()` (L169) |
@@ -1921,24 +2514,32 @@ PATCH /api/v1/settings/dns
 | 处理管道 & 上游转发 & DHCP 解析 | `internal/dnsforward/process.go` | `processDHCPHosts()` (L275), `processDHCPAddrs()` (L345), `processUpstream()` (L441), `setCustomUpstream()` (L516), `dhcpHostFromRequest()` (L494) |
 | 过滤规则引擎 (前后置) | `internal/dnsforward/filter.go` | `filterDNSRequest()` (L28), `filterDNSResponse()` (L116), `filterAfterResponse()` (L97) |
 | DNS 过滤核心 | `internal/filtering/filtering.go` | `DNSFilter` 结构体 (L252), `hostChecker` (L337), `CheckHost()` (L1787) |
+| 日志统计入口 | `internal/dnsforward/stats.go` | `processQueryLogsAndStats()` (L19), `logQuery()` (L99), `updateStats()` (L143) |
+| Query Log 写入器 | `internal/querylog/qlog.go` | `queryLog` 结构体 (L26), `Add()` (L219), `periodicRotate()` (L150) |
+| Query Log 刷盘 | `internal/querylog/querylogfile.go` | `flushLogBuffer()` (L19), `encodeEntries()` (L36), `flushToFile()` (L80), `rotate()` (L103) |
+| Query Log 条目结构 | `internal/querylog/entry.go` | `logEntry` 结构体, JSON 序列化 |
+| Stats 内存聚合 | `internal/stats/unit.go` | `unit` 结构体 (L95), `add()` (L318), `serialize()` (L258), `unitDB` 结构体 (L155) |
+| Stats 持久化 | `internal/stats/stats.go` | `StatsCtx` 结构体 (L110), `Update()` (L278), `periodicFlush()` (L496), `flushDB()` (L446) |
+| Stats BoltDB 操作 | `internal/stats/unit.go` | `flushUnitToDB()` (L343), `loadUnitFromDB()` (L277), `idToUnitName()` (L207) |
 | 上游配置构造 | `internal/dnsforward/upstreams.go` | `newBootstrap()` (L27), `newUpstreamConfig()` (L60), `newPrivateConfig()` (L97), `setProxyUpstreamMode()` (L143) |
 | 客户端专属上游 | `internal/client/upstreammanager.go` | `customUpstreamConfig()` (L122), `newCustomUpstreamConfig()` (L209) |
 | DoH 主路由注册 | `internal/home/dns.go` | `initDNS()` (L46), `newServerConfig()` (L263), `registerDoHHandlers()` (L598) |
 | DoH 鉴权豁免 | `internal/home/authhttp.go` | `isDoHRoute()` (L327), `authMiddlewareDefault.Wrap()` (L404) |
-| DoH 路由默认配置 | `internal/home/config.go` | `doHConfig` 结构体 (L209), 默认 routes (L469) |
-| 日志统计 | `internal/dnsforward/stats.go` | `processQueryLogsAndStats()` (L19) |
+| DoH 路由默认配置 | `internal/home/config.go` | `doHConfig` 结构体 (L209), 默认 routes (L469), `defaultConfigModifier` (L977), `Apply()` (L1009) |
+| 配置修改 API (旧) | `internal/dnsforward/http.go` | `handleSetConfig()` (L539), `setConfig()` (L588), `setConfigRestartable()` (L652) |
+| 信号处理 | `internal/home/signal.go` | `signalHandler.handle()` (L75), `reloadConfig()` (L117) |
 | 新架构 dnssvc 实现 | `internal/next/dnssvc/dnssvc.go` | `New()` (L62), `Config()` (L158), `Start()` (L173) |
 | 新架构总入口 | `internal/next/cmd/cmd.go` | `Main()` (L21) |
 | 新架构服务管理 | `internal/next/cmd/service.go` | `serviceMgr` (L61), `Start()` (L79), `Refresh()` (L144) |
 | 新架构配置管理 | `internal/next/configmgr/configmgr.go` | `Manager` (L101), `assemble()` (L152), `UpdateDNS()` (L216), `updateDNS()` (L351) |
-| 新架构 Web API | `internal/next/websvc/dns.go` | `handleGetSettingsDNS()` (L40), `handlePatchSettingsDNS()` (L63) |
-| DoH API 配置 | `internal/dnsforward/http.go` | `registerHandlers()` (L823), HTTP 控制接口 |
+| 新架构 Web API (热更新) | `internal/next/websvc/dns.go` | `handleGetSettingsDNS()` (L40), `handlePatchSettingsDNS()` (L63) |
+| 配置修改接口定义 | `internal/agh/agh.go` | `ConfigModifier` 接口 (L15), `EmptyConfigModifier` (L22) |
 
 ---
 
-## 17. 总结
+## 20. 总结
 
-AdGuardHome 的 DNS 多协议统一架构，通过五层核心设计、四个关键扩展机制、两组业务协同链路、两大深层系统与一条演进路径，实现了协议透明性、业务可扩展性与长期可演进性的平衡：
+AdGuardHome 的 DNS 多协议统一架构，通过五层核心设计、四个关键扩展机制、两组业务协同链路、两大可观测性系统、两条热重载路径与一条演进路径，实现了协议透明性、业务可扩展性、可观测性与长期可演进性的平衡：
 
 ### 核心五层设计
 
@@ -1960,18 +2561,30 @@ AdGuardHome 的 DNS 多协议统一架构，通过五层核心设计、四个关
 10. **访问控制双维度检查**（Wrap 中间件）：IP 白/黑名单（精确 + CIDR） + ClientID 白/黑名单 + 域名黑名单，白名单模式自动切换，支持协议差异化阻断
 11. **DHCP ↔ DNS 双向解析联动**：DNS 通过 `DHCP` interface 解耦依赖 DHCP，前向 `*.lan` A/AAAA 查询经 `IPByHost()` 查租约返回，反向私有网段 PTR 查询经 `HostByIP()` 查租约返回，安全开关依赖 dnsproxy 注入的私有网段标识
 
+### 两大可观测性系统
+
+12. **查询日志系统**：`processQueryLogsAndStats()` 分叉点 → `queryLog.Add()` → RingBuffer 内存缓冲 → 阈值触发异步 goroutine 刷盘 → JSON Lines 追加写入 → 按 RotationIvl 轮转归档（querylog.json → querylog.json.1），IP 匿名化 + 忽略域名过滤 + 客户端级忽略开关
+13. **统计指标系统**：`stats.Update()` → `unit.add()` 按小时内存聚合（域名/被拦截域名/客户端/上游四维计数 + 结果分类计数 + 平均耗时） → 跨小时触发 BoltDB 持久化（每小时一个 Bucket，GOB 编码 unitDB） → Dashboard 读取路径 `getData()` 聚合 Top N 与时间序列
+
+### 两条热重载路径
+
+14. **旧架构 Web API 热更新**：`POST /control/dns_config` → `handleSetConfig()` → 字段分组（非重启字段立即生效 / 需重启字段标记）→ `ConfModifier.Apply()` 持久化 YAML → `Reconfigure()` 全量 stop → Prepare → start
+15. **新架构纯函数式热更新**：`PATCH /api/v1/settings/dns` → `handlePatchSettingsDNS()` → `Config()` 值拷贝 → 增量修改 → `configmgr.UpdateDNS()` 原子替换（Shutdown 旧 → New 新） → 持久化 → `Start()` 新实例
+
 ### 一条演进路径
 
-12. **next/dnssvc 新架构迁移**：通过 `configmgr.Manager` 实现纯函数式装配 —— "配置即数据，服务即实例"，每次变更全量 Shutdown 旧服务 + New 新服务 + Start，以换取配置解耦与不可变性；简化中间件链至单一层，依托 `proxy.DefaultHandler` 完成核心转发与缓存
+16. **next/dnssvc 新架构迁移**：通过 `configmgr.Manager` 实现纯函数式装配 —— "配置即数据，服务即实例"，每次变更全量 Shutdown 旧服务 + New 新服务 + Start，以换取配置解耦与不可变性；简化中间件链至单一层，依托 `proxy.DefaultHandler` 完成核心转发与缓存
 
 ### 整体优势
 
 - **可扩展性**：新增协议只需在 dnsproxy 中实现 Listener，上层逻辑零改动
 - **一致性**：所有协议使用相同的过滤、统计、日志逻辑，行为一致
 - **可测试性**：各模块独立可测，不依赖具体协议
+- **可观测性**：查询日志 JSON 格式便于外部分析，统计指标按小时分片聚合，支持长历史 Dashboard
 - **演进能力**：通过 Wrap 模式可无限扩展横切关注点（如 tracing、鉴权等），新架构纯函数式装配进一步降低状态耦合
 - **灵活性**：上游分流支持按客户端、域名多级精细化调度，Fallback 保障解析可靠性
 - **部署弹性**：DoH 双入口模式可在独立专用端口与共享 Web 端口之间自由选择
-- **安全性**：私有网段 DHCP 解析对外部客户端屏蔽，UDP 阻断采用丢包避免放大攻击，Bogus NXDOMAIN 检查过滤虚假响应
-- **解耦性**：DNS 与 DHCP 通过 interface 解耦，支持独立替换与测试；新架构 ConfigManager 将配置读写与服务生命周期解耦
-- **性能可控**：Cache 支持 TTL 上下限、乐观缓存、LRU 淘汰，阻断响应独立 TTL 控制下游客户端缓存行为
+- **安全性**：私有网段 DHCP 解析对外部客户端屏蔽，UDP 阻断采用丢包避免放大攻击，Bogus NXDOMAIN 检查过滤虚假响应，IP 匿名化保护隐私
+- **解耦性**：DNS 与 DHCP 通过 interface 解耦；配置持久化通过 `ConfigModifier` 接口解耦；新架构 ConfigManager 将配置读写与服务生命周期解耦
+- **性能可控**：Cache 支持 TTL 上下限、乐观缓存、LRU 淘汰；查询日志 RingBuffer 降低锁竞争；统计指标内存聚合 + 批量持久化平衡写入吞吐
+- **运维友好**：热更新区分重启/非重启字段最小化服务中断，SIGHUP 支持证书与 ARP 表刷新，配置变更全程持久化到 YAML 可审计
