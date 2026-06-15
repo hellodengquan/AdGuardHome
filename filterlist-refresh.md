@@ -610,7 +610,401 @@ if filepath.IsAbs(flt.URL) {
 
 ---
 
-## 9. 关键代码索引（已校准行号）
+## 10. 完整刷新衔接：三块按顺序协作的函数调用与数据流
+
+本节以"定时刷新黑名单 + 白名单（force=false）"为例，沿着实际代码路径，逐步拆解订阅源管理、刷新调度、合并去重三块在每一步如何交接。
+
+### 10.1 事件触发：定时器到期（调度→订阅源管理）
+
+| 步骤 | 位置 | 动作 | 输入 | 输出 |
+|------|------|------|------|------|
+| 10.1.1 | `filtering.go:1109` | `t.C` 触发，select 进入定时器分支 | — | — |
+| 10.1.2 | `filtering.go:1115` | 调用 `periodicallyRefreshFilters(ivl)` | 当前间隔 `ivl`，全局 `d.conf` | `nextIvl` 新间隔 |
+
+**数据流**：从调度器自身状态（`ivl`、`t`）进入，读取全局配置 `FiltersUpdateIntervalHours`。
+
+---
+
+### 10.2 调度 → 订阅源管理：筛选待更新列表
+
+| 步骤 | 位置 | 动作 | 输入 | 输出 |
+|------|------|------|------|------|
+| 10.2.1 | `filtering.go:1123` | `tryRefreshFilters(true, true, false)` | block=true, allow=true, force=false | (updated, isNetErr, ok) |
+| 10.2.2 | `filter.go:265` | `refreshLock.TryLock()` 获取刷新锁 | — | ok=true/false（失败直接返回） |
+| 10.2.3 | `filter.go:416` | `refreshFiltersIntl(block, allow, force)` | 三个布尔标志 | (updNum, isNetErr) |
+
+进入黑名单处理分支（白名单完全对称）：
+
+| 步骤 | 位置 | 动作 | 输入 | 输出 |
+|------|------|------|------|------|
+| 10.2.4 | `filter.go:430` | `refreshFiltersArray(ctx, &d.conf.Filters, force)` | 指向 `conf.Filters` 的指针，force=false | `(updNum, lists, toUpd, isNetErr)` |
+| 10.2.5 | `filter.go:318` | `listsToUpdate(filters, force)` 筛选需更新的订阅源 | `conf.Filters` 切片（RLock 保护），force=false | `updateFilters []FilterYAML`（副本） |
+
+**关键交接点**：`listsToUpdate()` 从**订阅源管理**（`conf.Filters`）读取以下字段作为输入：
+- `Enabled`：必须为 true
+- `LastUpdated`：+ `FiltersUpdateIntervalHours` 与 `now` 比较是否过期
+- `URL` / `ID`：用于拷贝构造输出副本
+
+输出的 `updateFilters` 是独立拷贝（值语义），后续所有对订阅源的修改都在这个副本上进行，不会影响原列表——这是三块之间的第一个"隔离边界"。
+
+**数据流**：`conf.Filters[].{Enabled, LastUpdated, URL, ID, Name, checksum, RulesCount}` → 拷贝 → `updateFilters []FilterYAML`
+
+---
+
+### 10.3 调度 → 合并去重：逐个更新订阅源
+
+| 步骤 | 位置 | 动作 | 输入 | 输出 |
+|------|------|------|------|------|
+| 10.3.1 | `filter.go:323` | `updateFilterList(ctx, updateFilters)` 遍历更新副本列表 | `updateFilters []FilterYAML` | `(failNum, updateFlags []bool)` |
+| 10.3.2 | `filter.go:345` | 对每个 `uf = &updateFilters[i]` 调用 `d.update(uf)` | 单个订阅源指针 | `(updated bool, err error)` |
+
+深入单个 `update()`：
+
+| 步骤 | 位置 | 动作 | 输入 | 输出 |
+|------|------|------|------|------|
+| 10.3.3 | `filter.go:483` | `updateIntl(ctx, filter)` 下载+解析 | `&updateFilters[i]` 的 URL/ID | `(b bool, err error)` + 副作用：创建临时文件 |
+| 10.3.4 | `filter.go:506` | `aghrenameio.NewPendingFile()` 创建临时文件 | `dataDir/filters/<id>.txt` | `PendingFile`（`<id>.txt.tmp`） |
+| 10.3.5 | `filter.go:517-521` | 分支判断：绝对路径走 `readFromFile()`，URL 走 `readFromHTTP()` | `filter.URL` | `(*ParseResult, error)` |
+| 10.3.6 | `parser.go:49` | `Parser.Parse(tmpFile, src, buf)` 边读边写边解析 | 源数据 Reader，目标 tmpFile Writer | `ParseResult{Title, RulesCount, BytesWritten, Checksum}` |
+| 10.3.7 | `filter.go:527` | 增量判断：`res.Checksum != flt.checksum` | 新/旧 CRC-32 | `updated bool` |
+| 10.3.8 | `filter.go:585` | `finalizeUpdate()` 根据 updated 标志决定 | `updated`、`PendingFile`、`ParseResult` | 副作用：原子替换或清理临时文件 |
+| 10.3.9 | `filter.go:484` | ⚠️ `filter.LastUpdated = time.Now()` | — | 副作用：**无论成功失败**都覆写 LastUpdated |
+
+**合并去重实际发生在 10.3.6（Parser.Parse）**：
+- 去空行、去注释（`#` / `!`）
+- 提取 Title
+- HTML/二进制检测
+- 有效规则行才累加 CRC-32（即"有效去重"后的真正内容校验）
+
+**关键交接点**：`finalizeUpdate()` 把 `ParseResult`（解析产物）的三个字段**回写到副本**：
+```go
+flt.ensureName(res.Title)       // 若 Name 为空，填入解析的标题
+flt.checksum = res.Checksum     // 覆盖旧校验和
+flt.RulesCount = res.RulesCount // 更新规则数
+```
+此时改动仍只在 `updateFilters` 副本上，**尚未触及** `conf.Filters`（订阅源主存储）。
+
+---
+
+### 10.4 调度 → 订阅源管理：回写元数据
+
+全部订阅源更新完毕后，进入回写阶段：
+
+| 步骤 | 位置 | 动作 | 输入 | 输出 |
+|------|------|------|------|------|
+| 10.4.1 | `filter.go:328` | `d.conf.filtersMu.Lock()` 取写锁 | — | — |
+| 10.4.2 | `filter.go:331` | `syncUpdatedFilters(ctx, filters, updateFilters, updateFlags)` | `&conf.Filters`（主列表）、`updateFilters`（副本）、`updateFlags` | `updateCount int` |
+| 10.4.3 | `filter.go:369-391` | 双重循环：按 `ID == uf.ID && URL == uf.URL` 定位条目；`LastUpdated` 无条件同步；仅 `updated=true` 时同步 `Name/RulesCount/checksum` | — | 副作用：修改 `conf.Filters[k]` |
+| 10.4.4 | `filter.go:329` | `defer d.conf.filtersMu.Unlock()` 释放写锁 | — | — |
+
+**关键交接点**：`syncUpdatedFilters()` 是第二块（调度/合并）向第一块（订阅源管理）正式提交数据的唯一入口。通过 `filtersMu` 写锁保证期间主列表不被 API 读取或修改。
+
+白名单处理与以上完全对称（`filter.go:433-437`），结果累加到 `updNum`、`lists`、`toUpd`、`isNetErr`。
+
+---
+
+### 10.5 合并去重 → 过滤引擎：重建并热替换
+
+全部名单回写完毕后，进入引擎重建：
+
+| 步骤 | 位置 | 动作 | 输入 | 输出 |
+|------|------|------|------|------|
+| 10.5.1 | `filter.go:444-450` | 短路判断：全网络错误返回(0,true)；无变化返回(0,false) | `isNetErr`、`updNum` | 可能直接 return |
+| 10.5.2 | `filter.go:452` | `d.EnableFilters(false)` 同步重建引擎 | `async=false` | — |
+| 10.5.3 | `filter.go:672` | `enableFiltersLocked()`：收集所有 `Enabled=true` 的 FilterYAML → 转换为 `[]Filter{ID, FilePath}`，并加入自定义规则（ID=IDCustom） | `conf.Filters`、`conf.WhitelistFilters`、`conf.UserRules` | `blockFilters []Filter`、`allowFilters []Filter` |
+| 10.5.4 | `filtering.go:390` | `setFilters(async=false)`：`filtersInitializerLock` 锁定 → 初始化通道若有旧任务则清空 → 直接 `initFiltering(ctx, allowFilters, blockFilters)` | 两组 Filter | — |
+| 10.5.5 | `filtering.go:746` | `initFiltering()`：分别为 blacklist 和 whitelist 调用 `newRuleStorage()` → 构建 `urlfilter.NewDNSEngine()` | 两组 Filter | 两套 storage + engine |
+| 10.5.6 | `filtering.go:760-769` | `engineLock.Lock()` → `reset(ctx)` 释放旧引擎 → 指针赋值新 storage/engine → `engineLock.Unlock()` | — | 原子替换全局引擎 |
+| 10.5.7 | `filtering.go:772` | `debug.FreeOSMemory()` 回收内存 | — | — |
+
+---
+
+### 10.6 收尾：清理旧文件（调度）
+
+| 步骤 | 位置 | 动作 | 输入 | 输出 |
+|------|------|------|------|------|
+| 10.6.1 | `filter.go:454-458` | 遍历 `lists` + `toUpd`，对 `toUpd[i]==true` 的调用 `removeOldFilterFile()` | — | 删除 `.old` 后缀文件（部分 rename 策略的残留） |
+| 10.6.2 | `filter.go:460` | `refreshFiltersIntl` 返回 `(updNum, false)` | — | 回到 periodicallyRefreshFilters |
+
+---
+
+### 10.7 回调度：调整下一次间隔
+
+| 步骤 | 位置 | 动作 | 输入 | 输出 |
+|------|------|------|------|------|
+| 10.7.1 | `filtering.go:1125-1129` | `ok && !isNetErr` → `ivl=1h`；`isNetErr` → `ivl*=2; ivl=max(ivl, 1h)` | (updated, isNetErr, ok) | 新 `ivl` |
+| 10.7.2 | `filtering.go:1109` | `t.Reset(nextIvl)` 重置定时器 | 新 `ivl` | — |
+
+---
+
+### 10.8 三大块在每一步的分工总表
+
+```
+        ┌──────────────────────────────────────────────────────────────┐
+        │                     一次完整刷新                       │
+        └──────────────────────────────────────────────────────────────┘
+阶段      10.1 触发    10.2 筛选     10.3 更新   10.4 回写   10.5 重建   10.7 调整
+          ──────     ────────    ───────   ───────   ───────   ──────
+
+订阅源     提供配置     提供Enabled   →副本→     接收同步    提供Enabled  无
+管理       读接口       LastUpdated   (隔离)    (写锁)       收集项
+          (只读)       (只读)                              (只读)
+
+刷新调度  定时器到期    listsToUpdate  update()  sync      Enable     period调
+           t.C         TryLock       updateIntl Updated   Filters    ivl计算
+                                   finalizeUpd           initFilt
+
+合并去重     —            —           Parser.    —        (隐含     —
+                                     Parse             dedup-ID)
+                                   checksum对比
+                                   原子替换
+```
+
+隔离边界：
+- **边界 A（10.2 → 10.3）**：`listsToUpdate()` 值拷贝，修改不影响原 `conf.Filters`
+- **边界 B（10.3 → 10.4）**：`filtersMu.Lock()` 保证同步期间主列表不变
+- **边界 C（10.5.6）**：`engineLock.Lock()` 保证匹配期间引擎指针原子切换
+
+---
+
+## 11. 异常场景分析：ctx 取消、锁泄漏、文件状态与 atomic 失败回滚
+
+### 11.1 ctx 被取消时 updatesLoop 的收尾
+
+#### 11.1.1 实际使用的 ctx：全是 `context.TODO()`，不传递取消信号
+
+代码全量 grep 结果：刷新链路中所有 ctx 创建都来自 `context.TODO()`：
+
+- `refreshFiltersIntl()` `filter.go:417` → `ctx := context.TODO()`
+- `update()` `filter.go:481` → `ctx := context.TODO()`
+- `Start()` `filtering.go:1087` → `go d.updatesLoop(context.TODO())`
+- `Close()` `filtering.go:402` → `d.reset(context.TODO())`
+
+**HTTP Client 未设置请求 ctx**（`filter.go:532` `d.conf.HTTPClient.Get(urlStr)`），也未将链路 ctx 传入 HTTP 请求。
+
+**结论：ctx 取消信号完全没有从外部进入刷新链路的路径。** 用户取消 API 请求不会中断正在进行的刷新；刷新 goroutine 本身也无法因 ctx 超时而提前退出。
+
+#### 11.1.2 真正的退出机制：`done` 通道 + `Close()`
+
+退出路径（`filtering.go:394-402`）：
+
+```go
+func (d *DNSFilter) Close() {
+    d.engineLock.Lock()     // 第 1 个锁：防止与 initFiltering/匹配并发
+    defer d.engineLock.Unlock()
+
+    if d.done != nil {
+        d.done <- struct{}{}   // 发送退出信号
+    }
+
+    d.reset(context.TODO())    // 释放引擎
+}
+```
+
+`updatesLoop` 中的接收（`filtering.go:1131-1137`）：
+
+```go
+case doneCh := <-d.done:
+    if !t.Stop() { <-t.C }    // 停止并清空定时器
+    d.done <- doneCh          // 回写到 done 通道（奇怪的回环）
+    return                    // 退出 goroutine
+```
+
+#### 11.1.3 异常场景推演：刷新中途收到 done 信号
+
+由于 **三个 select 分支互斥**，有两种情形：
+
+**情形 1：信号到达时，updatesLoop 阻塞在 select 上**（最常见）
+- `done` 分支被选中 → `t.Stop()` + `return` → goroutine 正常退出
+- ✅ 无资源泄漏
+
+**⚠️ 情形 2：信号到达时，periodicallyRefreshFilters() 正在执行（刷新已启动）**
+- select 会**继续阻塞**，直到 `periodicallyRefreshFilters()` 返回
+- 期间 `refreshLock` 已被持有、HTTP 请求正在进行、临时文件可能已创建
+- 等刷新完成回到 select 后，才消费 `done` 信号退出
+- 可能的风险：`Close()` 先 `engineLock.Lock()`，而刷新结束时要 `EnableFilters()` → `initFiltering()` 也要 `engineLock.Lock()` → **潜在死锁**
+
+死锁路径：
+```
+goroutine A (Close):           goroutine B (updatesLoop 正在刷新):
+  engineLock.Lock() ◄──已锁
+  done <- struct{}{}
+                                   refreshFiltersIntl() 完成
+                                   EnableFilters(false)
+                                     enableFiltersLocked → setFilters → initFiltering
+                                       engineLock.Lock()  ◄── 永久阻塞！
+  d.reset(ctx)  ◄── 永远等不到，因为 B 阻塞在拿 engineLock
+```
+
+**但 Close 中的 `done <- doneCh` 回环使得 B 有机会在进入 EnableFilters 之前先退出 select：** 实际 `updatesLoop` 中 `periodicallyRefreshFilters()` 返回后，会回到 for 循环头的 select 下一轮，此时先读到 done 信号 → return，EnableFilters 不再被执行。**这个回环是有意设计的死锁规避手段。**
+
+#### 11.1.4 小结
+
+| 问题 | 结果 |
+|------|------|
+| ctx 取消能否中断刷新？ | ❌ 不能。全部 ctx=TODO，HTTP 也没传 ctx |
+| 如何退出？ | `Close()` → `done` 通道 |
+| goroutine 泄漏？ | ✅ 无。回环确认最终退出 |
+| 死锁风险？ | ⚠️ Close 与刷新中 EnableFilters 存在理论死锁，done 回环规避之 |
+| done 通道泄漏？ | ❓ done 容量=1。若没人 Close，通道不会关；Close 后可重复写/读。（可接受） |
+
+---
+
+### 11.2 锁与文件状态的泄漏风险
+
+#### 11.2.1 各类锁的获取-释放配对检查
+
+| 锁 | 获取位置 | 释放方式 | 异常路径覆盖 | 泄漏可能 |
+|----|---------|---------|-------------|---------|
+| `refreshLock` | `tryRefreshFilters()` TryLock | `defer unlock`（同一函数内） | ✅ defer 覆盖所有 return | ❌ 无 |
+| `conf.filtersMu` (R) | `listsToUpdate()` RLock | `defer RUnlock` | ✅ defer | ❌ 无 |
+| `conf.filtersMu` (R) | `EnableFilters()` RLock | `defer RUnlock` | ✅ defer | ❌ 无 |
+| `conf.filtersMu` (W) | `refreshFiltersArray()` Lock | `defer Unlock` | ✅ defer | ❌ 无 |
+| `conf.filtersMu` (W) | `filterAdd/Del/SetProps/HandleSetURL` Lock/RLock | `defer Unlock/RUnlock` | ✅ defer | ❌ 无 |
+| `filtersInitializerLock` | `setFilters()` Lock | `defer Unlock` | ✅ defer | ❌ 无 |
+| `engineLock` (R) | `matchHost/ApplyBypassSafesearch` 等匹配 | `defer RUnlock` | ✅ defer | ❌ 无 |
+| `engineLock` (W) | `initFiltering()` 内匿名函数 Lock | `defer Unlock` | ✅ defer | ❌ 无 |
+| `engineLock` (W) | `Close()` 入口 Lock | `defer Unlock` | ✅ defer | ❌ 无 |
+
+**结论：** 所有锁都用 `defer` 确保释放，且均在同一函数内获取/释放，没有跨越 goroutine 或未配对的情况。正常流程和所有 panic 路径（被 defer 覆盖）都安全。
+
+#### 11.2.2 临时文件状态的泄漏风险
+
+**临时文件生命周期**：
+
+| 事件 | 调用 | 位置 |
+|------|------|------|
+| 创建 | `NewPendingFile(flt.Path(dataDir), 0644)` | `filter.go:506` |
+| 写入 | `Parser.Parse(tmpFile, src, buf)` → tmpFile.Write() | `parser.go:49` |
+| 无变化时清理 | `file.Cleanup()`（close + unlink tmp file） | `filter.go:599` |
+| 有变化时替换 | `file.CloseReplace()`（close + atomically rename） | `filter.go:604` |
+| 中途异常清理 | `errors.WithDeferred(returned, file.Cleanup())` | `filter.go:599`（`!updated` 分支） |
+
+**底层实现（Unix）**：`google/renameio/v2` 的 `PendingFile`：
+- 在同目录创建 `.tmp-<rand>-<name>`
+- `Cleanup()` 会 `os.Remove` 该文件
+- `CloseReplace()` 完成 `fsync` + `rename`（POSIX rename 原子覆盖）
+
+**异常路径检查**：
+
+| 异常点 | 文件状态 | 最终结果 |
+|--------|---------|---------|
+| 创建前（URL 错误、NewPendingFile 失败） | 无文件 | ✅ 无泄漏 |
+| 创建后，Parser.Parse() 中途出错 | 部分写的 tmp 文件存在 | ✅ 走 `!updated` 分支 `errors.WithDeferred(returned, Cleanup())` 清理 |
+| finalizeUpdate 前 goroutine panic | tmp 文件留在磁盘 | ❗ defer 未覆盖此路径！Go defer 在同 goroutine 内生效，panic 会触发 defer；**但若进程被 SIGKILL 杀**，tmp 文件残留 |
+| CloseReplace() 中 rename 失败（跨盘/权限） | tmp 文件 + 原文件均保留 | ✅ 返回 err 给上层，调用方不会同步元数据，下次刷新重试 |
+| 断电 / 崩溃 | tmp 文件残留 | ❗ 重启后留存在 `dataDir/filters/`，不再被引用但占空间 |
+
+**残留 tmp 文件的影响**：每次刷新产生一个新随机名 tmp，`.tmp-*-<id>.txt` 文件可能累积。可通过定期清理 `dataDir/filters/` 下非 `<id>.txt` 命名的文件来处理。
+
+---
+
+### 11.3 atomic（CloseReplace）失败场景：缓存与锁的回滚分析
+
+#### 11.3.1 atomic 更新失败的触发条件
+
+Unix 上 `CloseReplace()` = `renameio.PendingFile.CloseAtomicallyReplace()` 内部：
+```
+fsync(tmpFd) → close(tmpFd) → rename(tmpPath, targetPath)
+```
+
+可能失败的情况：
+1. **fsync 失败**：磁盘 IO 错误、磁盘满
+2. **rename 失败**：跨设备（EXDEV）、目标目录权限、target 在写入中被另一个进程删改
+
+#### 11.3.2 失败后的代码行为（`filter.go:585-622`）
+
+```go
+func (d *DNSFilter) finalizeUpdate(...) (err error) {
+    if !updated {
+        return errors.WithDeferred(returned, file.Cleanup())  // 路径 A
+    }
+
+    err = file.CloseReplace()    // 路径 B：这里失败
+    if err != nil {
+        return fmt.Errorf("finalizing update: %w", err)  // ⬅️ 直接 return！
+    }
+    // 以下（元数据更新）不再执行
+    flt.ensureName(res.Title)
+    flt.checksum = res.Checksum
+    flt.RulesCount = rulesCount
+    return nil
+}
+```
+
+**关键：CloseReplace 失败时 `return err`，后面的元数据更新（`ensureName`、`checksum`、`RulesCount`）被跳过！**
+
+#### 11.3.3 锁状态分析
+
+| 锁 | CloseReplace 失败时状态 | 是否需要回滚 |
+|----|-------------------------|-------------|
+| `refreshLock` | ✅ 由外层 tryRefreshFilters 的 defer 释放 | 不需要 |
+| `conf.filtersMu` | ⬅️ 此阶段还没拿！要在 syncUpdatedFilters 前才拿 | 不需要 |
+| `engineLock` | 此阶段还没碰！ | 不需要 |
+
+**结论：** atomic 失败不涉及任何锁的释放问题。所有相关锁在更外层或更内层的 defer 保护下。
+
+#### 11.3.4 缓存与状态回滚检查
+
+**1）副本 `updateFilters[i]` 的状态（内存）：**
+- `LastUpdated` 已被 `update()` 设为 `time.Now()`（无论成功失败，`filter.go:484`）
+- `Name`/`checksum`/`RulesCount`：仍为旧值（CloseReplace 失败时跳过）
+- **错位副作用 A**：`LastUpdated` 已更新为"现在"，但实际内容没更新 → 下次定时刷新要等完整 Interval 后才重试该条目！force=true 才会绕过。
+
+**2）主列表 `conf.Filters` 的状态（内存）：**
+- `syncUpdatedFilters` 中 `updated == updateFlags[i]`，而 `updateFlags[i]` 是 `d.update()` 返回的 `b`
+- 关键：`d.update()` 返回的 `b` = `updateIntl()` 返回值 = `res.Checksum != flt.checksum` → 在 CloseReplace 之前就已决定
+- 如果**内容确实不同（b=true）但 CloseReplace 失败**，则：
+  - `updateFlags[i]=true`
+  - `syncUpdatedFilters` 会尝试同步元数据（`Name/RulesCount/checksum`）
+  - 但副本中这三个字段没被更新（仍为旧值） → **结果：主列表元数据也不变**
+  - ✅ `LastUpdated` 无条件同步 → 与副本一致（同为错误的"现在"）
+
+**3）磁盘文件状态：**
+- **tmp 文件**：renameio 内部 CloseAtomicallyReplace 出错时，会尝试 `Cleanup()` 删除 tmp（取决于具体失败阶段）
+  - fsync 前失败：tmp 删除 ✅
+  - fsync 后、rename 前失败：tmp 可能残留 ❗（renameio 文档说明"尽力而为"）
+- **旧文件 <id>.txt**：未动，仍是之前的版本 ✅
+- **缓存一致性**：主列表的 checksum 还是旧值，磁盘文件也是旧内容 → **内存元数据和磁盘内容一致**（这点没问题）
+
+**4）过滤引擎状态：**
+- `updNum`：syncUpdatedFilters 返回的 updateCount
+- 由于副本 checksum 没更新 → syncUpdatedFilters 中 `uf.RulesCount == f.RulesCount`（没变） → `updateCount` 可能不会增加？
+  - 实际：`updateCount++` 只看 `updateFlags[i]==true`（不看值是否变了），所以 b=true 时 updNum 仍增加
+- 所以 `EnableFilters(false)` 会被调用（`filter.go:452`）
+- `enableFiltersLocked` 会按 FilePath（`<id>.txt`）重新加载引擎 → 加载的是**旧文件**（因为 rename 失败）
+- 但此时主列表 `f.RulesCount` 还是旧值（与旧文件实际内容一致）
+- **结论：引擎实际内容是正确的（旧版本），但系统误以为"完成了一次更新"**
+
+#### 11.3.5 错位副作用汇总表
+
+| 错位副作用 | 现象 | 影响 | 严重度 |
+|-----------|------|------|--------|
+| A. LastUpdated 前移 | 不管成功失败都写 `time.Now()` | 该条目下一个 Interval 周期内不再重试 | 中 |
+| B. 误判更新成功 | `updNum` 计数增加（因为 b=true），但实际文件没变 | 触发一次无意义的引擎重建；日志中 `filter updated` 但实际无变化 | 低 |
+| C. 调度间隔被推长 | 由于 `!isNetErr`（CloseReplace 非网络错误），`periodicallyRefreshFilters` 设 `ivl=1h` | 下一轮定时刷新仍然是 1 小时，不影响 Interval 内的重试 | 低 |
+| D. tmp 文件残留（极端） | fsync 后 rename 前失败 | 磁盘占空间；下次刷新生成新 tmp，旧 tmp 成为孤儿 | 低 |
+
+**无回滚动作**：代码中没有针对 CloseReplace 失败的补偿逻辑（不 rollback LastUpdated、不 decrement updNum、不重新 try rename 等）。所有"状态回滚"实际上都是依赖"元数据未更新 → 自然不一致被最小化"。
+
+---
+
+## 12. 异常场景下的改进建议（代码潜在问题）
+
+基于上述分析，当前实现中可考虑优化的点：
+
+### 12.1 LastUpdated 前移问题（错位副作用 A）
+将 `filter.LastUpdated = time.Now()` 从 `update()` 无条件赋值，改为仅在 `updated=true || (err == nil && !updated)` 时赋值，或从 `finalizeUpdate` 内部在 CloseReplace 成功后赋值。
+
+### 12.2 updNum 虚增问题（错位副作用 B）
+`updateFlags[i]` 的取值应结合 CloseReplace 成功与否：`b = updateIntl()` 只表示 checksum 不同，不等于最终更新成功。建议引入"最终成功"标志或在 syncUpdatedFilters 中同时读取 `f.RulesCount != uf.RulesCount`（实际上更可靠）。
+
+### 12.3 ctx 传递链路
+考虑将 `updatesLoop(context.TODO())` 改为使用可取消的 ctx，配合 `http.NewRequestWithContext` 让 Close/退出时能够中断进行中的 HTTP 请求。
+
+---
+
+## 13. 关键代码索引（已校准行号，更新版）
 
 | 功能 | 精确定位 |
 |------|----------|
@@ -646,3 +1040,11 @@ if filepath.IsAbs(flt.URL) {
 | 新架构 Storage 定义 | `internal/filtering/rulelist/storage.go:16` |
 | 手动刷新 HTTP Handler | `internal/filtering/http.go:366` |
 | 添加订阅源 HTTP Handler | `internal/filtering/http.go:65` |
+| 刷新数组 `refreshFiltersArray()` | `internal/filtering/filter.go:313` |
+| 更新列表循环 `updateFilterList()` | `internal/filtering/filter.go:339` |
+| 移除旧文件 `removeOldFilterFile()` | `internal/filtering/filter.go:465` |
+| 关闭清理 `Close()` | `internal/filtering/filtering.go:394` |
+| done 回环（死锁规避） | `internal/filtering/filtering.go:1131-1137` |
+| enableFiltersLocked（启用内部） | `internal/filtering/filter.go:672` |
+| PendingFile 接口定义 | `internal/aghrenameio/renameio.go:20` |
+| Unix CloseReplace（atomic rename） | `internal/aghrenameio/renameio_unix.go:27` |
