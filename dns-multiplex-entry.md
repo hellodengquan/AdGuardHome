@@ -902,7 +902,538 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 
 ---
 
-## 10. 架构演进：`next/dnssvc` 新架构
+## 10. ClientID 客户端识别完整链路
+
+ClientID 是 AdGuardHome 对客户端进行精细化管理（自定义上游、独立过滤、统计归属）的核心标识。它仅在三种加密协议中携带，其推导与使用贯穿请求生命周期的多个环节。
+
+### 10.1 各协议 ClientID 提取路径
+
+#### DoH (DNS-over-HTTPS): 从 URL 路径提取
+
+位于 `internal/dnsforward/clientid.go:63` 的 `clientIDFromDNSContextHTTPS()`：
+
+```go
+func clientIDFromDNSContextHTTPS(pctx *proxy.DNSContext) (clientID string, err error) {
+    r := pctx.HTTPRequest  // 由 dnsproxy 从网络请求还原的 http.Request
+
+    // 关键：依赖 Go 1.22+ 的路由模式匹配。
+    // 当路由为 "/dns-query/{ClientID}" 时，Pattern 中包含 "{ClientID}" 占位符
+    if !strings.Contains(r.Pattern, "{ClientID}") {
+        return "", nil   // 路由没有 ClientID 占位符 → 跳过
+    }
+
+    // 从匹配到的 URL 段中读取参数值，例如 /dns-query/john → "john"
+    clientID = r.PathValue("ClientID")
+    err = client.ValidateClientID(clientID)  // 校验字符集和长度
+    if err != nil { return "", fmt.Errorf("clientid check: %w", err) }
+
+    return strings.ToLower(clientID), nil   // 规范化: 统一小写
+}
+```
+
+**DoH 路由模式配置**（`internal/home/config.go:469`）：
+```go
+// 默认路由已预留 ClientID 占位符
+DoH: doHConfig{
+    Routes: []string{
+        "GET /dns-query",
+        "POST /dns-query",
+        "GET /dns-query/{ClientID}",    // ✅ 带 ClientID
+        "POST /dns-query/{ClientID}",   // ✅ 带 ClientID
+    },
+},
+```
+
+#### DoT / DoQ: 从 SNI 子域名前缀提取
+
+##### 第 1 步：按协议获取 SNI
+
+位于 `internal/dnsforward/clientid.go:91` 的 `clientServerName()`：
+
+```go
+func clientServerName(...) (srvName string, err error) {
+    switch proto {
+    case proxy.ProtoHTTPS:
+        // HTTPS 时若 TLS SNI 未取到则 fallback 到 HTTP Host 头
+        srvName, fromHost, err = clientServerNameFromHTTP(pctx.HTTPRequest)
+        //   r.TLS != nil   → r.TLS.ServerName (TLS 握手 SNI)
+        //   否则            → 解析 r.Host 去除端口部分
+    case proxy.ProtoQUIC:
+        // QUIC 连接从 TransportParameters 中获取 TLS SNI
+        srvName = pctx.QUICConnection.ConnectionState().TLS.ServerName
+    case proxy.ProtoTLS:
+        // 标准 TLS 连接，直接从 *tls.Conn 的 ConnectionState() 读取
+        tc := pctx.Conn.(tlsConn)
+        srvName = tc.ConnectionState().ServerName
+    }
+    return srvName, nil
+}
+```
+
+##### 第 2 步：将 SNI 与服务域名对比，提取子域前缀
+
+位于 `internal/dnsforward/clientid.go:20` 的 `clientIDFromClientServerName()`：
+
+```go
+func clientIDFromClientServerName(
+    hostSrvName string, // 配置中的服务域名: "dns.example.com"
+    cliSrvName  string, // 客户端 SNI:       "john.dns.example.com"
+    strict      bool,   // 是否严格拒绝非匹配 SNI
+) (clientID string, err error) {
+    if hostSrvName == cliSrvName {
+        return "", nil   // 完全一致 → 没有 ClientID 前缀
+    }
+
+    // 检查: cliSrvName 是否为 hostSrvName 的**直接子域**
+    //   "john.dns.example.com" 是 "dns.example.com" 的直接子域 ✓
+    //   "a.b.dns.example.com" 不是  → 拒绝（严格模式）
+    if !netutil.IsImmediateSubdomain(cliSrvName, hostSrvName) {
+        if !strict { return "", nil }
+        return "", fmt.Errorf("client server name %q doesn't match", cliSrvName)
+    }
+
+    // 截断: "john.dns.example.com"[:len("dns.example.com")+1] → "john"
+    clientID = cliSrvName[:len(cliSrvName)-len(hostSrvName)-1]
+    if err = client.ValidateClientID(clientID); err != nil {
+        return "", err
+    }
+    return strings.ToLower(clientID), nil
+}
+```
+
+### 10.2 ClientID 总调度：`clientIDFromDNSContext()`
+
+位于 `internal/dnsforward/middleware.go:99`，处理 DoH 与 SNI 的优先级组合：
+
+```go
+func (s *Server) clientIDFromDNSContext(
+    ctx context.Context, l *slog.Logger, pctx *proxy.DNSContext,
+) (clientID string, err error) {
+    proto := pctx.Proto
+
+    if proto == proxy.ProtoHTTPS {
+        // ⭐ 优先级 1: 先从 URL 路径提取 (/dns-query/{ClientID})
+        clientID, err = clientIDFromDNSContextHTTPS(pctx)
+        if err != nil { return "", err }
+        if clientID != "" {
+            return clientID, nil   // 命中 URL 路径 → 直接返回，跳过 SNI
+        }
+        // URL 路径没有 ClientID → fallthrough，继续尝试 SNI
+    } else if proto != proxy.ProtoTLS && proto != proxy.ProtoQUIC {
+        return "", nil   // UDP / TCP / DNSCrypt 明文协议 → 不支持
+    }
+
+    // ⭐ 优先级 2: 从 SNI / Host 头提取 ({clientid}.server.example.com)
+    cliSrvName, err := clientServerName(ctx, l, pctx, proto)
+    // ...
+    return clientIDFromClientServerName(
+        s.conf.TLSConf.ServerName,  // 服务域名
+        cliSrvName,                  // 客户端 SNI
+        s.conf.TLSConf.StrictSNICheck,  // 严格模式开关
+    )
+}
+```
+
+**协议支持矩阵**：
+
+| 协议 | URL 路径提取 | SNI 子域提取 | 两者结合（DoH 双通道） |
+|------|:-----------:|:-----------:|:---------------------:|
+| UDP/TCP (Plain) | ❌ | ❌ | ❌ |
+| DNSCrypt | ❌ | ❌ | ❌ |
+| DoT (TLS) | ❌ | ✅ | - |
+| DoQ (QUIC) | ❌ | ✅ | - |
+| DoH (HTTPS) | ✅ (最高优先级) | ✅ (fallback) | ✅ URL → SNI |
+
+### 10.3 ClientID 的使用：三处注入点
+
+ClientID 在 Wrap 中间件中推导成功后，流向三处使用：
+
+```
+clientIDFromDNSContext() → 拿到 clientID = "john"
+   │
+   ├──► 使用点 1: IsBlockedClient(ip, clientID)
+   │        在 accessManager 中进行 allowlist/blocklist 检查
+   │
+   ├──► 使用点 2: contextWithClientID(ctx, clientID)
+   │        写入 context，下游 dnsContext 中读取用于日志、过滤
+   │        dctx.clientID = clientIDFromContext(ctx)
+   │
+   └──► 使用点 3: setCustomUpstream(ctx, l, pctx, clientID)
+            在 processUpstream 中通过 ClientsContainer 查询该 ID 的专属上游：
+            pctx.CustomUpstreamConfig = ClientsContainer.CustomUpstreamConfig(clientID, ip)
+```
+
+---
+
+## 11. Access Control 访问控制完整链路
+
+访问控制发生在 **Wrap 中间件**（所有处理之前），包含三重独立检查，全部通过才允许请求进入管道。
+
+### 11.1 `accessManager`：统一的访问控制引擎
+
+位于 `internal/dnsforward/dnsforward.go:128` 的 `Server.access` 字段，由 `newAccessCtx()` 从配置构建：
+
+```go
+// internal/dnsforward/access.go:22
+type accessManager struct {
+    // IP 白/黑名单：精确地址 + CIDR 网段
+    allowedIPs    *container.MapSet[netip.Addr]
+    blockedIPs    *container.MapSet[netip.Addr]
+    allowedNets   []netip.Prefix
+    blockedNets   []netip.Prefix
+
+    // ClientID 白/黑名单（加密协议才携带）
+    allowedClientIDs *container.MapSet[string]
+    blockedClientIDs *container.MapSet[string]
+
+    // 域名黑名单：基于 urlfilter 规则引擎
+    blockedHostsEng *urlfilter.DNSEngine  // 支持通配符、正则等
+}
+```
+
+配置载入逻辑在 `newAccessCtx()` (`access.go:66`)：
+```go
+func newAccessCtx(allowed, blocked, blockedHosts []string) (a *accessManager, err error) {
+    // 1. IP 与 ClientID 自动解析：
+    //    "192.168.1.0/24" → IP CIDR 网段
+    //    "10.0.0.5"      → 精确 IP
+    //    其他字符串       → 视为 ClientID（调用 ValidateClientID 校验）
+    processAccessClients(allowed, a.allowedIPs, &a.allowedNets, a.allowedClientIDs)
+    processAccessClients(blocked, a.blockedIPs, &a.blockedNets, a.blockedClientIDs)
+
+    // 2. 域名黑名单通过 urlfilter RuleStorage 加载
+    //    每个域名一行，写入 blockedHostsEng 供高效匹配
+    a.blockedHostsEng = urlfilter.NewDNSEngine(rulesStrg)
+}
+```
+
+### 11.2 白名单模式切换
+
+`accessManager` 通过 `allowlistMode()` 自动切换：**只要配置了任何一条 allow 规则，就进入白名单模式**：
+
+```go
+// access.go:108
+func (a *accessManager) allowlistMode() (ok bool) {
+    return a.allowedIPs.Len() != 0 ||
+           a.allowedClientIDs.Len() != 0 ||
+           len(a.allowedNets) != 0
+}
+```
+
+白名单模式下的语义：
+| 字段 | 白名单模式 | 黑名单模式（默认） |
+|------|:---------:|:----------------:|
+| IP | 未在 allowlist 内 → 拒绝 | 在 blocklist 内 → 拒绝 |
+| ClientID | 未在 allowlist 内（含空 ClientID） → 拒绝 | 在 blocklist 内 → 拒绝 |
+
+### 11.3 三重检查在 Wrap 中间件的执行顺序
+
+位于 `internal/dnsforward/middleware.go:24` 的 `Wrap()`：
+
+```go
+func (s *Server) Wrap(h proxy.Handler) (wrapped proxy.Handler) {
+    f := func(ctx context.Context, p *proxy.Proxy, pctx *proxy.DNSContext) (err error) {
+        l := slogutil.MustLoggerFromContext(ctx)
+
+        // ====== 第 1 步：推导 ClientID（仅加密协议可拿到）======
+        clientID, err := s.clientIDFromDNSContext(ctx, l, pctx)
+        if err != nil {
+            pctx.Res = s.NewMsgSERVFAIL(pctx.Req)   // 提取失败返回 SERVFAIL
+            return nil
+        }
+
+        // ====== 第 2 步：客户端身份检查（IP + ClientID 同时判定）======
+        blocked, _ := s.IsBlockedClient(pctx.Addr.Addr(), clientID)
+        if blocked {
+            // 按协议返回对应阻断：UDP/DNSCrypt→丢包，TCP/HTTPS→REFUSED
+            return s.serveBlockedResponse(pctx)
+        }
+
+        // ====== 第 3 步：请求域名黑名单检查（如 version.bind）======
+        blocked = s.isBlockedHost(ctx, l, pctx.Req.Question)
+        if blocked {
+            return s.serveBlockedResponse(pctx)
+        }
+
+        // ====== 全部通过：注入 ClientID 到 context，进入主流程 ======
+        if clientID != "" { ctx = contextWithClientID(ctx, clientID) }
+
+        return h.ServeDNS(ctx, p, pctx)
+    }
+    return proxy.HandlerFunc(f)
+}
+```
+
+### 11.4 客户端身份判定：`IsBlockedClient()`
+
+```go
+// 实际调用：Server.access 两个方法组合判断
+func (s *Server) IsBlockedClient(ip netip.Addr, clientID string) (blocked bool) {
+    // a. ClientID 维度
+    if s.access.isBlockedClientID(clientID) { return true }
+
+    // b. IP 维度（精确 IP + 网段）
+    blocked, _ = s.access.isBlockedIP(ip)
+    return blocked
+}
+```
+
+**ClientID 判定** (`isBlockedClientID()`, access.go:113)：
+```go
+func (a *accessManager) isBlockedClientID(id string) (ok bool) {
+    if id == "" { return a.allowlistMode() }
+    //   白名单模式：allowlist 内不拦截 → !Has(id) 为 true → 拦截
+    //   黑名单模式：blocklist 内 → Has(id) 为 true → 拦截
+    if a.allowlistMode() { return !a.allowedClientIDs.Has(id) }
+    return a.blockedClientIDs.Has(id)
+}
+```
+
+**IP 判定** (`isBlockedIP()`, access.go:141)：
+```go
+func (a *accessManager) isBlockedIP(ip netip.Addr) (blocked bool, rule string) {
+    blocked = true          // 默认值，白名单模式下反转
+    ips := a.blockedIPs
+    ipnets := a.blockedNets
+
+    if a.allowlistMode() {
+        blocked = false
+        ips = a.allowedIPs
+        ipnets = a.allowedNets
+    }
+
+    if ips.Has(ip) { return blocked, ip.String() }
+    for _, ipnet := range ipnets {
+        if ipnet.Contains(ip) { return blocked, ipnet.String() }
+    }
+
+    return !blocked, ""   // 未命中列表：白名单→拒绝, 黑名单→通过
+}
+```
+
+### 11.5 域名黑名单检查：`isBlockedHost()`
+
+`access.go:129` 中通过 urlfilter 的 DNSEngine 匹配：
+
+```go
+func (a *accessManager) isBlockedHost(host string, qt rules.RRType) (ok bool) {
+    _, ok = a.blockedHostsEng.MatchRequest(&urlfilter.DNSRequest{
+        Hostname: aghnet.NormalizeDomain(host),  // 去末尾. + 小写
+        DNSType:  qt,                            // A/AAAA/CNAME 等类型
+    })
+    return ok
+}
+```
+
+默认配置的内置拦截（`dnsforward.go:51`）：
+```go
+var defaultBlockedHosts = []string{"version.bind", "id.server", "hostname.bind"}
+```
+这三个是 DNS 服务器探测域名，避免信息泄露。
+
+---
+
+## 12. DHCP 与 DNS 的双向解析协同
+
+AdGuardHome 内置 DHCP 服务器，通过 **"DNS 依赖 DHCP 查询接口"** 的解耦模式，实现前向（主机名→IP）和后向（IP→主机名）的本地解析联动。
+
+### 12.1 解耦接口：`DHCP` interface
+
+位于 `internal/dnsforward/dnsforward.go:64`，DNS 模块只依赖此接口，不直接耦合 DHCP 实现：
+
+```go
+type DHCP interface {
+    // 正向：主机名 → IP（由 DHCP 租约表内部实现哈希查找）
+    IPByHost(host string) (ip netip.Addr)
+
+    // 反向：IP → 主机名（由 DHCP 租约表内部实现哈希查找）
+    HostByIP(ip netip.Addr) (host string)
+
+    // 启用开关：关闭时直接跳过 DHCP 解析
+    Enabled() (ok bool)
+}
+```
+
+Server 持有该接口引用（`dnsforward.go:108`）：
+```go
+type Server struct {
+    dhcpServer DHCP   // 由外部注入（home/dns.go 在创建 Server 时传入）
+    // ...
+}
+```
+
+### 12.2 前向解析：主机名 → IP (`processDHCPHosts`)
+
+位于 `internal/dnsforward/process.go:275`，是处理管道的第 3 模块（在 DDR 之后，过滤之前）：
+
+```go
+func (s *Server) processDHCPHosts(...) (rc resultCode) {
+    pctx := dctx.proxyCtx
+    req := pctx.Req
+    q := &req.Question[0]
+
+    // 条件 1: 判断查询名是否匹配本地 DHCP 域模式
+    dhcpHost := s.dhcpHostFromRequest(q)
+    if dctx.isDHCPHost = dhcpHost != ""; !dctx.isDHCPHost {
+        return resultCodeSuccess   // 不是 DHCP 主机查询 → 跳过
+    }
+
+    // 条件 2: 客户端必须来自私有网络（防止外部探测内部主机名）
+    if !pctx.IsPrivateClient {
+        pctx.Res = s.NewMsgNXDOMAIN(req)   // 外部客户端 → NXDOMAIN，甚至不记日志
+        return resultCodeFinish            // 管道提前结束
+    }
+
+    // 条件 3: 通过 DHCP 接口查询租约表
+    ip := s.dhcpServer.IPByHost(dhcpHost)   // O(1) 哈希查找
+    if ip == (netip.Addr{}) {
+        return resultCodeSuccess   // 没命中 → 继续走过滤+上游（可能 DNS 重写匹配）
+    }
+
+    // 命中 → 组装响应（不经过上游）
+    resp := s.replyCompressed(req)
+    switch q.Qtype {
+    case dns.TypeA:
+        // A 记录 → 直接写入 IPv4 地址
+        resp.Answer = append(resp.Answer, &dns.A{Hdr: s.hdr(req, dns.TypeA), A: ip.AsSlice()})
+    case dns.TypeAAAA:
+        // AAAA + DNS64：IPv4 主机被 DNS64 前缀合成 IPv6
+        if s.dns64Pref != (netip.Prefix{}) {
+            resp.Answer = append(resp.Answer, &dns.AAAA{
+                Hdr:  s.hdr(req, dns.TypeAAAA),
+                AAAA: s.mapDNS64(ip),   // 64:ff9b:: + IPv4 合成 AAAA
+            })
+        }
+    }
+
+    dctx.proxyCtx.Res = resp     // 写入响应
+    return resultCodeSuccess     // 继续下游管道（过滤/日志等仍会执行）
+}
+```
+
+**DHCP 主机名匹配规则**：`dhcpHostFromRequest()` (`process.go:494`)
+
+```go
+func (s *Server) dhcpHostFromRequest(q *dns.Question) (reqHost string) {
+    if !s.dhcpServer.Enabled() { return "" }         // DHCP 未开启
+    if q.Qtype != dns.TypeA && q.Qtype != dns.TypeAAAA { return "" }  // 仅 A/AAAA
+
+    reqHost = strings.ToLower(q.Name[:len(q.Name)-1])          // 去末尾点
+    if !netutil.IsSubdomain(reqHost, s.localDomainSuffix) {    // 是否 *.lan ?
+        return ""
+    }
+
+    // "my-pc.lan"[:len("my-pc.lan") - len("lan") - 1]  →  "my-pc"
+    return reqHost[:len(reqHost)-len(s.localDomainSuffix)-1]
+}
+```
+
+**查询示例**（`localDomainSuffix = "lan"`）：
+
+| 查询 | 匹配结果 | 行为 |
+|-----|:-------:|-----|
+| `my-pc.lan.` IN A | ✅ → `dhcpHost="my-pc"` | 查租约，返回 IP 或 NXDOMAIN |
+| `server.corp.lan.` IN A | ✅ → `dhcpHost="server.corp"` | 查租约 |
+| `google.com.` IN A | ❌ → 不匹配 `.lan` 域 | 跳过 DHCP，转上游 |
+| `my-pc.lan.` IN MX | ❌ → 非 A/AAAA | 跳过 DHCP |
+
+### 12.3 后向解析：IP → 主机名 (`processDHCPAddrs`)
+
+位于 `internal/dnsforward/process.go:345`，是处理管道的第 4 模块：
+
+```go
+func (s *Server) processDHCPAddrs(...) (rc resultCode) {
+    pctx := dctx.proxyCtx
+    if pctx.Res != nil { return resultCodeSuccess }   // 已有响应（如前向已命中）→ 跳过
+
+    req := pctx.Req
+    q := req.Question[0]
+    pref := pctx.RequestedPrivateRDNS   // dnsproxy 识别的私有 PTR 前缀
+    //    请求: "1.168.192.in-addr.arpa."  →  pref = 192.168.1.1/32
+    //    dnsproxy 解析: 非私有网段不设置此字段 → 值为零值
+
+    if pref == (netip.Prefix{}) || q.Qtype != dns.TypePTR {
+        return resultCodeSuccess   // 非私有 PTR 或非 PTR 查询 → 跳过
+    }
+
+    addr := pref.Addr()
+    host := s.dhcpServer.HostByIP(addr)  // 从租约表反向查找 O(1)
+    if host == "" { return resultCodeSuccess }  // 没找到 → 交给上游/PTR
+
+    // 命中 → 组装 PTR 响应
+    resp := s.replyCompressed(req)
+    resp.Answer = append(resp.Answer, &dns.PTR{
+        Hdr: dns.RR_Header{
+            Name:   q.Name,
+            Rrtype: dns.TypePTR,
+            Ttl:    s.dnsFilter.BlockedResponseTTL(),
+            Class:  dns.ClassINET,
+        },
+        // "my-pc" + "lan"  →  "my-pc.lan."
+        Ptr: dns.Fqdn(strings.Join([]string{host, s.localDomainSuffix}, ".")),
+    })
+    pctx.Res = resp
+    return resultCodeSuccess
+}
+```
+
+### 12.4 关键前置条件：dnsproxy 注入的两个字段
+
+DHCP 协同依赖 dnsproxy 在 `DNSContext` 中预先填充的两个字段：
+
+| 字段 | 设置者 | 含义 | 如何设置 |
+|------|:------:|------|---------|
+| `IsPrivateClient` | dnsproxy | 请求源 IP 是否属于 `proxy.PrivateNets` 配置的私有网段（10.0.0.0/8、192.168.0.0/16 等） | 每次请求时检查 `DNSContext.Addr` 是否匹配 |
+| `RequestedPrivateRDNS` | dnsproxy | PTR 查询目标 IP 若属于私有网段，则解析出前缀 | 反解 `*.in-addr.arpa` 或 `*.ip6.arpa`，再判断是否为私有 IP |
+
+AdGuardHome 在 `newProxyConfig()` 中将自身的私有网段集合传给 dnsproxy：
+```go
+// internal/dnsforward/config.go:359
+conf = &proxy.Config{
+    PrivateNets:    s.conf.PrivateNets,   // 透传给 dnsproxy
+    RequestHandler: /* ... */,
+}
+```
+
+这两个字段是 DHCP 模块安全开关的核心：
+- `IsPrivateClient=false` → 前向解析直接 NXDOMAIN（**防止外部请求内部主机名**）
+- `RequestedPrivateRDNS=零值` → 反向解析直接跳过（**公共 IP 的 PTR 交给上游**）
+
+### 12.5 DHCP 协同的完整数据流
+
+```
+DNS 请求进入管道
+   │
+   ▼
+┌───────────────────────────────────────────────────────┐
+│ processInitial 模块                                    │
+│   注入 dctx.isPrivateClient (来自 pctx.IsPrivateClient)│
+└───────────────────────┬───────────────────────────────┘
+                        │
+   ┌────────────────────┴────────────────────┐
+   │                                         │
+   ▼                                         ▼
+ processDHCPHosts (前向)               processDHCPAddrs (反向)
+   │                                         │
+   ├─ dhcpHostFromRequest() 判断域           ├─ q.Qtype==PTR?
+   ├─ pctx.IsPrivateClient?                 ├─ RequestedPrivateRDNS != 零值?
+   ├─ dhcpServer.IPByHost() 查询租约        ├─ dhcpServer.HostByIP() 查询租约
+   │                                         │
+   ▼                                         ▼
+ 命中 → 构造 A/AAAA (可能 DNS64)         命中 → 构造 PTR (host.localDomainSuffix)
+   │                                         │
+   └────────────────────┬────────────────────┘
+                        │
+                        ▼
+           processFilteringBeforeRequest (过滤)
+                        │
+                        ▼
+                继续下游管道 ...
+```
+
+---
+
+## 13. 架构演进：`next/dnssvc` 新架构
 
 位于 `internal/next/dnssvc/dnssvc.go`，展现了未来更简洁的设计方向（目前仅用于内部子系统）：
 
@@ -922,7 +1453,7 @@ func New(c *Config) (svc *Service, err error) {
 }
 ```
 
-### 10.1 新旧架构对比
+### 13.1 新旧架构对比
 
 | 特性 | 旧架构 (`dnsforward`) | 新架构 (`next/dnssvc`) |
 |------|----------------------|-----------------------|
@@ -933,15 +1464,17 @@ func New(c *Config) (svc *Service, err error) {
 
 ---
 
-## 11. 关键文件索引
+## 14. 关键文件索引
 
 | 功能模块 | 文件路径 | 关键行号/函数 |
 |---------|---------|-------------|
-| DNS 服务器主体 | `internal/dnsforward/dnsforward.go` | `Server` 结构体 (L99), `Start()` (L463), `ServeHTTP()` (L888), `setupFallbackDNS()` (L679) |
+| DNS 服务器主体 & DHCP 接口 | `internal/dnsforward/dnsforward.go` | `DHCP` interface (L64), `Server` 结构体 (L99), `Start()` (L463), `ServeHTTP()` (L888), `setupFallbackDNS()` (L679) |
 | 监听器配置 | `internal/dnsforward/config.go` | `newProxyConfig()` (L331), `prepareTLS()` (L710), `preparePlain()` (L812), `loadUpstreams()` (L530), `filterOutAddrs()` (L630) |
 | 统一入口 | `internal/dnsforward/requesthandler.go` | `ServeDNS()` (L18) |
-| 中间件实现 | `internal/dnsforward/middleware.go` | `Wrap()` (L24), `logMiddleware.Wrap()` (L169) |
-| 处理管道 & 上游转发 | `internal/dnsforward/process.go` | `processUpstream()` (L441), `setCustomUpstream()` (L516) |
+| 中间件 & 访问控制 & ClientID 入口 | `internal/dnsforward/middleware.go` | `Wrap()` (L24), `serveBlockedResponse()` (L59), `isBlockedHost()` (L73), `clientIDFromDNSContext()` (L99), `logMiddleware.Wrap()` (L169) |
+| ClientID 提取实现 | `internal/dnsforward/clientid.go` | `clientIDFromClientServerName()` (L20), `clientIDFromDNSContextHTTPS()` (L63), `clientServerName()` (L91), `clientServerNameFromHTTP()` (L130) |
+| 访问控制引擎 | `internal/dnsforward/access.go` | `accessManager` (L22), `processAccessClients()` (L39), `newAccessCtx()` (L66), `allowlistMode()` (L108), `isBlockedClientID()` (L113), `isBlockedIP()` (L141) |
+| 处理管道 & 上游转发 & DHCP 解析 | `internal/dnsforward/process.go` | `processDHCPHosts()` (L275), `processDHCPAddrs()` (L345), `processUpstream()` (L441), `setCustomUpstream()` (L516), `dhcpHostFromRequest()` (L494) |
 | 上游配置构造 | `internal/dnsforward/upstreams.go` | `newBootstrap()` (L27), `newUpstreamConfig()` (L60), `newPrivateConfig()` (L97), `setProxyUpstreamMode()` (L143) |
 | 客户端专属上游 | `internal/client/upstreammanager.go` | `customUpstreamConfig()` (L122), `newCustomUpstreamConfig()` (L209) |
 | DoH 主路由注册 | `internal/home/dns.go` | `initDNS()` (L46), `newServerConfig()` (L263), `registerDoHHandlers()` (L598) |
@@ -953,24 +1486,35 @@ func New(c *Config) (svc *Service, err error) {
 
 ---
 
-## 12. 总结
+## 15. 总结
 
-AdGuardHome 的 DNS 多协议统一架构，通过以下四层设计实现了高度的协议透明性，并在此基础上叠加了上游分流和 DoH 双入口的扩展能力：
+AdGuardHome 的 DNS 多协议统一架构，通过四层核心设计、三个关键扩展机制、两组业务协同链路，实现了协议透明性与业务可扩展性的平衡：
 
-1. **协议抽象层**（dnsproxy 库提供）：6 种协议监听器 → 统一 `DNSContext`，对上层完全屏蔽协议差异
-2. **中间件装饰层**（3 层洋葱模型）：速率限制、日志注入、ClientID/访问控制 — 以相同逻辑处理所有协议
+### 核心四层设计
+
+1. **协议抽象层**（dnsproxy 库提供）：6 种协议监听器 → 统一 `DNSContext`，对上层完全屏蔽协议差异，同时注入 `IsPrivateClient` / `RequestedPrivateRDNS` 供上层使用
+2. **中间件装饰层**（3 层洋葱模型）：速率限制 → 日志注入 → ClientID 提取 + 访问控制，在进入主处理管道之前完成横切关注点
 3. **统一入口层**：`ServeDNS()` 方法，所有 DNS 查询必经的单点入口
 4. **模块化管道层**：9 个独立处理模块依次执行，按需提前短路返回
 
-在此基础上，三个关键机制进一步增强了系统的灵活性与可靠性：
+### 三个关键扩展机制
 
 5. **上游分流层**（五层优先级链）：客户端专属 → 精确域名匹配 → 通配域名匹配 → 默认上游组 → Fallback 兜底，每一层都支持独立的域名分流语法与上游模式
 6. **DoH 双入口复用**：dnsproxy 独立 HTTPS 监听器 + 主 Web 路由挂载，两条路径最终汇聚到同一个 `proxy.Proxy.ServeHTTP()` → `RequestHandler` → `ServeDNS()`，实现 DNS 处理逻辑的 100% 复用
+7. **ClientID 跨协议识别**：DoH 优先从 URL 路径 `{ClientID}` 占位符提取 → DoH/DoT/DoQ 回退从 SNI 直接子域前缀提取 → 注入 context 供访问控制、自定义上游、日志统计使用
 
-这种架构带来的优势：
+### 两组业务协同链路
+
+8. **访问控制双维度检查**（Wrap 中间件）：IP 白/黑名单（精确 + CIDR） + ClientID 白/黑名单 + 域名黑名单，白名单模式自动切换，支持协议差异化阻断
+9. **DHCP ↔ DNS 双向解析联动**：DNS 通过 `DHCP` interface 解耦依赖 DHCP，前向 `*.lan` A/AAAA 查询经 `IPByHost()` 查租约返回，反向私有网段 PTR 查询经 `HostByIP()` 查租约返回，安全开关依赖 dnsproxy 注入的私有网段标识
+
+### 整体优势
+
 - **可扩展性**：新增协议只需在 dnsproxy 中实现 Listener，上层逻辑零改动
 - **一致性**：所有协议使用相同的过滤、统计、日志逻辑，行为一致
 - **可测试性**：各模块独立可测，不依赖具体协议
 - **演进能力**：通过 Wrap 模式可无限扩展横切关注点（如 tracing、鉴权等）
 - **灵活性**：上游分流支持按客户端、域名多级精细化调度，Fallback 保障解析可靠性
 - **部署弹性**：DoH 双入口模式可在独立专用端口与共享 Web 端口之间自由选择
+- **安全性**：私有网段 DHCP 解析对外部客户端屏蔽，UDP 阻断采用丢包避免放大攻击
+- **解耦性**：DNS 与 DHCP 通过 interface 解耦，支持独立替换与测试
