@@ -435,9 +435,77 @@ func (s *Server) ServeDNS(ctx context.Context, _ *proxy.Proxy, pctx *proxy.DNSCo
 
 位于 `internal/dnsforward/process.go:441`：
 
-- **自定义上游设置**：检查该客户端是否有专属上游配置
-- 调用 `prx.Resolve(ctx, pctx)` 通过 dnsproxy 转发到上游
-- 支持的上游模式：
+```go
+func (s *Server) processUpstream(
+    ctx context.Context, l *slog.Logger, dctx *dnsContext,
+) (rc resultCode) {
+    pctx := dctx.proxyCtx
+
+    if pctx.Res != nil {
+        // 已有响应（本地缓存、DHCP、过滤等已生成）→ 跳过
+        return resultCodeSuccess
+    } else if dctx.isDHCPHost {
+        // DHCP 主机名未命中 → 返回 NXDOMAIN
+        pctx.Res = s.NewMsgNXDOMAIN(req)
+        return resultCodeFinish
+    }
+
+    // 步骤 A: 按客户端注入自定义上游配置
+    s.setCustomUpstream(ctx, l, pctx, dctx.clientID)
+
+    // 步骤 B: 委托 dnsproxy 完成实际转发（含上游选择、fallback）
+    prx := s.proxy()
+    if dctx.err = prx.Resolve(ctx, pctx); dctx.err != nil {
+        return resultCodeError
+    }
+
+    dctx.responseFromUpstream = true
+    return resultCodeSuccess
+}
+```
+
+上游转发的 **四层策略决策** 过程如下：
+
+```
+客户端请求
+   │
+   ▼
+┌────────────────────────────────────────────────────┐
+│  第1层：客户端专属上游 (CustomUpstreamConfig)       │
+│  调用 s.setCustomUpstream()                        │
+│  从 ClientsContainer 按 clientID / IP 查询         │
+│  命中 → 写入 pctx.CustomUpstreamConfig             │
+└───────────────┬────────────────────────────────────┘
+                │
+                ▼
+┌────────────────────────────────────────────────────┐
+│  第2层：按 hostname 域名分流 (在 dnsproxy 内部)     │
+│  proxy.UpstreamConfig 两大分发表：                  │
+│   • SpecifiedDomainUpstreams: 精确匹配域名          │
+│     (如: [/example.com/]1.1.1.1)                   │
+│   • DomainReservedUpstreams: 子域名通配匹配         │
+│     (如: [/google.com/]8.8.8.8)                    │
+│  命中 → 使用匹配的上游组                            │
+└───────────────┬────────────────────────────────────┘
+                │
+                ▼
+┌────────────────────────────────────────────────────┐
+│  第3层：默认上游组 + 上游模式 (UpstreamMode)        │
+│  proxy.Config.UpstreamMode 决定策略：               │
+│   • UpstreamModeLoadBalance: 轮询负载均衡 (默认)   │
+│   • UpstreamModeParallel:    并发取最快             │
+│   • UpstreamModeFastestAddr: 探测 IP 响应时延       │
+└───────────────┬────────────────────────────────────┘
+                │
+                ▼
+┌────────────────────────────────────────────────────┐
+│  第4层：Fallback 兜底 (所有主上游均失败)             │
+│  proxy.Config.Fallbacks                            │
+│  主上游全部 Timeout / SERVFAIL → 切换 Fallback      │
+└────────────────────────────────────────────────────┘
+```
+
+支持的上游模式：
   - `load_balance`：负载均衡（默认）
   - `parallel`：并行查询所有上游，取最快响应
   - `fastest_addr`：探测上游 IP 连通速度，选择最快
@@ -529,7 +597,312 @@ func (s *Server) clientIDFromDNSContext(...) (clientID string, err error) {
 
 ---
 
-## 7. 架构演进：`next/dnssvc` 新架构
+## 7. 多上游 Fallback 机制
+
+### 7.1 Fallback DNS 的配置与装配
+
+Fallback DNS 是当所有主上游服务器都失败（超时、SERVFAIL、网络错误等）时使用的兜底解析器。其装配流程位于 `internal/dnsforward/dnsforward.go` 的 `Prepare()` 方法中：
+
+```go
+// internal/dnsforward/dnsforward.go:483
+func (s *Server) Prepare(ctx context.Context, conf *ServerConfig) (err error) {
+    // ... 前面步骤: proxyConfig 已构建好主上游 (UpstreamConfig) ...
+
+    proxyConfig, err := s.newProxyConfig(ctx)
+    // ...
+
+    // Fallback 在主 proxyConfig 构建之后单独注入
+    proxyConfig.Fallbacks, err = s.setupFallbackDNS()
+    if err != nil {
+        return fmt.Errorf("setting up fallback dns servers: %w", err)
+    }
+
+    dnsProxy, err := proxy.New(proxyConfig)
+    // ...
+}
+```
+
+### 7.2 `setupFallbackDNS()` 实现细节
+
+位于 `internal/dnsforward/dnsforward.go:679`：
+
+```go
+func (s *Server) setupFallbackDNS() (uc *proxy.UpstreamConfig, err error) {
+    // 从配置读取 fallback_dns 列表，过滤掉空行和注释 (# 开头)
+    fallbacks := s.conf.FallbackDNS
+    fallbacks = stringutil.FilterOut(fallbacks, aghnet.IsCommentOrEmpty)
+    if len(fallbacks) == 0 {
+        return nil, nil  // 未配置 fallback → 不启用
+    }
+
+    // 与主上游相同，通过 proxy.ParseUpstreamsConfig 解析为 UpstreamConfig
+    // 注意: Fallback 暂不使用 Bootstrap 解析器（见 TODO 注释）
+    uc, err = proxy.ParseUpstreamsConfig(fallbacks, &upstream.Options{
+        Logger:       aghslog.NewForUpstream(s.baseLogger, aghslog.UpstreamTypeFallback),
+        Timeout:      s.conf.UpstreamTimeout,  // 复用主上游的超时
+        PreferIPv6:   s.conf.BootstrapPreferIPv6,
+    })
+    return uc, err
+}
+```
+
+### 7.3 Fallback 触发时机（在 dnsproxy 内部）
+
+Fallback 的实际使用由 dnsproxy 库的 `Resolve()` 逻辑控制。触发条件是：**所有匹配的主上游全部失败**（超时、连接失败、返回 SERVFAIL/REFUSED/SERVFAIL 等错误响应码）。当主上游耗尽后，dnsproxy 才尝试 `proxy.Config.Fallbacks` 中的上游，同样遵循域名分流与上游模式规则。
+
+---
+
+## 8. 按 Hostname 拆分上游（域名分流）
+
+### 8.1 Upstream 配置字符串语法
+
+AdGuardHome 支持类似 Dnsmasq 的上游域名匹配语法，由 `proxy.ParseUpstreamsConfig()` 解析（位于 dnsproxy 库内部）：
+
+| 语法 | 含义 | 对应字段 |
+|------|------|---------|
+| `8.8.8.8:53` | 无域名前缀，默认上游 | `UpstreamConfig.Upstreams` |
+| `[/example.com/]1.1.1.1` | 精确匹配域名及子域 | `UpstreamConfig.SpecifiedDomainUpstreams` |
+| `[/*.google.com/]8.8.8.8` | 通配子域名（不含根域） | `UpstreamConfig.DomainReservedUpstreams` |
+
+**解析过程**：用户在 YAML 中配置的 `upstream_dns` 是一个字符串数组：
+
+```yaml
+upstream_dns:
+  - https://dns.google/dns-query
+  - [/example.com/]1.1.1.1
+  - [/*.corp.local/]192.168.1.1
+```
+
+加载路径：`loadUpstreams()` (`config.go:530`) 从配置或文件读取原始字符串 → 过滤注释和空行 → `proxy.ParseUpstreamsConfig()` 将其解析为三部分数据结构。
+
+### 8.2 `proxy.UpstreamConfig` 三部分结构
+
+```go
+type UpstreamConfig struct {
+    // 1. 无域名匹配的默认上游（兜底使用）
+    Upstreams []upstream.Upstream
+
+    // 2. 指定域名上游（精确匹配: [/a.b/]x → 仅 a.b 和 *.a.b）
+    //    Key: 规范化域名 (如 "example.com.")
+    SpecifiedDomainUpstreams map[string][]upstream.Upstream
+
+    // 3. 域名通配保留上游（通配匹配: [/*.x/]y → 仅 *.x）
+    //    Key: 规范化域名 (如 "google.com.")
+    DomainReservedUpstreams map[string][]upstream.Upstream
+}
+```
+
+### 8.3 匹配优先级（在 dnsproxy `Resolve()` 内）
+
+对于一个查询 `www.example.com`，匹配算法依次尝试：
+
+1. **精确域名匹配**：查找 `SpecifiedDomainUpstreams["www.example.com."]`
+   - 若命中 → 使用该组上游
+   - 否则向上递归父域 `example.com.` → `com.`
+2. **通配保留匹配**：查找 `DomainReservedUpstreams["www.example.com."]`
+   - 同样向上递归父域
+3. **默认上游**：使用 `Upstreams` 数组
+
+### 8.4 客户端专属上游的覆盖
+
+位于 `internal/dnsforward/process.go:516` 的 `setCustomUpstream()`：
+
+```go
+func (s *Server) setCustomUpstream(
+    ctx context.Context, l *slog.Logger,
+    pctx *proxy.DNSContext, clientID string,
+) {
+    if !pctx.Addr.IsValid() || s.conf.ClientsContainer == nil { return }
+
+    cliAddr := pctx.Addr.Addr()
+    // 按优先级查询: ClientID → IP 地址
+    upsConf := s.conf.ClientsContainer.CustomUpstreamConfig(clientID, cliAddr)
+    if upsConf != nil {
+        // 写入 DNSContext，dnsproxy Resolve() 将优先使用此配置
+        // 完全覆盖主 UpstreamConfig（含域名分流）
+        pctx.CustomUpstreamConfig = upsConf
+    }
+}
+```
+
+`ClientsContainer.CustomUpstreamConfig()` 的实现位于 `internal/client/upstreammanager.go:122`，它：
+- 按 `client UID` 查找缓存的 `customUpstreamConfig`
+- 若配置有变动（`isChanged` 标记），调用 `newCustomUpstreamConfig()` 重新构建
+- 内部同样调用 `proxy.ParseUpstreamsConfig()`，支持与全局上游相同的域名分流语法
+
+**完整上游优先级链**：
+
+```
+请求进入
+   │
+   ▼
+pctx.CustomUpstreamConfig 存在? ──是──► 使用客户端专属配置 (含分流)
+   │否
+   ▼
+SpecifiedDomainUpstreams 精确匹配命中? ──是──► 使用该组上游
+   │否
+   ▼
+DomainReservedUpstreams 通配匹配命中? ──是──► 使用该组上游
+   │否
+   ▼
+默认 Upstreams 组 (按 UpstreamMode 执行负载均衡/并行/探测)
+   │
+   ▼
+全部失败? ──是──► 使用 proxyConfig.Fallbacks
+```
+
+---
+
+## 9. DoH 双入口复用机制
+
+DoH（DNS-over-HTTPS）是 AdGuardHome 中最特殊的协议，因为它建立在 HTTP 之上，而 AdGuardHome 自身已经有一个用于 Web 管理界面的 HTTP 服务器。于是形成了 **两种 DoH 接入路径并存** 的复用架构。
+
+### 9.1 路径 A：dnsproxy 独立 HTTPS 监听器
+
+**配置方式**：通过 `proxy.Config.HTTPConfig.ListenAddresses` 配置独立的 `host:port`。
+
+**代码入口**：dnsproxy 库在 `proxy.Start()` 时，若检测到 `HTTPConfig.ListenAddresses` 非空，就会创建独立的 `net.Listener` + `http.Server`，由 dnsproxy 自身管理生命周期。这条路径与其他协议（DoT/DoQ/UDP）完全一致，适用于需要 DoH 监听在独立端口（如 443）的场景。
+
+请求流程：
+```
+客户端 → https://doh.example.com:443/dns-query
+            │
+            ▼
+      dnsproxy 独立 HTTPS Listener
+            │
+            ▼
+      dnsproxy 内部解析 HTTP 请求体/URL 参数
+            │
+            ▼
+      组装 *proxy.DNSContext (Proto=ProtoHTTPS)
+            │
+            ▼
+      RequestHandler (中间件链) → ServeDNS()
+```
+
+### 9.2 路径 B：挂载到 AdGuardHome 主 Web 服务器（默认推荐）
+
+**代码装配链路**：
+
+#### 第 1 步：`initDNS()` 注册路由
+
+位于 `internal/home/dns.go:46`：
+
+```go
+func initDNS(ctx context.Context, baseLogger *slog.Logger, ...) (err error) {
+    // ... 初始化 stats、queryLog、filters、dnsServer ...
+
+    err = initDNSServer(ctx, ...)   // 创建并 Prepare dnsServer
+    if err != nil { return err }
+
+    // ⭐ DNS Server 准备好后，将其以 http.Handler 身份注册到主 Web mux
+    registerDoHHandlers(config.HTTPConfig.DoH.Routes)
+
+    return nil
+}
+```
+
+#### 第 2 步：默认 DoH 路由配置
+
+位于 `internal/home/config.go:469`，默认路由为：
+
+```yaml
+http_config:
+  doh:
+    routes:
+      - "GET /dns-query"
+      - "POST /dns-query"
+      - "GET /dns-query/{ClientID}"
+      - "POST /dns-query/{ClientID}"
+```
+
+#### 第 3 步：`registerDoHHandlers()` 注册
+
+位于 `internal/home/dns.go:598`：
+
+```go
+func registerDoHHandlers(routes []string) {
+    for _, route := range routes {
+        // 关键: 将 dnsServer 直接作为 http.Handler 挂到全局 mux
+        // dnsServer 类型是 *dnsforward.Server，它实现了 ServeHTTP()
+        globalContext.web.conf.mux.Handle(route, globalContext.dnsServer)
+    }
+}
+```
+
+#### 第 4 步：鉴权中间件豁免 DoH 路由
+
+位于 `internal/home/authhttp.go:326`：
+
+```go
+func (mw *authMiddlewareDefault) isDoHRoute(r *http.Request) (ok bool) {
+    _, pattern := mw.mux.Handler(r)  // 查出匹配到的 route pattern
+    if pattern == "" { return false }
+    return slices.Contains(mw.doHRoutes, pattern)  // 在白名单中则跳过鉴权
+}
+```
+
+DoH 路由被标记为公开资源，鉴权中间件在 `handlePublicAccess()` 中对其放行，避免 DoH 客户端因缺少登录 cookie 被 401 拒绝。
+
+#### 第 5 步：`dnsforward.Server.ServeHTTP()` 转交 dnsproxy
+
+位于 `internal/dnsforward/dnsforward.go:888`：
+
+```go
+// dnsforward.Server 实现了 net/http.Handler 接口
+func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+    if !s.IsRunning() {
+        http.Error(w, "DNS server is not running", http.StatusInternalServerError)
+        return
+    }
+    if prx := s.proxy(); prx != nil {
+        // ⭐ 委托给 dnsproxy 的 HTTP 处理器
+        // prx.ServeHTTP() 会:
+        //   1. 从请求中解析出 DNS 请求 (GET 的 dns 参数或 POST 二进制 body)
+        //   2. 组装 proxy.DNSContext (Proto=ProtoHTTPS)
+        //   3. 调用与其他协议完全相同的 RequestHandler → ServeDNS() 流程
+        prx.ServeHTTP(w, r)
+    }
+}
+```
+
+### 9.3 双路径汇合点
+
+两条路径虽然 HTTP 服务器来源不同，但最终都汇聚到同一个 `proxy.Proxy` 实例的内部 DoH 处理器，再调用完全相同的 `RequestHandler`（中间件链 + `ServeDNS()`）。因此从 DNS 处理逻辑看，两者 **100% 等价**。
+
+```
+  ┌───────────────────────┐     ┌───────────────────────┐
+  │ dnsproxy 独立 HTTPS    │     │ AdGuardHome 主 Web     │
+  │ 服务器 (独立端口)      │     │ 服务器 (共享端口)      │
+  └───────────┬───────────┘     └───────────┬───────────┘
+              │  HTTP 请求                     │  HTTP 请求
+              ▼                               ▼
+  ┌─────────────────────────────────────────────────────┐
+  │        proxy.Proxy.ServeHTTP() (dnsproxy 内部)       │
+  │   解析 DoH 请求 → 构造 DNSContext(Proto=ProtoHTTPS) │
+  └───────────────────────┬─────────────────────────────┘
+                          │
+                          ▼
+  ┌─────────────────────────────────────────────────────┐
+  │   RequestHandler (中间件链: Rate → Log → Wrap)        │
+  │                 → Server.ServeDNS()                   │
+  └─────────────────────────────────────────────────────┘
+```
+
+### 9.4 两种模式对比
+
+| 维度 | 路径 A：独立 HTTPS 监听器 | 路径 B：主 Web 挂载（默认） |
+|------|--------------------------|---------------------------|
+| 端口 | 独立端口，可对外 443 | 复用 Web 管理端口（默认 3000） |
+| HTTP Server 归属 | dnsproxy 库管理 | `home.web` 全局 Web API 管理 |
+| 鉴权 | 不经过鉴权中间件（直接进入 DNS 处理） | 鉴权中间件按 doh.routes 白名单放行 |
+| TLS 证书 | dnsproxy 单独配置 | 复用主 Web 服务器证书 |
+| HTTP/3 支持 | 由 `ServeHTTP3` 配置控制 | 取决于主 Web 服务器 |
+| 适用场景 | 专用 DoH 服务端口 | 端口资源紧张、统一证书管理 |
+
+---
+
+## 10. 架构演进：`next/dnssvc` 新架构
 
 位于 `internal/next/dnssvc/dnssvc.go`，展现了未来更简洁的设计方向（目前仅用于内部子系统）：
 
@@ -549,7 +922,7 @@ func New(c *Config) (svc *Service, err error) {
 }
 ```
 
-### 7.1 新旧架构对比
+### 10.1 新旧架构对比
 
 | 特性 | 旧架构 (`dnsforward`) | 新架构 (`next/dnssvc`) |
 |------|----------------------|-----------------------|
@@ -560,33 +933,44 @@ func New(c *Config) (svc *Service, err error) {
 
 ---
 
-## 8. 关键文件索引
+## 11. 关键文件索引
 
 | 功能模块 | 文件路径 | 关键行号/函数 |
 |---------|---------|-------------|
-| DNS 服务器主体 | `internal/dnsforward/dnsforward.go` | `Server` 结构体 (L99), `Start()` (L463), `ServeHTTP()` (L888) |
-| 监听器配置 | `internal/dnsforward/config.go` | `newProxyConfig()` (L331), `prepareTLS()` (L710), `preparePlain()` (L812) |
+| DNS 服务器主体 | `internal/dnsforward/dnsforward.go` | `Server` 结构体 (L99), `Start()` (L463), `ServeHTTP()` (L888), `setupFallbackDNS()` (L679) |
+| 监听器配置 | `internal/dnsforward/config.go` | `newProxyConfig()` (L331), `prepareTLS()` (L710), `preparePlain()` (L812), `loadUpstreams()` (L530), `filterOutAddrs()` (L630) |
 | 统一入口 | `internal/dnsforward/requesthandler.go` | `ServeDNS()` (L18) |
 | 中间件实现 | `internal/dnsforward/middleware.go` | `Wrap()` (L24), `logMiddleware.Wrap()` (L169) |
-| 处理管道 | `internal/dnsforward/process.go` | 9 个 `process*` 方法 |
+| 处理管道 & 上游转发 | `internal/dnsforward/process.go` | `processUpstream()` (L441), `setCustomUpstream()` (L516) |
+| 上游配置构造 | `internal/dnsforward/upstreams.go` | `newBootstrap()` (L27), `newUpstreamConfig()` (L60), `newPrivateConfig()` (L97), `setProxyUpstreamMode()` (L143) |
+| 客户端专属上游 | `internal/client/upstreammanager.go` | `customUpstreamConfig()` (L122), `newCustomUpstreamConfig()` (L209) |
+| DoH 主路由注册 | `internal/home/dns.go` | `initDNS()` (L46), `newServerConfig()` (L263), `registerDoHHandlers()` (L598) |
+| DoH 鉴权豁免 | `internal/home/authhttp.go` | `isDoHRoute()` (L327), `authMiddlewareDefault.Wrap()` (L404) |
+| DoH 路由默认配置 | `internal/home/config.go` | `doHConfig` 结构体 (L209), 默认 routes (L469) |
 | 日志统计 | `internal/dnsforward/stats.go` | `processQueryLogsAndStats()` (L19) |
-| 主服务初始化 | `internal/home/dns.go` | `initDNS()` (L46), `newServerConfig()` (L263), `registerDoHHandlers()` (L598) |
 | 新架构实现 | `internal/next/dnssvc/dnssvc.go` | `New()` (L62) |
 | DoH API 配置 | `internal/dnsforward/http.go` | `registerHandlers()` (L823), HTTP 控制接口 |
 
 ---
 
-## 9. 总结
+## 12. 总结
 
-AdGuardHome 的 DNS 多协议统一架构，通过以下四层设计实现了高度的协议透明性：
+AdGuardHome 的 DNS 多协议统一架构，通过以下四层设计实现了高度的协议透明性，并在此基础上叠加了上游分流和 DoH 双入口的扩展能力：
 
 1. **协议抽象层**（dnsproxy 库提供）：6 种协议监听器 → 统一 `DNSContext`，对上层完全屏蔽协议差异
 2. **中间件装饰层**（3 层洋葱模型）：速率限制、日志注入、ClientID/访问控制 — 以相同逻辑处理所有协议
 3. **统一入口层**：`ServeDNS()` 方法，所有 DNS 查询必经的单点入口
 4. **模块化管道层**：9 个独立处理模块依次执行，按需提前短路返回
 
+在此基础上，三个关键机制进一步增强了系统的灵活性与可靠性：
+
+5. **上游分流层**（五层优先级链）：客户端专属 → 精确域名匹配 → 通配域名匹配 → 默认上游组 → Fallback 兜底，每一层都支持独立的域名分流语法与上游模式
+6. **DoH 双入口复用**：dnsproxy 独立 HTTPS 监听器 + 主 Web 路由挂载，两条路径最终汇聚到同一个 `proxy.Proxy.ServeHTTP()` → `RequestHandler` → `ServeDNS()`，实现 DNS 处理逻辑的 100% 复用
+
 这种架构带来的优势：
 - **可扩展性**：新增协议只需在 dnsproxy 中实现 Listener，上层逻辑零改动
 - **一致性**：所有协议使用相同的过滤、统计、日志逻辑，行为一致
 - **可测试性**：各模块独立可测，不依赖具体协议
 - **演进能力**：通过 Wrap 模式可无限扩展横切关注点（如 tracing、鉴权等）
+- **灵活性**：上游分流支持按客户端、域名多级精细化调度，Fallback 保障解析可靠性
+- **部署弹性**：DoH 双入口模式可在独立专用端口与共享 Web 端口之间自由选择
