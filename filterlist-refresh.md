@@ -610,22 +610,22 @@ if filepath.IsAbs(flt.URL) {
 
 ---
 
-## 10. 完整刷新衔接：三块按顺序协作的函数调用与数据流
+## 9. 完整刷新衔接：三块按顺序协作的函数调用与数据流
 
 本节以"定时刷新黑名单 + 白名单（force=false）"为例，沿着实际代码路径，逐步拆解订阅源管理、刷新调度、合并去重三块在每一步如何交接。
 
-### 10.1 事件触发：定时器到期（调度→订阅源管理）
+### 9.1 事件触发：定时器到期（调度→订阅源管理）
 
 | 步骤 | 位置 | 动作 | 输入 | 输出 |
 |------|------|------|------|------|
-| 10.1.1 | `filtering.go:1109` | `t.C` 触发，select 进入定时器分支 | — | — |
-| 10.1.2 | `filtering.go:1115` | 调用 `periodicallyRefreshFilters(ivl)` | 当前间隔 `ivl`，全局 `d.conf` | `nextIvl` 新间隔 |
+| 9.1.1 | `filtering.go:1109` | `t.C` 触发，select 进入定时器分支 | — | — |
+| 9.1.2 | `filtering.go:1115` | 调用 `periodicallyRefreshFilters(ivl)` | 当前间隔 `ivl`，全局 `d.conf` | `nextIvl` 新间隔 |
 
 **数据流**：从调度器自身状态（`ivl`、`t`）进入，读取全局配置 `FiltersUpdateIntervalHours`。
 
 ---
 
-### 10.2 调度 → 订阅源管理：筛选待更新列表
+### 9.2 调度 → 订阅源管理：筛选待更新列表
 
 | 步骤 | 位置 | 动作 | 输入 | 输出 |
 |------|------|------|------|------|
@@ -651,7 +651,7 @@ if filepath.IsAbs(flt.URL) {
 
 ---
 
-### 10.3 调度 → 合并去重：逐个更新订阅源
+### 9.3 调度 → 合并去重：逐个更新订阅源
 
 | 步骤 | 位置 | 动作 | 输入 | 输出 |
 |------|------|------|------|------|
@@ -686,7 +686,7 @@ flt.RulesCount = res.RulesCount // 更新规则数
 
 ---
 
-### 10.4 调度 → 订阅源管理：回写元数据
+### 9.4 调度 → 订阅源管理：回写元数据
 
 全部订阅源更新完毕后，进入回写阶段：
 
@@ -703,7 +703,7 @@ flt.RulesCount = res.RulesCount // 更新规则数
 
 ---
 
-### 10.5 合并去重 → 过滤引擎：重建并热替换
+### 9.5 合并去重 → 过滤引擎：重建并热替换
 
 全部名单回写完毕后，进入引擎重建：
 
@@ -719,7 +719,7 @@ flt.RulesCount = res.RulesCount // 更新规则数
 
 ---
 
-### 10.6 收尾：清理旧文件（调度）
+### 9.6 收尾：清理旧文件（调度）
 
 | 步骤 | 位置 | 动作 | 输入 | 输出 |
 |------|------|------|------|------|
@@ -728,7 +728,7 @@ flt.RulesCount = res.RulesCount // 更新规则数
 
 ---
 
-### 10.7 回调度：调整下一次间隔
+### 9.7 回调度：调整下一次间隔
 
 | 步骤 | 位置 | 动作 | 输入 | 输出 |
 |------|------|------|------|------|
@@ -737,7 +737,7 @@ flt.RulesCount = res.RulesCount // 更新规则数
 
 ---
 
-### 10.8 三大块在每一步的分工总表
+### 9.8 三大块在每一步的分工总表
 
 ```
         ┌──────────────────────────────────────────────────────────────┐
@@ -767,11 +767,384 @@ flt.RulesCount = res.RulesCount // 更新规则数
 
 ---
 
-## 11. 异常场景分析：ctx 取消、锁泄漏、文件状态与 atomic 失败回滚
+## 10. 热替换并发机制：旧查询与新引擎接管的协作
 
-### 11.1 ctx 被取消时 updatesLoop 的收尾
+### 10.1 并发模型：单写多读（RWMutex）
 
-#### 11.1.1 实际使用的 ctx：全是 `context.TODO()`，不传递取消信号
+引擎热替换的并发安全基于 `sync.RWMutex` 实现（`filtering.go:284`）：
+
+```go
+type DNSFilter struct {
+    engineLock sync.RWMutex   // 读写锁
+    ...
+}
+```
+
+**读路径（DNS 查询匹配）**：持有读锁 RLock → RUnlock
+**写路径（引擎热替换）**：持有写锁 Lock → Unlock
+
+### 10.2 读路径：查询时如何持有引擎指针
+
+以 `matchHost()` 为例（`filtering.go:904-920`）：
+
+```go
+d.engineLock.RLock()
+// 注释强调：不仅 Match() 时要持锁，使用返回的规则期间也要持锁
+// TODO(e.burkov): Inspect if the above is true.
+defer d.engineLock.RUnlock()
+
+if setts.ProtectionEnabled && d.filteringEngineAllow != nil {
+    dnsres, ok := d.filteringEngineAllow.MatchRequest(ufReq)
+    ...
+}
+...
+if d.filteringEngine != nil {
+    dnsres, ok = d.filteringEngine.MatchRequest(ufReq)
+    ...
+}
+```
+
+**关键点**：
+- 整个匹配过程在**单次 RLock 保护**下完成
+- 期间访问 `d.filteringEngineAllow` 和 `d.filteringEngine` 两个指针
+- `defer RUnlock()` 保证即使 panic 也会释放锁
+- 只要在 RLock 期间读到了指针，后续 `MatchRequest()` 调用使用的就是**同一个引擎实例**（即使替换发生，旧引擎也不会被中途释放）
+
+### 10.3 写路径：引擎替换的原子性
+
+`initFiltering()` 中的替换逻辑（`filtering.go:760-769`）：
+
+```go
+func() {
+    d.engineLock.Lock()
+    defer d.engineLock.Unlock()
+
+    d.reset(ctx)               // 1. 释放旧引擎内存
+    d.rulesStorage = rulesStorage       // 2. 赋值新 storage
+    d.filteringEngine = filteringEngine // 3. 赋值新 engine
+    d.rulesStorageAllow = rulesStorageAllow
+    d.filteringEngineAllow = filteringEngineAllow
+}()
+```
+
+**替换的原子性分析**：
+- 在**单次 Lock 保护**下完成所有指针赋值
+- 对外部观察者（读路径）而言：要么看到全部旧指针，要么看到全部新指针，不会出现"黑名单是新的、白名单是旧的"中间状态
+- 但指针赋值本身有先后顺序，在 Go 内存模型下，如果没有锁保护并发读可能看到部分更新 —— 但这里读写都通过 `engineLock` 同步，所以安全
+
+### 10.4 并发时序：替换发生时正在进行的查询
+
+```
+时间轴 →
+
+Goroutine A (查询):          Goroutine B (替换):
+  RLock()                        ...构建新引擎...
+  engine.MatchRequest()
+  ...使用返回的规则...              Lock() ← 阻塞，等 A 释放读锁
+  ...                               ...
+  RUnlock()
+                                  ← 获取写锁
+                                  reset() 释放旧引擎
+                                  赋值新指针
+                                  Unlock()
+```
+
+**关键结论**：
+1. **进行中的查询安全**：已经获取读锁的查询会继续使用旧引擎完成全部匹配，不会被新替换打断
+2. **新查询立即生效**：写锁释放后到达的新查询，会直接读到新引擎指针
+3. **旧引擎内存安全**：只有当所有持有旧引擎的读锁都释放后，`reset()` 才会被调用（因为写锁要等所有读锁释放），不会出现"正在使用时被释放"的 use-after-free
+4. **替换期间阻塞**：替换进行时（持有写锁），新到达的查询会阻塞等待写锁释放，表现为一次查询延迟（通常毫秒级，取决于引擎构建时间）
+
+### 10.5 读-写公平性与查询饥饿
+
+`sync.RWMutex` 的 Go 标准实现是**写优先**：当有写者等待时，新到来的读者会被阻塞，避免写者饥饿。
+
+对 AdGuardHome 的影响：
+- 引擎热替换（写操作）不会被源源不断的 DNS 查询（读操作）饿死
+- 但替换期间到达的查询会排队等待，造成短暂延迟
+- 由于引擎替换频率很低（最快 1 小时一次），且耗时很短（内存指针赋值），实际影响可忽略
+
+### 10.6 待确认的隐患（代码 TODO）
+
+代码注释中有一个待确认的问题（`filtering.go:905-908`）：
+
+```go
+// Keep in mind that this lock must be held no just when calling Match() but
+// also while using the rules returned by it.
+//
+// TODO(e.burkov):  Inspect if the above is true.
+```
+
+即：返回的规则指针是否指向引擎内部存储？如果引擎被释放，这些指针是否失效？
+
+从 Go 的 `urlfilter.DNSEngine` 设计来看，`MatchRequest` 返回的 `DNSResult` 通常包含规则的**值拷贝或共享不可变数据**，只要引擎对象本身还存活就安全。而由于引擎替换时 `reset()` 在写锁内执行，且旧引擎只有在所有读锁释放后才会被释放，所以实际使用中是安全的。
+
+---
+
+## 11. Web UI 配置修改到 updatesLoop 的完整调用链路
+
+### 11.1 总览：两类配置修改路径
+
+用户从 Web UI 修改过滤相关配置有两大类操作，通向 `updatesLoop` 的路径不同：
+
+| 操作类型 | 代表接口 | 是否走 filtersInitializerChan | 是否影响刷新调度 |
+|----------|---------|----------------------------|-----------------|
+| **订阅源/规则改动** | add_url / remove_url / set_url / set_rules / config | ✅ 是（EnableFilters→setFilters→channel） | 间接（只触发引擎重建，不改变刷新节奏） |
+| **手动刷新** | refresh | ❌ 否（直接调用 tryRefreshFilters） | 直接（立即执行一次刷新） |
+
+### 11.2 路径一：订阅源/规则改动 → filtersInitializerChan → 引擎重建
+
+以最典型的"添加订阅源"为例（`http.go:65-172`）：
+
+```
+Web UI 发送 POST /control/filtering/add_url
+        │
+        ▼
+handleFilteringAddURL()
+  ├── json 解码请求体
+  ├── validateFilterURL() 校验 URL
+  ├── filterExists() 检查重复
+  ├── idGen.next() 分配新 ID
+  │
+  ├── d.update(&filt)        【步骤1：下载内容+写入磁盘】
+  │     └── updateIntl() → Parser.Parse() → finalizeUpdate()
+  │         （与定时刷新完全相同的更新逻辑）
+  │
+  ├── d.filterAdd(filt)       【步骤2：加入配置列表】
+  │     └── conf.filtersMu.Lock()
+  │         追加到 conf.Filters 或 conf.WhitelistFilters
+  │
+  ├── d.conf.ConfModifier.Apply(ctx)  【步骤3：持久化配置文件】
+  │
+  └── d.EnableFilters(true)   【步骤4：触发引擎重建】
+        │
+        ▼
+      enableFiltersLocked()
+        │  收集所有 Enabled=true 的过滤器
+        │  组装 blockFilters []Filter / allowFilters []Filter
+        │
+        ▼
+      setFilters(async=true)  【推入初始化通道】
+        │
+        ├── filtersInitializerLock.Lock()
+        ├── for { 清空通道中已挂起的旧任务 removeLoop }
+        ├── filtersInitializerChan <- {allowFilters, blockFilters}
+        │   （容量为 1 的缓冲通道，确保只有一个最新任务）
+        │
+        └── filtersInitializerLock.Unlock()
+              │
+              ▼
+        updatesLoop() 的 select 分支1 消费通道
+              │
+              ▼
+        initFiltering(allowFilters, blockFilters)
+              │
+              ├── 构建 ruleStorage + urlfilter.DNSEngine（黑白各一套）
+              ├── engineLock.Lock()
+              ├── reset() + 指针赋值
+              └── engineLock.Unlock()
+```
+
+**同类操作的对比**：
+
+| 操作 | 下载内容 | 修改配置 | 持久化 | EnableFilters |
+|------|---------|---------|-------|---------------|
+| add_url | ✅ 立即下载 | ✅ 追加 | ✅ | ✅ async=true |
+| remove_url | ❌ | ✅ 删除 | ✅ | ✅ async=true |
+| set_url（改 URL/名称/开关） | ⚠️ 仅 URL 变化时重下 | ✅ 修改 | ✅ | ⚠️ 仅当需要重启时 |
+| set_rules（自定义规则） | ❌ | ✅ 改 UserRules | ✅ | ✅ async=true |
+| config（总开关/刷新间隔） | ❌ | ✅ 改全局参数 | ✅ | ✅ async=true |
+
+### 11.3 关键机制：合并推送（Coalescing）
+
+`setFilters(async=true)` 中的 `removeLoop` 清空逻辑（`filtering.go:372-382`）：
+
+```go
+// async = true 时
+d.filtersInitializerLock.Lock()
+removeLoop:
+for {
+    select {
+    case <-d.filtersInitializerChan:
+        // fall through，继续丢弃
+    default:
+        break removeLoop
+    }
+}
+d.filtersInitializerChan <- filtersInitializerParams{
+    allowFilters: allowFilters,
+    blockFilters: blockFilters,
+}
+d.filtersInitializerLock.Unlock()
+```
+
+**设计意图**：
+- 通道容量 = 1
+- 如果短时间内多次调用 `EnableFilters(true)`（如用户快速操作），只保留**最后一次**的参数
+- 避免 `updatesLoop` 被重复的引擎重建任务淹没
+- `filtersInitializerLock` 保护"清空+推入"的原子性，防止并发写入
+
+### 11.4 路径二：手动刷新 → 直接调用刷新逻辑
+
+`handleFilteringRefresh()`（`http.go:366-407`）：
+
+```
+Web UI 点击"立即刷新"
+  │
+  ▼
+POST /control/filtering/refresh
+  │
+  ▼
+handleFilteringRefresh()
+  ├── json 解码 { whitelist: bool }
+  ├── 异步执行（go func）
+  │     │
+  │     └── tryRefreshFilters(!req.White, req.White, true)
+  │           ├── refreshLock.TryLock()
+  │           └── refreshFiltersIntl(block, allow, force=true)
+  │                 （与定时刷新完全相同的内部逻辑，但 force=true）
+  │
+  └── 立即响应 "OK" 给前端（不等刷新完成）
+```
+
+**特点**：
+- **不走初始化通道**，直接在独立 goroutine 中执行完整刷新流程
+- `force=true` 跳过过期检查，立即刷新所有已启用的订阅源
+- HTTP 请求立即返回，刷新在后台进行
+- 前端需要通过 `/control/filtering/status` 轮询查看结果
+
+### 11.5 刷新间隔配置修改的特殊情况
+
+`handleFilteringConfig()` 修改 `FiltersUpdateIntervalHours`（`http.go:480-490`）：
+
+```go
+func() {
+    d.conf.filtersMu.Lock()
+    defer d.conf.filtersMu.Unlock()
+    d.conf.FilteringEnabled = req.Enabled
+    d.conf.FiltersUpdateIntervalHours = req.Interval
+}()
+d.conf.ConfModifier.Apply(ctx)
+d.EnableFilters(true)
+```
+
+**注意**：修改刷新间隔**不会主动通知 `updatesLoop` 调整定时器**。
+
+实际效果：
+- `updatesLoop` 仍然按当前 `ivl` 等待下一次触发
+- 下一次 `periodicallyRefreshFilters()` 执行时，才会读取新的 `FiltersUpdateIntervalHours`
+- 如果新间隔更短，实际生效会延迟（最多等待旧的 ivl 时长）
+- 如果新间隔设为 0（禁用），下一次触发时发现为 0 → 直接返回，后续不再刷新（但定时器还在按原间隔 tick，只是不做事）
+
+**这是一个隐性设计**：配置修改不直接干预调度循环，而是通过"下次检查时读取最新值"的方式渐进生效。
+
+---
+
+## 12. 监控与指标：刷新成功率、耗时、错误数的暴露情况
+
+### 12.1 结论先行：没有专门的 metrics 层
+
+**AdGuardHome 的过滤刷新模块没有实现 Prometheus metrics 或专门的指标层。** 刷新状态的暴露仅通过以下两种方式：
+
+| 方式 | 内容 | 粒度 |
+|------|------|------|
+| 结构化日志 | `slog.Logger` 记录开始/结束/错误 | 每个订阅源 |
+| HTTP Status API | `/control/filtering/status` 返回元数据 | 每个订阅源 |
+
+### 12.2 日志指标（Log-based Metrics）
+
+刷新链路中通过 `slog.Logger` 输出的关键日志：
+
+| 日志级别 | 位置 | 事件 | 字段 |
+|---------|------|------|------|
+| `Debug` | `filter.go:420-422` | 刷新开始/结束 | `updated=N` |
+| `Info` | `filter.go:602` | 保存内容成功 | `id`, `path` |
+| `Info` | `filter.go:610-616` | 单个订阅源更新完成 | `id`, `bytes_written`, `rules_count` |
+| `Info` | `filter.go:380-386` | 回写元数据完成 | `id`, `rules_count`, `prev_rules_count` |
+| `Error` | `filter.go:349` | 单个订阅源更新失败 | `url`, `error` |
+| `Error` | `filter.go:492` | 更新文件 mtime 失败 | `error` |
+| `Debug` | `filter.go:596` | 无变化跳过 | `id`, `url` |
+
+**可通过日志采集间接获得**：
+- 刷新成功率 = （Info 条数）/ （Info + Error 条数）
+- 刷新耗时 = 同一次刷新中 "starting update" 到 "finished update" 的时间差
+- 错误类型分布 = Error 日志的 `error` 字段分类
+
+但这些都需要外部日志系统（如 ELK、Loki）做聚合，模块本身不提供统计能力。
+
+### 12.3 HTTP Status API 的可用字段
+
+`GET /control/filtering/status` 返回结构（`http.go:415-421`）：
+
+```json
+{
+  "filters": [
+    {
+      "id": 1,
+      "enabled": true,
+      "url": "https://...",
+      "name": "AdGuard Simplified Domain Names filter",
+      "rules_count": 56789,
+      "last_updated": "2024-01-15T10:30:00Z"
+    }
+  ],
+  "whitelist_filters": [...],
+  "user_rules": ["..."],
+  "interval": 24,
+  "enabled": true
+}
+```
+
+**能从中推断的信息**：
+- `rules_count`：每个订阅源的规则量（历史上一次成功刷新的结果）
+- `last_updated`：上次更新时间，可推算"距离上次更新多久了"
+- `enabled` + `interval`：可推算是否应该已经刷新过
+
+**缺失的指标**：
+- ❌ 刷新成功率（success rate）
+- ❌ 单次刷新耗时（duration）
+- ❌ 连续失败次数（consecutive failures）
+- ❌ 错误类型分布（error breakdown）
+- ❌ 刷新延迟/调度抖动（scheduling jitter）
+- ❌ 引擎重建耗时（engine reload time）
+
+### 12.4 全局 stats 模块 vs 过滤刷新
+
+项目中有 `internal/stats` 模块，提供 `/control/stats` 接口，但它**只统计 DNS 查询层面**的数据：
+
+- 总 DNS 查询数
+- 被过滤的查询数（按原因分类：广告、成人、安全浏览等）
+- 热门域名排行
+- 客户端查询统计
+- 按时间单位（小时/天）聚合
+
+**完全不包含**过滤列表刷新的成功率、耗时、错误数等运维指标。
+
+### 12.5 新架构（rulelist）的 metrics 现状
+
+新架构 `rulelist.Engine` / `rulelist.Storage` 同样没有 metrics 接口，只有：
+- `RulesCount` 属性（当前引擎的规则总数）
+- `LastUpdated` 概念（通过刷新时间推断）
+- 日志记录刷新事件
+
+### 12.6 小结：当前监控现状与改进空间
+
+| 维度 | 现状 | 可改进方向 |
+|------|------|-----------|
+| 刷新成功率 | ❌ 无，仅靠日志 | 增加计数器，按订阅源维度统计成功/失败 |
+| 刷新耗时 | ❌ 无，仅靠日志 | 增加 Histogram，区分 HTTP 下载/解析/引擎重建 |
+| 错误数/类型 | ❌ 无，仅靠日志 | 增加错误类型计数器（网络/解析/磁盘/校验） |
+| 调度间隔 | ⚠️ 可通过 status API 间接推断 | 增加下次刷新时间戳 |
+| 引擎规则总数 | ✅ 通过 status API 可获得 | 保持现状 |
+| Prometheus 格式 | ❌ 完全没有 | 增加 `/metrics` 端点或接入全局 metrics |
+
+---
+
+## 13. 异常场景分析：ctx 取消、锁泄漏、文件状态与 atomic 失败回滚
+
+### 13.1 ctx 被取消时 updatesLoop 的收尾
+
+#### 13.1.1 实际使用的 ctx：全是 `context.TODO()`，不传递取消信号
 
 代码全量 grep 结果：刷新链路中所有 ctx 创建都来自 `context.TODO()`：
 
@@ -784,7 +1157,7 @@ flt.RulesCount = res.RulesCount // 更新规则数
 
 **结论：ctx 取消信号完全没有从外部进入刷新链路的路径。** 用户取消 API 请求不会中断正在进行的刷新；刷新 goroutine 本身也无法因 ctx 超时而提前退出。
 
-#### 11.1.2 真正的退出机制：`done` 通道 + `Close()`
+#### 13.1.2 真正的退出机制：`done` 通道 + `Close()`
 
 退出路径（`filtering.go:394-402`）：
 
@@ -810,7 +1183,7 @@ case doneCh := <-d.done:
     return                    // 退出 goroutine
 ```
 
-#### 11.1.3 异常场景推演：刷新中途收到 done 信号
+#### 13.1.3 异常场景推演：刷新中途收到 done 信号
 
 由于 **三个 select 分支互斥**，有两种情形：
 
@@ -838,7 +1211,7 @@ goroutine A (Close):           goroutine B (updatesLoop 正在刷新):
 
 **但 Close 中的 `done <- doneCh` 回环使得 B 有机会在进入 EnableFilters 之前先退出 select：** 实际 `updatesLoop` 中 `periodicallyRefreshFilters()` 返回后，会回到 for 循环头的 select 下一轮，此时先读到 done 信号 → return，EnableFilters 不再被执行。**这个回环是有意设计的死锁规避手段。**
 
-#### 11.1.4 小结
+#### 13.1.4 小结
 
 | 问题 | 结果 |
 |------|------|
@@ -850,9 +1223,9 @@ goroutine A (Close):           goroutine B (updatesLoop 正在刷新):
 
 ---
 
-### 11.2 锁与文件状态的泄漏风险
+### 13.2 锁与文件状态的泄漏风险
 
-#### 11.2.1 各类锁的获取-释放配对检查
+#### 13.2.1 各类锁的获取-释放配对检查
 
 | 锁 | 获取位置 | 释放方式 | 异常路径覆盖 | 泄漏可能 |
 |----|---------|---------|-------------|---------|
@@ -868,7 +1241,7 @@ goroutine A (Close):           goroutine B (updatesLoop 正在刷新):
 
 **结论：** 所有锁都用 `defer` 确保释放，且均在同一函数内获取/释放，没有跨越 goroutine 或未配对的情况。正常流程和所有 panic 路径（被 defer 覆盖）都安全。
 
-#### 11.2.2 临时文件状态的泄漏风险
+#### 13.2.2 临时文件状态的泄漏风险
 
 **临时文件生命周期**：
 
@@ -899,9 +1272,9 @@ goroutine A (Close):           goroutine B (updatesLoop 正在刷新):
 
 ---
 
-### 11.3 atomic（CloseReplace）失败场景：缓存与锁的回滚分析
+### 13.3 atomic（CloseReplace）失败场景：缓存与锁的回滚分析
 
-#### 11.3.1 atomic 更新失败的触发条件
+#### 13.3.1 atomic 更新失败的触发条件
 
 Unix 上 `CloseReplace()` = `renameio.PendingFile.CloseAtomicallyReplace()` 内部：
 ```
@@ -912,7 +1285,7 @@ fsync(tmpFd) → close(tmpFd) → rename(tmpPath, targetPath)
 1. **fsync 失败**：磁盘 IO 错误、磁盘满
 2. **rename 失败**：跨设备（EXDEV）、目标目录权限、target 在写入中被另一个进程删改
 
-#### 11.3.2 失败后的代码行为（`filter.go:585-622`）
+#### 13.3.2 失败后的代码行为（`filter.go:585-622`）
 
 ```go
 func (d *DNSFilter) finalizeUpdate(...) (err error) {
@@ -934,7 +1307,7 @@ func (d *DNSFilter) finalizeUpdate(...) (err error) {
 
 **关键：CloseReplace 失败时 `return err`，后面的元数据更新（`ensureName`、`checksum`、`RulesCount`）被跳过！**
 
-#### 11.3.3 锁状态分析
+#### 13.3.3 锁状态分析
 
 | 锁 | CloseReplace 失败时状态 | 是否需要回滚 |
 |----|-------------------------|-------------|
@@ -944,7 +1317,7 @@ func (d *DNSFilter) finalizeUpdate(...) (err error) {
 
 **结论：** atomic 失败不涉及任何锁的释放问题。所有相关锁在更外层或更内层的 defer 保护下。
 
-#### 11.3.4 缓存与状态回滚检查
+#### 13.3.4 缓存与状态回滚检查
 
 **1）副本 `updateFilters[i]` 的状态（内存）：**
 - `LastUpdated` 已被 `update()` 设为 `time.Now()`（无论成功失败，`filter.go:484`）
@@ -976,7 +1349,7 @@ func (d *DNSFilter) finalizeUpdate(...) (err error) {
 - 但此时主列表 `f.RulesCount` 还是旧值（与旧文件实际内容一致）
 - **结论：引擎实际内容是正确的（旧版本），但系统误以为"完成了一次更新"**
 
-#### 11.3.5 错位副作用汇总表
+#### 13.3.5 错位副作用汇总表
 
 | 错位副作用 | 现象 | 影响 | 严重度 |
 |-----------|------|------|--------|
@@ -989,22 +1362,22 @@ func (d *DNSFilter) finalizeUpdate(...) (err error) {
 
 ---
 
-## 12. 异常场景下的改进建议（代码潜在问题）
+## 14. 异常场景下的改进建议（代码潜在问题）
 
 基于上述分析，当前实现中可考虑优化的点：
 
-### 12.1 LastUpdated 前移问题（错位副作用 A）
+### 14.1 LastUpdated 前移问题（错位副作用 A）
 将 `filter.LastUpdated = time.Now()` 从 `update()` 无条件赋值，改为仅在 `updated=true || (err == nil && !updated)` 时赋值，或从 `finalizeUpdate` 内部在 CloseReplace 成功后赋值。
 
-### 12.2 updNum 虚增问题（错位副作用 B）
+### 14.2 updNum 虚增问题（错位副作用 B）
 `updateFlags[i]` 的取值应结合 CloseReplace 成功与否：`b = updateIntl()` 只表示 checksum 不同，不等于最终更新成功。建议引入"最终成功"标志或在 syncUpdatedFilters 中同时读取 `f.RulesCount != uf.RulesCount`（实际上更可靠）。
 
-### 12.3 ctx 传递链路
+### 14.3 ctx 传递链路
 考虑将 `updatesLoop(context.TODO())` 改为使用可取消的 ctx，配合 `http.NewRequestWithContext` 让 Close/退出时能够中断进行中的 HTTP 请求。
 
 ---
 
-## 13. 关键代码索引（已校准行号，更新版）
+## 15. 关键代码索引（已校准行号，更新版）
 
 | 功能 | 精确定位 |
 |------|----------|
@@ -1048,3 +1421,13 @@ func (d *DNSFilter) finalizeUpdate(...) (err error) {
 | enableFiltersLocked（启用内部） | `internal/filtering/filter.go:672` |
 | PendingFile 接口定义 | `internal/aghrenameio/renameio.go:20` |
 | Unix CloseReplace（atomic rename） | `internal/aghrenameio/renameio_unix.go:27` |
+| 查询匹配读锁 `matchHost()` | `internal/filtering/filtering.go:904` |
+| 引擎替换写锁 `initFiltering()` | `internal/filtering/filtering.go:761` |
+| 配置修改 Handler `handleFilteringConfig` | `internal/filtering/http.go:462` |
+| 状态查询 Handler `handleFilteringStatus` | `internal/filtering/http.go:442` |
+| 合并推送 `removeLoop` 清空逻辑 | `internal/filtering/filtering.go:372` |
+| `filterToJSON` 状态序列化 | `internal/filtering/http.go:425` |
+| 手动刷新 Handler `handleFilteringRefresh` | `internal/filtering/http.go:366` |
+| `filterSetProperties` 设属性 | `internal/filtering/filter.go:220` |
+| `filterAdd` 添加订阅源 | `internal/filtering/filter.go:200` |
+| `filterDel` 删除订阅源 | `internal/filtering/filter.go:228` |
