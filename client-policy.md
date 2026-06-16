@@ -2122,7 +2122,485 @@ AdGuardHome 中有这些 TTL 配置，但都不是 `clients_persistent_ttl`：
 
 ---
 
-## 27. 关键配置参数
+## 27. 时钟回拨场景的 LastSeen 兜底
+
+### 27.1 Go `time.Now()` 的双时钟模型
+
+Go 的 `time.Time` 内部包含**两种时间**：
+
+```
+time.Time {
+    wall: uint64   // 墙钟时间（wall clock），含纳秒精度
+    ext:  int64    // 单调时间（monotonic clock），自进程启动以来的纳秒
+}
+```
+
+- 当 `time.Now()` 返回时，`wall` 使用系统时钟，`ext` 使用单调时钟
+- **单调时钟不受 NTP 调整影响**，不会回拨
+- `time.Since(t)` 和 `time.Until(t)` 优先使用单调时钟
+
+### 27.2 AdGuardHome 中的时间使用分类
+
+| 用途 | 代码 | 时钟类型 | 回拨影响 |
+|-----|------|---------|---------|
+| Query Log 时间戳 | `time.Now()` → `logEntry.Time` | 墙钟（RFC3339Nano） | ✅ 受回拨影响 |
+| DNS 缓存 TTL 过期 | `time.Since()` / `time.Until()` | 单调时钟 | ❌ 不受影响 |
+| WHOIS 缓存过期 | `time.Now().Add(ttl)` → `cacheItem.expiry` | 墙钟 | ✅ 受回拨影响 |
+| stats unit ID | `time.Now().Unix() / secsInHour` | 墙钟（Unix 秒） | ✅ 受回拨影响 |
+| ARP 刷新周期 | `time.Sleep(arpClientsUpdatePeriod)` | 单调时钟 | ❌ 不受影响 |
+| BlockedServices Schedule | `Schedule.Contains(time.Now())` | 墙钟 | ✅ 受回拨影响 |
+
+### 27.3 时钟回拨对各模块的影响
+
+**1. DNS 缓存：不受影响** ✅
+```
+底层 proxy 库使用 time.Since() 计算缓存条目年龄，
+Go 的 time.Since() 优先使用单调时钟，NTP 回拨不会导致缓存提前过期或延迟过期。
+```
+
+**2. Query Log 时间戳：回拨导致乱序** ⚠️
+```
+回拨前：logEntry.Time = 2025-07-01T12:00:00
+回拨后：logEntry.Time = 2025-07-01T11:55:00（5 分钟回拨）
+结果：日志中出现时间倒流，搜索 olderThan 可能遗漏记录
+```
+
+**3. WHOIS 缓存：回拨延长有效期** ⚠️
+```go
+// [internal/whois/whois.go:396-398]
+func toCacheItem(info Info, ttl time.Duration) (item *cacheItem) {
+    return &cacheItem{
+        expiry: time.Now().Add(ttl),  // ← 墙钟 +TTL
+    }
+}
+// [internal/whois/whois.go:405-406]
+func fromCacheItem(item *cacheItem) (info *Info, expired bool) {
+    if time.Now().After(item.expiry) {  // ← 墙钟比较
+        return item.info, true
+    }
+    return item.info, false
+}
+```
+回拨 5 分钟 → `time.Now()` 变小 → `After(expiry)` 更难满足 → **缓存有效期被隐式延长**
+
+**4. Stats 统计：unit ID 错乱** ⚠️
+```go
+// [internal/stats/unit.go:184-188]
+func newUnitID() (id uint32) {
+    const secsInHour = int64(time.Hour / time.Second)
+    return uint32(time.Now().Unix() / secsInHour)  // ← 墙钟
+}
+```
+回拨跨越整点 → unit ID 回退 → 新统计数据可能写入已关闭的 unit
+
+### 27.4 代码中无兜底机制
+
+AdGuardHome **没有实现时钟回拨的检测或兜底机制**：
+- ❌ 没有单调时钟校验（如比较 `time.Now()` 与上次记录的时间）
+- ❌ 没有时间回拨日志告警
+- ❌ 没有 `maxClockSkew` 配置项
+- ❌ WHOIS 缓存没有使用 `time.Since()` 代替墙钟比较
+
+### 27.5 降级策略
+
+如果运行环境可能发生时钟回拨（如嵌入式设备断电后重启）：
+1. 使用 `chrony` 替代 `ntpd`，支持步进限制（`maxslewrate`）
+2. 监控 Query Log 时间戳回拨：`jq '.T' querylog.json | sort -C`
+3. WHOIS 缓存受影响最严重，可缩短 `whois.cacheTTL` 减小回拨窗口
+
+---
+
+## 28. NTP 校准断网退路
+
+### 28.1 AdGuardHome 不依赖 NTP
+
+AdGuardHome 的 DNS 解析功能 **不依赖 NTP 同步**，核心路径无 NTP 依赖：
+
+| 功能 | 是否依赖 NTP | 说明 |
+|-----|-------------|------|
+| DNS 查询转发 | ❌ | 直接转发到上游 DNS |
+| 缓存 TTL 管理 | ❌ | 使用单调时钟 |
+| 客户端识别 | ❌ | 不使用时间戳 |
+| TLS 证书验证 | ⚠️ | Go 标准库验证证书有效期用墙钟 |
+| BlockedServices Schedule | ✅ | `Schedule.Contains(time.Now())` 用墙钟 |
+
+### 28.2 断网时 DNS 服务持续可用
+
+```
+客户端 DNS 请求
+  ├─ dnsProxy.Cache 命中 → 直接返回（无需上游）
+  ├─ 缓存未命中 + 上游不可达 → 返回 SERVFAIL
+  └─ CacheOptimistic=true → 返回过期缓存条目 + 异步刷新
+```
+
+**CacheOptimistic 模式**是断网时的关键退路：
+```go
+// [internal/dnsforward/http.go:100-101]
+// CacheOptimistic defines if expired entries should be served.
+CacheOptimistic *bool `json:"cache_optimistic"`
+```
+
+开启后，即使缓存条目已过期，仍会先返回过期结果，同时在后台尝试刷新。断网场景下：
+- 客户端立即得到（可能是过时的）响应
+- 后台刷新失败（上游不可达），过期条目继续被服务
+
+### 28.3 NTP 断网导致系统时钟漂移的影响
+
+当设备断网后 NTP 无法校时，系统时钟可能漂移：
+- **RTC 电池正常**：漂移 < 1 分钟/年，几乎无影响
+- **RTC 电池失效**（树莓派等）：每次重启时钟回到 1970 年，影响巨大
+
+1970 年时钟的影响：
+- TLS 证书被视为"尚未生效"，DoH/DoT 连接失败
+- BlockedServices Schedule 判断错误
+- Stats unit ID 溢出或为 0
+
+### 28.4 缓解措施
+
+1. 为嵌入式设备配置 RTC 模块
+2. 启用 `cache_optimistic`：`POST /control/dns_config {"cache_optimistic": true}`
+3. 配置 DHCP 租约时间：默认 `86400` 秒（1 天），断网期间旧租约仍有效
+4. 配置 fallback DNS：`FallbackDNS` 字段指定备用上游（如内网 DNS）
+
+---
+
+## 29. Prometheus 告警抑制
+
+### 29.1 结论：AdGuardHome 无 Prometheus 集成
+
+经过全代码库搜索 `prometheus`、`Prometheus`、`metrics`、`exporter`、`Metrics` 等关键词，**AdGuardHome 不包含任何 Prometheus metrics 导出功能**。
+
+Prometheus 告警抑制是 **AdGuard DNS（企业版 SaaS）** 的运维能力，不属于本地开源版本。
+
+### 29.2 AdGuardHome 可用的监控手段
+
+| 监控手段 | 说明 | 代码位置 |
+|---------|------|---------|
+| Query Log API | `GET /control/querylog` | [querylog/http.go] |
+| Stats API | `GET /control/stats` | [stats/http.go] |
+| DNS Server 状态 | `GET /control/status` | [dnsforward/http.go] |
+| 健康检查 | `GET /control/version.json` | [home/home.go] |
+| 系统日志 | `slog` 结构化日志 | 全局 |
+
+### 29.3 自行实现 Prometheus Exporter
+
+社区有第三方方案（如 `prometheus-adguardhome-exporter`），通过轮询 Stats API 导出指标：
+
+```
+AdGuardHome Stats API
+  ↓ HTTP 轮询（10s 间隔）
+prometheus-adguardhome-exporter
+  ↓ /metrics
+Prometheus Server
+  ↓ AlertManager
+告警规则 + 抑制策略
+```
+
+告警抑制配置示例（AlertManager）：
+```yaml
+inhibit_rules:
+  - source_match:
+      severity: 'critical'
+    target_match:
+      severity: 'warning'
+    equal: ['instance']
+```
+
+### 29.4 为什么 AdGuardHome 不内置 Prometheus
+
+1. **依赖最小化**：Prometheus client_golang 会增加二进制大小和依赖链
+2. **场景差异**：家用场景通常 < 10 客户端，不需要企业级监控
+3. **性能考量**：metrics 采集会增加每个请求的开销
+4. **企业版差异化**：AdGuard DNS 企业版提供 Prometheus 集成作为付费功能
+
+---
+
+## 30. prepare 阶段 snapshot 存储位置
+
+### 30.1 结论：AdGuardHome 无 "prepare 阶段 snapshot" 概念
+
+搜索 `snapshot`、`Snapshot`、`prepare.*phase`、`phase.*prepare` 等关键词，**AdGuardHome 中没有配置更新的"prepare → commit"两阶段协议，因此不存在 snapshot 存储位置**。
+
+这个概念属于分布式数据库（如 TiKV、CockroachDB）的事务模型，不适用于 AdGuardHome 的单节点 YAML 配置管理。
+
+### 30.2 实际的配置"快照"：AdGuardHome.yaml 文件
+
+AdGuardHome 的配置"快照"就是磁盘上的 `AdGuardHome.yaml` 文件：
+
+```
+配置写入流程：
+  config.Lock()                    // 内存写锁
+  ↓
+  修改 config 结构体字段             // 内存中修改
+  ↓
+  config.write()                   // 序列化为 YAML
+  ↓
+  os.WriteFile(AdGuardHome.yaml)   // 写入磁盘（原子替换）
+  ↓
+  config.Unlock()
+```
+
+**存储位置**：`/opt/AdGuardHome/AdGuardHome.yaml`（默认路径，可配置）
+
+### 30.3 备份机制
+
+AdGuardHome 在写入配置前会先备份旧配置：
+
+```go
+// [internal/home/config.go:write()]
+func writeConfig() error {
+    // 先写入 .tmp 文件
+    err = os.WriteFile(configPath+".tmp", data, 0644)
+    // 再原子重命名
+    err = os.Rename(configPath+".tmp", configPath)
+}
+```
+
+- `.tmp` 文件是临时快照，写入成功后被 `Rename` 原子替换
+- 如果 `WriteFile` 失败，原 `AdGuardHome.yaml` 不受影响
+- 如果 `Rename` 失败，`.tmp` 文件残留，但原文件仍完整
+
+### 30.4 bbolt 数据库的"快照"
+
+bbolt 数据库（用于统计、会话）使用 WAL（Write-Ahead Log）和 mmap：
+- 写入路径：`AdGuardHome/data/stats.db` / `sessions.db`
+- bbolt 事务内部有 `freelist` 和 `page` 管理，但这是数据库内部实现，不暴露为"snapshot"
+- 数据库文件本身就是持久化的"快照"
+
+### 30.5 恢复方式
+
+| 场景 | 恢复方式 |
+|-----|---------|
+| YAML 写入中断 | `.tmp` 文件残留，原 YAML 完整，重启即可 |
+| YAML 已被替换但内容错误 | 手动编辑或从备份恢复 |
+| bbolt 数据库损坏 | 删除 `.db` 文件，重启后自动重建空数据库 |
+| 全部丢失 | 从 `AdGuardHome.yaml.bak` 或系统备份恢复 |
+
+---
+
+## 31. 递归依赖深度超阈值的兜底
+
+### 31.1 结论：AdGuardHome 中不存在递归依赖深度控制
+
+搜索 `recursive`、`recursion.*depth`、`dependency.*depth`、`maxDepth`、`MaxDepth` 等关键词，**AdGuardHome 中没有递归依赖深度的概念或兜底机制**。
+
+这个概念属于 **AdGuard DNS（云端）** 的规则依赖图管理，不适用于 AdGuardHome。
+
+### 31.2 AdGuardHome 中仅有的"深度"概念
+
+| 场景 | 深度控制 | 代码 |
+|-----|---------|------|
+| CNAME 链跟踪 | Go 标准库 `dns` 包内部递归，无显式深度限制 | `miekg/dns` |
+| 域名逐级匹配 | `www.example.com` → `example.com` → `com`，最多 N 级（由域名标签数决定） | `filtering.CheckHost()` |
+| upstream 域名解析 | bootstrap DNS 解析 upstream 主机名，无深度限制 | `proxy.ParseUpstreamsConfig()` |
+
+### 31.3 为什么不需要
+
+1. **规则无依赖关系**：AdGuardHome 的过滤规则是扁平列表，规则之间没有"依赖"概念（不像 Docker 镜像层或 Bazel 构建图）
+2. **CNAME 链由上游 DNS 限制**：DNS 协议规范 CNAME 链不超过 8-10 层
+3. **单进程架构**：不存在分布式依赖
+
+### 31.4 潜在风险：无限 CNAME 循环
+
+唯一的"递归"风险是 CNAME 循环（`a.com CNAME b.com` / `b.com CNAME a.com`），但由 Go `miekg/dns` 库的递归深度限制兜底（通常 10 层）。
+
+---
+
+## 32. 写锁饥饿场景识别
+
+### 32.1 结论：代码中无写锁饥饿检测或预防机制
+
+搜索 `starvation`、`FairMutex`、`TryLock`、`TryRLock`、`writer.*starv` 等关键词，**AdGuardHome 没有实现写锁饥饿检测**。所有 `sync.RWMutex` 使用标准库实现，不支持公平性保证。
+
+### 32.2 理论上的写锁饥饿场景
+
+AdGuardHome 的 `sync.RWMutex` 使用场景中，**`serverLock`** 最可能发生写锁饥饿：
+
+```
+读锁持有者：DNS 请求处理（每个请求持有 RLock）
+写锁等待者：handleSetConfig / Reconfigure（需要 Lock）
+
+如果 DNS 请求持续不断且并发量大：
+  ┌──────────────────────────────────────────┐
+  │ RLock(请求1) → RLock(请求2) → RLock(请求3) │
+  │         ↓ 写者排队等待                       │
+  │ RLock(请求4) → RLock(请求5) → ...          │
+  │         ↓ 写者持续饥饿                       │
+  └──────────────────────────────────────────┘
+```
+
+Go 标准库 `sync.RWMutex` 的实现：**当写者排队等待后，新的读者会被阻塞**，因此实际上不会无限饥饿。但读者排空可能需要较长时间。
+
+### 32.3 AdGuardHome 中的具体写锁场景
+
+| 锁 | 写锁持有者 | 写锁持有时间 | 饥饿风险 |
+|---|----------|------------|---------|
+| `serverLock` | `Reconfigure()` | ~100ms+（stop+sleep+start） | ⚠️ 中等 |
+| `serverLock` | `setConfig()` | <1ms（逐字段修改） | ✅ 低 |
+| `confMu` | `SetBlockedServices()` | <1ms | ✅ 低 |
+| `config.RWMutex` | `writeConfig()` | ~10ms（序列化+写盘） | ✅ 低 |
+| `Storage.mu` | `Add/Update/Remove` | <1ms | ✅ 低 |
+
+### 32.4 `serverLock` 的实际保护策略
+
+DNS 请求路径的读锁持有时间极短（仅检查 `s.dnsProxy` 是否为 nil）：
+
+```go
+// [internal/dnsforward/stats.go:50-51]
+s.serverLock.RLock()
+defer s.serverLock.RUnlock()
+// 仅读取指针，不阻塞 I/O
+```
+
+写锁持有时间最长的是 `Reconfigure()`（~100ms+），但这是低频操作（仅配置变更时触发），不会造成持续饥饿。
+
+### 32.5 为什么不需要专门的饥饿检测
+
+1. **写操作频率极低**：配置变更通常 < 1 次/小时
+2. **Go RWMutex 自带写者优先**：写者排队后新读者被阻塞，不会无限延迟
+3. **家用 QPS 低**：即使 100 QPS，每次 RLock 持有 < 1 µs，排空时间 < 10 ms
+4. **Reconfigure 的 100ms Sleep 在写锁内**：这是有意为之，确保端口释放
+
+### 32.6 如果需要检测
+
+监控 `POST /control/dns_config` 的响应时间，如果 > 5 秒，可能存在锁竞争问题。或使用 Go `pprof` 的 mutex profile：
+
+```bash
+curl http://localhost:6060/debug/pprof/mutex > mutex.prof
+go tool pprof mutex.prof
+```
+
+---
+
+## 33. ECH SNI 监测采样率
+
+### 33.1 结论：AdGuardHome 无任何采样率机制
+
+搜索 `sample.*rate`、`sampling`、`sampleRate`、`ech.*monitor`、`monitor.*ech` 等关键词，**AdGuardHome 不实现 ECH SNI 监测，因此不存在采样率配置**。
+
+### 33.2 全链路无 ECH 感知
+
+```
+DoT/DoQ 请求到达
+  ↓
+clientServerName() 获取 SNI
+  ↓  ← ECH 后 Outer SNI 不含 ClientID，但代码不知道原因
+clientIDFromClientServerName() 尝试提取
+  ↓  ← 提取失败，返回空串，无日志
+ApplyClientFiltering("", remoteIP, setts)
+  ↓  ← 自动回退 IP/MAC 匹配
+完成，无任何记录表明 ECH 导致了回退
+```
+
+**关键问题**：无法区分以下情况：
+1. ECH 导致 SNI 不含 ClientID（真正需要关注）
+2. 客户端本身没配置 ClientID 子域名（正常）
+3. DoT/DoQ 客户端没有配 PersistentClient（正常）
+
+### 33.3 自行实现采样监测
+
+通过 Query Log + 外部分析间接监测：
+
+```bash
+# 方案 1：统计 DoT/DoQ 中 ClientID 为空的比例变化趋势
+# 如果某天比例突然上升，可能是 ECH 部署率增加
+jq -s 'group_by(.CP) | map({
+  proto: .[0].CP,
+  total: length,
+  no_cid: ([.[] | select(.CID == "")] | length),
+  ratio: ([.[] | select(.CID == "")] | length) / length
+})' querylog.json
+
+# 方案 2：按客户端 IP 聚合，识别"之前有 CID，后来没有"的客户端
+# 这些是 ECH 启用的候选
+```
+
+### 33.4 为什么没有采样率
+
+1. **无 metrics 基础设施**：没有 Prometheus，没有 counter，没有 histogram
+2. **ECH 渗透率极低**：截至 2025 年 < 5%，不值得投入
+3. **隐私考虑**：SNI 采样可能暴露用户浏览行为
+4. **维护成本**：采样率配置需要额外的 YAML 字段和 API，增加复杂度
+
+---
+
+## 34. 移动设备频繁切网下的 TTL 适配
+
+### 34.1 移动设备切网场景
+
+移动设备在以下场景会频繁切换网络：
+- Wi-Fi ↔ 4G/5G 切换
+- Wi-Fi 漫游（AP 间切换）
+- VPN 连接/断开
+- 飞行模式开关
+- NAT 重绑定
+
+每次切网的影响链：
+
+```
+设备获得新 IP
+  ↓
+新 IP 不在 dnsProxy.Cache 中（缓存以 IP + 域名做 key）
+  ↓
+旧 IP 的缓存条目仍在，但不被新 IP 命中
+  ↓
+DNS 查询需要重新解析（缓存未命中）
+  ↓
+DNS 响应缓存到新 IP 下
+```
+
+### 34.2 AdGuardHome 的 DNS 缓存与客户端 IP 的关系
+
+**关键发现**：AdGuardHome 的 `dnsProxy.Cache` **不以客户端 IP 为 key**，而是以 `(域名, 类型)` 为 key。因此移动设备切网**不会导致 DNS 缓存失效**：
+
+```
+dnsProxy.Cache key = (QName, QType)
+                     ↓
+          与客户端 IP 无关！
+```
+
+切网后 DNS 缓存行为：
+| 场景 | 缓存命中？ | 说明 |
+|-----|----------|------|
+| 设备 A（IP1→IP2）查询 example.com | ✅ 命中 | 缓存 key 不含 IP |
+| 设备 A 切网后首次查询新域名 | ❌ 未命中 | 缓存中无此域名 |
+| 设备 A 切网后重新查询已知域名 | ✅ 命中 | 缓存未过期则命中 |
+
+### 34.3 真正受影响的是客户端识别缓存
+
+移动设备切网后 IP 变化，影响的是**客户端识别**而非 DNS 缓存：
+
+```
+旧 IP = 192.168.1.50 → PersistentClient "my-phone"（配了家长控制）
+新 IP = 192.168.1.80 → 无 PersistentClient 匹配 → 回退全局设置
+```
+
+**影响**：
+1. 家长控制/自定义过滤规则对新 IP 不生效（直到管理员更新 PersistentClient 的 IP）
+2. RuntimeClient 需要重新从 ARP/DHCP 来源填充新 IP 的信息
+3. 统计数据中同一设备被记为两个不同客户端
+
+### 34.4 TTL 配置对切网场景的影响
+
+| TTL 配置 | 默认值 | 切网影响 |
+|---------|--------|---------|
+| `dns.cache_ttl_min` (`CacheMinTTL`) | 0（不覆盖） | 设大 → 缓存命中率高，但上游 DNS 变更传播慢 |
+| `dns.cache_ttl_max` (`CacheMaxTTL`) | 0（不覆盖） | 设大 → 缓存有效期长，减少上游查询 |
+| `dns.blocked_response_ttl` | 10 秒 | 设大 → 阻塞响应缓存久，减少误放行窗口 |
+| `dns.cache_optimistic` (`CacheOptimistic`) | false | 开启 → 过期缓存仍返回，断网时有用 |
+| DHCP Lease Duration | 86400 秒（1 天） | 设小 → 租约更频繁更新，切网后 IP→MAC 映射更快反映 |
+
+### 34.5 推荐的移动设备适配策略
+
+1. **给移动设备配 MAC 地址而非 IP**：PersistentClient 按 MAC 识别不受切网影响
+2. **开启 DHCP**：DHCP 服务器能实时反映 IP→MAC 映射
+3. **适当缩短 DHCP 租约**：从默认 24 小时缩短到 2-4 小时，加速 IP→MAC 映射更新
+4. **开启 CacheOptimistic**：切网可能短暂断网，过期缓存仍可服务
+5. **使用 DoH + ClientID**：移动设备通过 URL Path 传递 ClientID，完全不依赖 IP
+
+---
+
+## 35. 关键配置参数
 
 | 参数 | 类型 | 说明 | 代码位置 |
 |-----|------|------|---------|
@@ -2139,8 +2617,12 @@ AdGuardHome 中有这些 TTL 配置，但都不是 `clients_persistent_ttl`：
 | `ARPClientsUpdatePeriod` | time.Duration | ARP 表刷新周期（控制 RuntimeClient 清理频率） | [storage.go:119](internal/client/storage.go#L119) |
 | `SafeSearchCacheTTL` | time.Duration | 安全搜索缓存 TTL | [clientshttp.go:225](internal/home/clientshttp.go#L225) |
 | `SafeSearchCacheSize` | int | 安全搜索缓存大小 | [clientshttp.go:224](internal/home/clientshttp.go#L224) |
+| `CacheMinTTL` | uint32 | DNS 缓存最小 TTL（秒），0=不覆盖 | [http.go:92](internal/dnsforward/http.go#L92) |
+| `CacheMaxTTL` | uint32 | DNS 缓存最大 TTL（秒），0=不覆盖 | [http.go:95](internal/dnsforward/http.go#L95) |
+| `CacheOptimistic` | bool | 过期缓存仍返回+异步刷新（断网退路） | [http.go:101](internal/dnsforward/http.go#L101) |
+| `DHCPLeaseDuration` | uint32 | DHCP 租约时长（秒），默认 86400 | [config.go:596](internal/home/config.go#L596) |
 
-## 28. 调试与排错要点
+## 36. 调试与排错要点
 
 1. **客户端识别问题**：
    - 检查 `Source` 优先级，确认客户端信息来源是否正确
@@ -2204,3 +2686,17 @@ AdGuardHome 中有这些 TTL 配置，但都不是 `clients_persistent_ttl`：
    - **ECH fallback 占比监测**：代码中无 metrics，需通过日志侧分析（grep '"CP":"dot"\|"CP":"doq"' + jq 统计 CID 为空的比例）
    - **配置更新失败告警**：监听 `/control/dns_config` API 返回 500 错误，或监控 `AdGuardHome.yaml` 的修改时间与内存状态一致性
    - **时间戳异常检测**：监控 Query Log 中时间戳回拨、超前等异常情况
+   - **Prometheus 告警抑制**：AdGuardHome 不内置 Prometheus，需用第三方 exporter + AlertManager 自行实现
+   - **ECH SNI 采样率**：无采样率机制，无法区分"ECH 导致的 CID 丢失"和"客户端未配置 CID"
+   - **写锁饥饿检测**：用 Go pprof mutex profile（`curl localhost:6060/debug/pprof/mutex`）排查锁竞争
+
+8. **时钟与时间相关问题**：
+   - **时钟回拨兜底**：代码中无回拨检测，DNS 缓存使用单调时钟不受影响，WHOIS 缓存和 Stats 使用墙钟会受影响
+   - **NTP 断网退路**：DNS 核心功能不依赖 NTP，开启 `cache_optimistic` 可在断网时返回过期缓存；嵌入式设备需 RTC 模块防时钟归零
+   - **LastSeen 精度**：Query Log 精度 RFC3339Nano（纳秒），但无独立 LastSeen 字段，客户端无"上次在线"元数据
+
+9. **移动设备与网络切换问题**：
+   - **DNS 缓存不受切网影响**：`dnsProxy.Cache` 以 `(域名, 类型)` 为 key，不含客户端 IP，切网后缓存仍可命中
+   - **客户端识别受切网影响**：IP 变化导致 PersistentClient 匹配失败，建议给移动设备配 MAC 而非 IP
+   - **DHCP 租约与切网**：默认 86400 秒，缩短到 2-4 小时可加速 IP→MAC 映射更新
+   - **DoH + ClientID 最优**：移动设备通过 URL Path 传 ClientID，完全不受切网和 ECH 影响
