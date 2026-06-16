@@ -348,6 +348,32 @@ bufferLock sync.RWMutex
 
 由于所有操作都使用写锁，内存检索与日志写入、缓冲区落盘三者之间是完全互斥的，不存在并发读写导致的数据竞争问题。
 
+#### 3.2.2 bufferLock 读多写少优化：为什么是 RWMutex 却都用 Lock()
+
+从代码声明看，`bufferLock` 是 `sync.RWMutex`（读写锁），理论上支持读-读共享。但实际所有调用方（Add / searchMemory / flushLogBuffer）都使用写锁 `Lock()` 而非读锁 `RLock()`。这一看似"浪费"的设计有其架构考量：
+
+**为什么不用 RLock() 做读优化**：
+
+1. **RingBuffer 遍历与 Push 竞态**：`RingBuffer` 是循环队列，`Push()` 会移动头指针并可能覆盖旧元素。如果读用 `RLock()`，多个读 goroutine 可以并发读取，但此时如果有 `Push()` 操作，就需要写锁，会被读锁阻塞。反过来，如果正在读遍历中，Push 无法写入，效果上与写锁差异不大
+
+2. **读取频率与写入频率对比**：DNS 查询日志是 **写多读少** 场景——每秒可能有上百次 DNS 请求写入，但用户查询日志面板的频率低得多。读写锁的优势场景是"读多写少"，对于"写多读少"反而可能因锁升级等开销更慢
+
+3. **简化正确性证明**：全部用写锁，锁的语义简单清晰，不容易出现"读遍历 + 并发写入导致切片越界"之类的隐蔽 bug
+
+**真正的读多写少锁：confMu**
+
+实际上，系统中存在另一把真正的"读多写少"锁——`confMu`：
+```go
+// confMu protects configuration fields.
+confMu sync.RWMutex
+```
+
+`confMu` 保护配置字段（Enabled、FileEnabled、MemSize、RotationIvl 等），这些字段读取频率极高（每次 Add、每次 search 都要读），修改频率极低（用户改配置时才写），因此：
+- **读路径**：`Add()`、`ShouldLog()`、`searchMemory()`、`checkAndRotate()` 都用 `confMu.RLock()`
+- **写路径**：配置更新时才用 `confMu.Lock()`
+
+这是读多写少场景的正确优化方式。`bufferLock` 虽然也是 RWMutex 类型，但其用途更偏向"互斥锁语义"，属于预留了扩展空间但当前未启用读优化的设计。
+
 ### 3.3 搜索条件匹配
 
 文件：`internal/querylog/searchparams.go:66-80`、`internal/querylog/searchcriterion.go`
@@ -474,6 +500,69 @@ func (q *qLogFile) validateQLogLineIdx(lineIdx, lastProbeLineIdx, ts, fSize int6
 
 这种设计保证了即使日志文件存在损坏或异常，搜索过程也不会崩溃，最多是退化为顺序扫描，性能下降但功能可用。
 
+#### 4.3.2 maxSearchDepth 为何是常量 100：固定上限而非自适应
+
+`maxSearchDepth = 100` 是一个**硬编码常量**，而非根据文件大小动态计算的自适应值。设计考量如下：
+
+**理论推导**：二分查找的时间复杂度是 O(log n)。对于 1GB 的日志文件，假设每行平均 500 字节，约 200 万行记录，log₂(2,000,000) ≈ 21 次迭代即可完成。100 的上限是理论值的 5 倍左右，留有极大冗余。
+
+**为什么不自适应**：
+
+1. **常量足够大**：100 次迭代对于任何实际大小的日志文件都绰绰有余。即使文件损坏导致搜索范围收敛很慢，100 次也足以判断异常
+2. **实现简单**：不需要根据 fileSize 计算理论深度，直接一个常量了事
+3. **安全冗余**：对于"近乎有序但局部乱序"的损坏文件，二分查找可能失效导致深度增加，100 的上限能及时终止
+
+**与损坏文件兜底的配合**：
+- 正常文件：深度 ≈ log₂(行数)，通常 20~30 次
+- 轻微损坏：深度 50~80 次，最终能找到目标但路径曲折
+- 严重损坏：深度达到 100 → 触发 `errTSNotFound` → 上层回退到顺序扫描
+
+即 maxSearchDepth 既是**性能上限**也是**损坏检测阈值**。
+
+#### 4.3.3 时间戳解析 0 的告警与错误传播
+
+当 `readQLogTimestamp()` 解析失败时返回 0，在不同调用上下文中有不同的处理策略：
+
+**1. seekTS 路径：直接报错终止**（文件：`internal/querylog/qlogfile.go:196-204`）
+```go
+ts := readQLogTimestamp(ctx, l, line)
+if ts == 0 {
+    return false, fmt.Errorf(
+        "looking up timestamp %d in %q: record %q has empty timestamp",
+        timestamp, q.file.Name(), line,
+    )
+}
+```
+- 二分查找过程中遇到损坏行 → 立即返回错误
+- 错误逐层上传至 `seekTS` → `qLogReader.seekTS` → `setQLogReader`
+- 最终上层 `searchFiles` 收到 nil reader，回退为只查内存
+
+**2. 顺序扫描路径：记录错误但继续**（文件：`internal/querylog/search.go:340-344`）
+```go
+if !params.quickMatch(ctx, l.logger, line, clientFinder.findClient) {
+    ts = readQLogTimestamp(ctx, l.logger, line)  // 可能返回 0
+    return nil, ts, nil  // 不报错，跳过这一行
+}
+```
+- quickMatch 不通过时，需要读取时间戳来更新 `oldestNano` 游标
+- 即使解析失败（返回 0），也只是跳过这一行继续下一行
+- 不会因为个别坏行导致整个查询失败
+
+**3. 告警日志**（文件：`internal/querylog/qlogfile.go:478-488`）
+```go
+if len(val) == 0 {
+    logger.ErrorContext(ctx, "couldn't find timestamp", "line", str)
+    return 0
+}
+tm, err := time.Parse(time.RFC3339Nano, val)
+if err != nil {
+    logger.ErrorContext(ctx, "couldn't parse timestamp", "value", val, slogutil.KeyError, err)
+    return 0
+}
+```
+- 两种失败场景都输出 `Error` 级别日志，便于运维排查
+- 但不 panic、不中断服务，体现了"日志系统不应影响核心 DNS 服务"的设计原则
+
 ### 4.4 磁盘检索完整流程
 
 文件：`internal/querylog/search.go:261-288`
@@ -559,6 +648,66 @@ params.match() — 精确字段匹配
     ↓
 结果集
 ```
+
+#### 4.4.2 quickMatch 二次校验的性能权衡
+
+quickMatch + 精确匹配的"两阶段过滤"设计，本质是**用快速预筛换 CPU 时间**的经典优化。其性能收益取决于过滤命中率：
+
+**性能模型分析**：
+
+假设：
+- quickMatch 耗时：T_q（约一次字符串 Index + 几次比较）
+- 完整解码 + 精确匹配耗时：T_d（约 10~50 倍 T_q）
+- 预筛通过率：P（0 < P < 1）
+
+则平均每条记录的过滤耗时 = T_q + P × T_d
+
+| 场景 | P（通过率） | 平均耗时 | 加速比 |
+|------|------------|----------|--------|
+| 搜索罕见域名 | 0.1% | ≈ T_q + 0.001×T_d | ~100x |
+| 搜索常见关键词 | 10% | ≈ T_q + 0.1×T_d | ~10x |
+| 全量查询（无过滤） | 100% | ≈ T_q + T_d | ~0.9x（略慢） |
+
+**结论**：
+- 当搜索条件较严格（命中率低）时，quickMatch 带来巨大性能提升
+- 当全量查询（无 search 参数）时，quickMatch 反而有轻微 overhead，但这是可接受的
+
+**ctFilteringStatus 为何完全跳过预筛**：
+
+`ctFilteringStatus` 类型的搜索条件，quickMatch 直接返回 `true`。原因是：
+- 过滤状态需要解析 `IsFiltered` 和 `Reason` 两个字段，并进行逻辑组合判断
+- 简单的字符串提取容易出错（Reason 字段是数字，但还需要结合 IsFiltered 布尔值）
+- 该过滤条件在实际使用中命中率中等，预筛的收益不确定，不如直接解码保证正确性
+
+### 4.5 qLogReader 大文件超时保护
+
+qLogReader 本身**没有显式的超时机制**，但通过多层设计间接防止了大文件扫描导致的服务不可用：
+
+**1. maxFileScanEntries 软限制**（文件：`internal/querylog/searchparams.go:25-27`）
+```go
+// maxFileScanEntries is a maximum of log entries to scan in query log
+// files at once.
+maxFileScanEntries int
+```
+默认 50000 条的扫描上限，即使文件再大，单次请求也只扫 5 万条就返回，避免单次请求占用过长时间。
+
+**2. Context 透传**
+
+整个读取链路上下文是透传的：
+```
+search(ctx) → searchFiles(ctx) → setQLogReader(ctx) → seekTS(ctx) → readNextEntry(ctx)
+```
+如果上层 HTTP handler 设置了请求超时，会通过 `context.Done()` 传播。但实际实现中，`ReadNext()` 等读取操作是纯 CPU + 磁盘 IO 的同步操作，不会主动检查 context，超时只能在两次读取之间生效。
+
+**3. 分批查询 + 游标分页**
+
+前端通过 `older_than` 游标分页，每次只请求一页数据。大文件被拆分为多次小请求处理，单次请求的资源占用可控。
+
+**4. 并发安全锁**
+
+`qLogFile` 内部有 `sync.Mutex`，但 `qLogReader` 作为单次查询的临时对象，通常不会被并发访问。锁的主要作用是防止同一 reader 被并发调用导致的内部状态混乱。
+
+> 总结：qLogReader 的"超时保护"不是通过 deadline 实现的硬性中断，而是通过 **扫描上限 + 分批查询** 的设计，从架构上避免单次请求处理过大文件。
 
 ---
 
@@ -738,26 +887,101 @@ quickMatch() 快速预筛 + decode + 精确匹配
 - **值越大**：越少的请求次数，越高的单次延迟，越高的瞬时资源占用
 - **值越小**：越多的请求次数，越低的单次延迟，更平滑的资源消耗
 
-#### 5.8.4 前端短轮询补页机制
+#### 5.8.2 50000 上限与分页参数的联动设计
 
-文件：`client/src/actions/queryLogs.ts:38-68`
+`maxFileScanEntries` 与 `limit` / `offset` / `older_than` 三个分页参数之间存在复杂的联动关系：
 
-前端 `shortPollQueryLogs` 实现了自动补页逻辑：
+**1. 游标分页模式（older_than + limit）**
+- `maxFileScanEntries = 50000`（默认）
+- 设计意图：扫描最多 5 万条，尽量凑够 limit 条返回
+- 如果 5 万条内凑够了 limit 条 → 正常返回，oldest 作为下一页游标
+- 如果扫了 5 万条还没凑够 limit → 提前返回，前端可继续翻页
 
+**2. 偏移分页模式（offset + limit）**
+- `maxFileScanEntries = 0`（自动取消上限）
+- 原因：offset 需要精确跳过 N 条，必须从最新记录一直数到 offset 位置
+- 如果有扫描上限，可能数到一半就停了，导致 offset 不准
+- 代价：offset 越大，扫描量越大，延迟越高（全表扫描）
+
+**3. 三种典型场景的扫描量**：
+
+| 场景 | 参数 | 实际扫描量 | 原因 |
+|------|------|-----------|------|
+| 全量翻页第一页 | limit=500, 无过滤 | ~500 条 | 无过滤条件，每条都匹配，扫 500 条就够了 |
+| 严格过滤 + 翻页 | search="罕见域名" + limit=500 | 最高 50000 条 | 匹配率低，需要扫很多条才能凑够 500 条 |
+| offset 深分页 | offset=10000 + limit=500 | 至少 10500 条 | offset 模式无上限，必须数到第 10000 条 |
+
+这种设计体现了**常用路径优化**的思路：游标分页是用户正常浏览的路径，有上限保护；offset 深分页是 API 调用者的路径，虽然慢但结果准确。
+
+#### 5.8.3 shortPollQueryLogs 的放大攻击面与防护
+
+前端 `shortPollQueryLogs` 的自动补页机制存在潜在的放大攻击风险，但有多层防护：
+
+**风险分析**：
+如果过滤条件非常严格（如搜索一个不存在的域名），每次请求可能扫描 50000 条却只返回 0 条匹配。shortPoll 检测到"数据不足一页且还有 oldest"，会递归发起下一次请求……理论上可能在一次用户操作中触发大量后端扫描。
+
+**实际防护机制**：
+
+**1. 服务端：maxFileScanEntries 限制**
+每次请求最多扫 5 万条，即使递归 10 次也只有 50 万条，CPU 占用可控。
+
+**2. 前端：isQueryTheSame 校验**
 ```typescript
-export const shortPollQueryLogs = (params: LogsParams = {}) => async (dispatch, getState) => {
-    await dispatch(getQueryLog(params));
-    
-    const { queryLogs: { data, oldest, ...rest } } = getState();
-    
-    // 如果返回数据不足一页，且还有更旧的数据，自动递归请求
-    if (data.length < QUERY_LOGS_PAGE_LIMIT && oldest) {
-        await dispatch(shortPollQueryLogs({ ...params, older_than: oldest }));
-    }
-};
+const isQueryTheSame = 
+    typeof previousQuery === 'string' && 
+    typeof currentQuery === 'string' && 
+    previousQuery === currentQuery;
+
+const isShortPollingNeeded =
+    (logs.length < QUERY_LOGS_PAGE_LIMIT || totalData.logs.length < QUERY_LOGS_PAGE_LIMIT) &&
+    oldest !== '' &&
+    isQueryTheSame;
+```
+只有搜索词相同才会自动补页。如果搜索词在短时间内多次变化，不会触发补页。
+
+**3. 前端：oldest 空值终止**
+当服务端返回的 `oldest` 为空字符串时，短轮询立即终止，不会无限递归。
+
+**4. 自然终止条件**
+- 日志文件只有 2 个，最多翻 2 个文件就到底了
+- 即使每次 5 万条都匹配 0 个，最多也只递归 2 次（当前文件 + 归档文件）
+
+**攻击面评估**：
+实际很难被放大攻击。最坏情况下一次过滤操作触发 2~3 次后端请求，每次扫 5 万条，总共 10~15 万条扫描量，对于服务器来说完全可接受。
+
+### 5.9 MemSize 热点时段动态调整策略
+
+**当前实现：静态配置**
+
+AdGuardHome 当前的 `MemSize` 是**静态配置**，启动时或修改配置时设置一次，运行中不会动态变化。但从架构设计来看，它具备动态调整的基础能力：
+
+**配置热更新路径**：
+```
+用户修改配置 → PUT /control/querylog/config/update
+    → queryLog.writeDiskConfig() 更新配置文件
+    → 内部通过 confMu.RLock() / Lock() 切换配置
+    → 下次 Add() 时读取新的 MemSize
 ```
 
-这种设计保证了用户始终能看到"一整页"数据，即使某一批次匹配率很低（如严格过滤条件下），也会自动向后拉取直到凑够一页或遍历完全部日志。
+**为什么不做"热点时段动态调整"**：
+
+1. **RingBuffer 的 OOM 保护已经足够**：即使流量高峰，RingBuffer 满了就覆盖最旧的，不会内存爆炸
+2. **落盘是异步的**：flush goroutine 后台写盘，不阻塞 DNS 请求处理
+3. **读写频率不对等**：写远多于读，内存缓冲区主要作用是"批量写盘"而非"缓存查询"
+4. **配置变更简单**：用户可以随时通过 API 调整 MemSize 并立即生效，不需要自动化
+
+**隐含的"动态调整"：FileEnabled 开关**
+
+虽然 MemSize 本身不动态变化，但有一个相关的"降级策略"：
+- 如果 `FileEnabled = false`，日志只保留在内存中，`MemSize` 就是全部可查询数据量
+- 如果 `FileEnabled = true`，内存缓冲区只是"写盘前的暂存"，热数据主要靠磁盘文件 + seekTS 二分查找
+
+这种"内存缓冲区 + 磁盘文件"的分层架构，本身就是对不同访问频率数据的自然分级——最新的在内存（最快），稍旧的在当前文件（二分查找定位），最旧的在归档文件（顺序扫描）。
+
+**如果要实现热点时段动态调整，可以基于以下扩展点**：
+- 在 `periodicRotate` 检查时根据最近 1 小时的请求量动态调整 MemSize
+- 需要创建新的 RingBuffer 并原子替换（现有 `bufferLock` 可以保护）
+- 但考虑到 RingBuffer 的 OOM 保护和异步落盘已经足够稳健，实际收益不大
 
 ---
 
