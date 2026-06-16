@@ -1212,7 +1212,524 @@ func (s *Storage) periodicARPUpdate(ctx context.Context) {
 
 ---
 
-## 13. 关键配置参数
+## 13. MAC 与 IP 同时匹配但 Name 不同的歧义解决
+
+### 13.1 冲突场景
+
+当一个 DNS 请求同时满足以下条件时，存在歧义：
+1. 请求来源 IP 匹配 PersistentClient-A 的 IP
+2. DHCP 服务器查到该 IP 对应的 MAC 地址，MAC 又匹配 PersistentClient-B 的 MAC
+3. Client-A 与 Client-B 是两个不同的持久化客户端，Name 不同
+
+### 13.2 PersistentClient 侧的根本防止：标识符全局唯一约束
+
+AdGuardHome **在存储层就杜绝了这种歧义**，通过 `clashes()` 系列检查在 `Add()` 和 `Update()` 时阻止标识符被多个客户端共享：
+
+```go
+// [internal/client/index.go:105-137]
+func (ci *index) clashes(c *Persistent) (err error) {
+    if p := ci.clashesName(c); p != nil {
+        return fmt.Errorf("another client uses the same name %q", p.Name)
+    }
+    for _, id := range c.ClientIDs {
+        existing, ok := ci.clientIDToUID[id]
+        if ok && existing != c.UID {
+            return fmt.Errorf("another client %q uses the same ClientID %q", p.Name, id)
+        }
+    }
+    p, ip := ci.clashesIP(c)
+    if p != nil {
+        return fmt.Errorf("another client %q uses the same IP %q", p.Name, ip)
+    }
+    p, s := ci.clashesSubnet(c)
+    if p != nil {
+        return fmt.Errorf("another client %q uses the same subnet %q", p.Name, s)
+    }
+    p, mac := ci.clashesMAC(c)
+    if p != nil {
+        return fmt.Errorf("another client %q uses the same MAC %q", p.Name, mac)
+    }
+    return nil
+}
+```
+
+完整校验链路：
+```
+Storage.Add()
+  └─ p.validate()          // 字段合法性
+  └─ s.index.clashesUID()  // UID 不能重复
+  └─ s.index.clashes()     // Name / ClientID / IP / Subnet / MAC 任一重复 → 拒绝
+      ├─ clashesName()
+      ├─ clashesIP()
+      ├─ clashesSubnet()
+      └─ clashesMAC()
+
+Storage.Update(name, p)
+  └─ p.validate()
+  └─ p.UID = stored.UID    // 复用旧 UID
+  └─ s.index.clashes(p)    // 与其他所有客户端比对（自身 UID 豁免）
+  └─ index.remove(stored)
+  └─ index.add(p)
+```
+
+### 13.3 查找顺序中的隐性歧义：DHCP MAC 反查
+
+虽然标识符冲突被 `clashes()` 杜绝，但 `ApplyClientFiltering` 和 `findByIP` 中仍存在「先 IP 匹配，再查 DHCP 找 MAC」的两步查找逻辑：
+
+```go
+// [internal/client/storage.go:564-576]
+func (s *Storage) findByIP(addr netip.Addr) (p *Persistent, ok bool) {
+    p, ok = s.index.findByIP(addr)  // 第 1 步：直接 IP 匹配
+    if ok {
+        return p, true
+    }
+    foundMAC := s.dhcp.MACByIP(addr) // 第 2 步：DHCP 服务器反查 MAC
+    if foundMAC != nil {
+        return s.index.findByMAC(foundMAC) // 用 MAC 再查一次
+    }
+    return nil, false
+}
+```
+
+**歧义场景**：
+- PersistentClient-A 配置了 IP `192.168.1.50`
+- PersistentClient-B 配置了 MAC `aa:bb:cc:dd:ee:ff`
+- DHCP 租约恰好在运行时将 `192.168.1.50` 分配给了 `aa:bb:cc:dd:ee:ff`
+
+**解决策略：先匹配到的优先，不会继续回退**
+- 因为 `findByIP` 第 1 步 `index.findByIP(addr)` 命中 Client-A 即返回，**不会再执行 DHCP MAC 反查**
+- 因此 IP 匹配的优先级 > DHCP 动态 MAC 反查匹配
+- 只有当 IP 未在任何 PersistentClient 中出现时，才会走 DHCP→MAC 路径
+
+### 13.4 RuntimeClient 侧的歧义：多来源 Name 覆盖
+
+RuntimeClient 从多个来源获取 Name 信息，按 `Source` 优先级由高到低覆盖：
+
+```
+SourceHostsFile(5) > SourceDHCP(4) > SourceRDNS(3) > SourceARP(2) > SourceWHOIS(1)
+```
+
+`Runtime.Info()` 按优先级返回第一个非空的 Name：
+```go
+// [internal/client/client.go]
+func (r *Runtime) Info() (cs Source, host string) {
+    switch {
+    case r.hostsFile != nil:   // hosts 文件最高优先级
+        cs, info = SourceHostsFile, r.hostsFile
+    case r.dhcp != nil:        // 然后是 DHCP
+        cs, info = SourceDHCP, r.dhcp
+    case r.rdns != nil:        // 反向 DNS
+        cs, info = SourceRDNS, r.rdns
+    case r.arp != nil:         // ARP
+        cs, info = SourceARP, r.arp
+    case r.whois != nil:       // WHOIS（仅 ASN/组织，不含 hostname）
+        cs = SourceWHOIS
+    }
+}
+```
+
+---
+
+## 14. MergeTags 与 Tags 数量上限
+
+### 14.1 allowedTags 白名单（25 个内置 Tag）
+
+```go
+// [internal/client/storage.go:25-50]
+var allowedTags = []string{
+    "device_audio", "device_camera", "device_gameconsole",
+    "device_laptop", "device_nas", "device_other",
+    "device_pc", "device_phone", "device_printer",
+    "device_securityalarm", "device_tablet", "device_tv",
+    "os_android", "os_ios", "os_linux",
+    "os_macos", "os_other", "os_windows",
+    "user_admin", "user_child", "user_regular",
+}
+```
+
+校验发生在 `Persistent.validate()` 中：
+```go
+// [internal/client/persistent.go:158-166]
+for _, t := range c.Tags {
+    _, ok := slices.BinarySearch(allTags, t)  // 二分查找
+    if !ok {
+        return fmt.Errorf("invalid tag: %q", t)
+    }
+}
+slices.Sort(c.Tags)  // 校验后排序存储
+```
+
+### 14.2 Tags 数量上限：无硬编码上限，但白名单长度 = 25
+
+当前代码中**没有**类似 `maxTagsPerClient` 的常量限制单个 PersistentClient 的 Tags 数量。但由于 Tag 必须属于 `allowedTags`（长度 25），实际上限就是 25 个。
+
+API 层面也通过 `AllowedTags()` 暴露白名单，前端在选择 Tag 时只会给出这 25 个选项：
+```go
+// [internal/client/storage.go:722-726]
+func (s *Storage) AllowedTags() (tags []string) {
+    return s.allowedTags
+}
+```
+
+### 14.3 Tag 传递链中的切片克隆
+
+每次请求会克隆 Tags 切片写入 `filtering.Settings`，避免并发读写：
+```go
+// [internal/client/storage.go:795-796]
+setts.ClientTags = slices.Clone(c.Tags)
+```
+
+---
+
+## 15. atomicConfig 事务边界
+
+### 15.1 `*homeconfig` 内嵌 `sync.RWMutex`
+
+```go
+// [internal/home/config.go:167]
+type config struct {
+    // ... 所有 YAML 字段 ...
+    sync.RWMutex `yaml:"-"`  // 读写锁，不序列化
+    SchemaVersion uint
+}
+```
+
+全局 `config` 变量本身带有 `sync.RWMutex`，作为"原子配置"的事务边界。
+
+### 15.2 写事务：`config.Lock()/Unlock()`
+
+写配置到磁盘（`writeConfig()`）或通过 API 修改配置时，持有写锁：
+```go
+// 典型写事务：
+config.Lock()
+defer config.Unlock()
+// 读取 + 修改 config 字段
+// 写 YAML 到磁盘
+```
+
+### 15.3 读事务：`config.RLock()/RUnlock()`
+
+所有需要一致视图的读取路径使用读锁：
+```go
+config.RLock()
+defer config.RUnlock()
+// 读取多个字段，保证原子一致视图
+```
+
+### 15.4 读写锁的分层：`config` 锁 vs `clients.lock` vs `dnsforward.serverLock`
+
+AdGuardHome 使用**多层锁**保护不同粒度的配置，事务边界嵌套时要注意顺序：
+
+| 锁 | 保护对象 | 粒度 |
+|---|---------|------|
+| `config.RWMutex` | 全局 `AdGuardHome.yaml` 配置对象 | 最粗粒度 |
+| `clientsContainer.lock (sync.Mutex)` | `clients` HTTP API、客户端增删改 | 中粒度 |
+| `client.Storage.mu (sync.Mutex)` | PersistentClient index、RuntimeClient index | 中粒度（客户端存储内部） |
+| `dnsforward.Server.serverLock (sync.RWMutex)` | dnsProxy 指针、配置热加载 | 最细粒度（DNS 请求路径） |
+
+**加锁顺序（避免死锁）**：
+```
+config.RWMutex → clients.lock → Storage.mu → dnsforward.serverLock
+```
+外层锁在持有期间可以获取内层锁，反之不可。
+
+### 15.5 `handleSetProtection` 的事务边界示例
+
+```go
+// [internal/dnsforward/http.go:810-818]
+func() {
+    s.serverLock.Lock()         // 先拿 DNS 层写锁
+    defer s.serverLock.Unlock()
+    s.dnsFilter.SetProtectionStatus(...)  // 修改过滤引擎状态
+}()
+s.conf.ConfModifier.Apply(ctx)   // 再触发全局配置写盘（会拿 config.Lock）
+```
+
+注意：这里先拿 `serverLock` 再调用 `Apply` 拿 `config.Lock`，是与上面相反的方向。但 `ConfModifier.Apply` 是独立路径，不会反向持有 `serverLock`，因此不会死锁。
+
+---
+
+## 16. dnscache 级联失效路径
+
+### 16.1 三层缓存及各自的触发点
+
+| 缓存层 | 内容 | 失效方式 | 触发 API |
+|-------|------|---------|---------|
+| **全局 dnsProxy.Cache** | 所有 DNS 响应 | 全量清空（无局部失效） | `POST /control/cache_clear`、`Reconfigure()` |
+| **客户端自定义 upstream 缓存** | 特定 PersistentClient 的自定义 upstream 响应 | 全量清空或按客户端清空 | `POST /control/cache_clear`、`Storage.Add/Update()` |
+| **SafeSearch LRU** | 搜索引擎域名→安全域名映射 | 全量清空 | `SafeSearch.Update()` |
+| **SafeBrowsing/Parental HashPrefix** | URL hash prefix 查毒结果 | TTL 过期（无主动清除 API） | 仅被动过期 |
+
+### 16.2 手动级联失效：`handleCacheClear`
+
+```go
+// [internal/dnsforward/http.go:764-770]
+func (s *Server) handleCacheClear(w http.ResponseWriter, _ *http.Request) {
+    s.dnsProxy.ClearCache()                           // 第 1 层：全局 DNS 缓存
+    s.conf.ClientsContainer.ClearUpstreamCache()       // 第 2 层：所有客户端 upstream 缓存
+    _, _ = io.WriteString(w, "OK")
+}
+```
+
+`ClearUpstreamCache` 内部遍历所有 PersistentClient 逐个清理：
+```go
+// [internal/client/upstreammanager.go]
+func (m *upstreamManager) clearUpstreamCache() {
+    for _, conf := range m.uidToCustomConf {
+        conf.proxyConf.ClearCache()
+    }
+}
+```
+
+### 16.3 SafeSearch 配置变更的级联失效
+
+```go
+// [internal/filtering/safesearch/safesearch.go:349-361]
+func (ss *Default) Update(ctx context.Context, conf filtering.SafeSearchConfig) (err error) {
+    ss.mu.Lock()
+    defer ss.mu.Unlock()
+    err = ss.resetEngine(ctx, rulelist.IDSafeSearch, conf)
+    if err != nil {
+        return err
+    }
+    ss.cache.Clear()   // 引擎重建后，缓存无条件全量失效
+    return nil
+}
+```
+
+### 16.4 配置变更时的缓存失效粒度矩阵
+
+| 配置变更类型 | dnsProxy.Cache | 客户端 upstream cache | SafeSearch | SafeBrowsing/Parental |
+|------------|----------------|----------------------|-----------|----------------------|
+| 全局 upstream 变更（`Reconfigure`） | ✅ 重建清空 | ❌ 不变 | ❌ 不变 | ❌ 不变 |
+| 某 PersistentClient upstream 变更 | ❌ 不变 | ✅ 仅该客户端 `isChanged=true` 下次请求重建 | ❌ 不变 | ❌ 不变 |
+| 过滤规则列表增删 | ❌ **不主动失效**（依赖 TTL） | ❌ 不变 | ❌ 不变 | ❌ 不变 |
+| 手动 `POST /control/cache_clear` | ✅ 全清空 | ✅ 所有客户端清空 | ❌ 不变 | ❌ 不变 |
+| SafeSearch 配置变更 | ❌ 不变 | ❌ 不变 | ✅ 全清空 | ❌ 不变 |
+| SafeBrowsing 开关切换 | ❌ 不变 | ❌ 不变 | ❌ 不变 | ✅ 引擎替换（缓存 TTL 保留） |
+
+### 16.5 客户端 upstream 缓存的"懒重建"机制
+
+```go
+// [internal/client/upstreammanager.go:100-119]
+func (m *upstreamManager) updateCustomUpstreamConfig(c *Persistent) {
+    cliConf, ok := m.uidToCustomConf[c.UID]
+    if !ok {
+        cliConf = &customUpstreamConfig{...}
+        m.uidToCustomConf[c.UID] = cliConf
+    }
+    cliConf.upstreams = slices.Clone(c.Upstreams)
+    cliConf.upstreamsCacheSize = c.UpstreamsCacheSize
+    cliConf.isChanged = true   // 打脏标记，不立即重建
+}
+
+// 下一次请求 customUpstreamConfig() 时才真正重建并清空旧缓存：
+// upstreamManager.customUpstreamConfig():
+//   if cliConf.isChanged || cliConf.commonConfUpdate.Before(m.confUpdate) {
+//       old := cliConf.proxyConf
+//       cliConf.proxyConf = ... 重新解析 upstream ...
+//       old.Close()              // 关闭旧对象，缓存随之消失
+//       cliConf.isChanged = false
+//   }
+```
+
+---
+
+## 17. services.json 热更新 reload
+
+### 17.1 代码生成：`servicelist.go` 是构建产物，非运行时下载
+
+```
+// 生成命令：
+go run ./scripts/blocked-services/main.go
+// 输入：  https://raw.githubusercontent.com/AdguardTeam/HostlistsRegistry/main/assets/blocked-services.json
+// 输出：  internal/filtering/servicelist.go
+```
+
+`servicelist.go` 文件头：
+```go
+// Code generated by go run ./scripts/blocked-services/main.go; DO NOT EDIT.
+var blockedServices = []blockedService{{
+    ID:      "4chan",
+    Rules:   []string{"||4cdn.org^", "||4chan.org^", ...},
+    ...
+}, ...}
+```
+
+→ **运行时没有从网络动态加载 services.json 的逻辑**，规则列表随二进制发布。
+
+### 17.2 包级初始化：`blockedServices` → `serviceRules`
+
+```go
+// [internal/filtering/blocked.go:27-60]
+var serviceRules map[string][]*rules.NetworkRule
+
+func initBlockedServices() {
+    serviceRules = make(map[string][]*rules.NetworkRule, len(blockedServices))
+    for _, s := range blockedServices {
+        for _, ruleText := range s.Rules {
+            nr, err := rulelist.NewRuleBuilder().
+                Text(ruleText).
+                Result()
+            serviceRules[s.ID] = append(serviceRules[s.ID], nr.(*rules.NetworkRule))
+        }
+    }
+}
+```
+
+`initBlockedServices()` 在 `InitModule()` 中被调用，**进程生命周期内只执行一次**。
+
+### 17.3 运行时"热更新"的实际含义：reload 的不是 services.json，是用户选中的 ID 列表
+
+用户通过以下 API 变更"要阻塞哪些服务"：
+```
+GET  /control/blocked_services/all           // 列出所有可用服务（从 blockedServices 读）
+GET  /control/blocked_services/get           // 获取当前全局/客户端的阻塞配置
+PUT  /control/blocked_services/update        // 更新阻塞配置（调度 + 服务 ID 列表）
+```
+
+`handleBlockedServicesUpdate` 内部调用：
+```
+filter.SetBlockedServices(schedule, ids)
+  └─ 重建全局 BlockedServices 对象
+  └─ 内部不会重新编译 serviceRules（因为 serviceRules 不变）
+```
+
+→ 所谓"热更新"只更新用户的**选择**（ID 列表 + Schedule），底层规则库 `serviceRules` 是只读的。
+
+### 17.4 重新编译 serviceRules 的唯一方式：重启进程
+
+由于 `initBlockedServices()` 只在启动时执行一次，要加载新版 `services.json` 的规则必须：
+1. 重新构建二进制（执行 `go generate` 或脚本）
+2. 重启 AdGuardHome
+
+没有运行时 API 可以触发 serviceRules 重建。
+
+---
+
+## 18. SNI 加密（ECH）启用后的客户端识别退路
+
+### 18.1 ECH（Encrypted Client Hello）对 ClientID 提取的影响
+
+传统 TLS 的 SNI 扩展是明文的，AdGuardHome 从 SNI 的子域名解析 ClientID：
+```
+myphone.dns.example.com  →  ClientID = "myphone"
+```
+
+但启用 ECH（Encrypted Client Hello，即 TLS 1.3 ESNI/ECH 扩展）后：
+- **Outer SNI**（明文）：仅包含公共域名（如 `dns.example.com`），不带 ClientID
+- **Inner SNI**（加密，在 EncryptedExtensions 中）：包含真实 SNI，但服务器需要持有 ECH 私钥才能解密
+
+### 18.2 AdGuardHome 对 ECH 的当前支持情况
+
+在 SVCB/HTTPS 记录生成时支持透传 `ech` 参数：
+```go
+// [internal/dnsforward/svcbmsg.go + svcbmsg_internal_test.go:97-107]
+// 测试用例：svcb: ech, "AAAA" → SVCBECHConfig{ECH: []byte{0,0,0}}
+// 表示 DNS Filter 规则中的 $dnssvcb 参数能识别 ech= 值并写入 HTTPS/SVCB 响应
+```
+
+但**TLS listener 层不支持 ECH 解密**（`crypto/tls` 标准库目前也不支持 ECH），因此：
+
+| 协议 | 启用 ECH 后 ClientID 能否提取 | 说明 |
+|-----|----------------------------|------|
+| **DoH (HTTPS)** | ✅ 可提取（优先用 URL Path） | DoH 的 ClientID 主要从 `/myphone/dns-query` 的 URL Path 提取，不依赖 SNI |
+| **DoT (TLS over TCP/853)** | ❌ 无法提取 | Outer SNI 只有公共域名，Inner SNI 无法解密，ClientID 子域名丢失 |
+| **DoQ (QUIC/853)** | ❌ 无法提取 | 同上，QUIC 的 Initial 包中的 SNI 也被 ECH 加密 |
+
+### 18.3 DoH Path 提取：ECH 场景下的退路
+
+```go
+// [internal/dnsforward/clientid.go]
+func clientIDFromDNSContextHTTPS(pctx *proxy.DNSContext) (clientID string, err error) {
+    r := pctx.HTTPRequest
+    clientID = clientIDFromPath(r.URL.Path, s.conf.TLSConf.ForceHTTPSSvcDomain)
+    if clientID != "" {
+        return clientID, nil
+    }
+    // 退回到 SNI 提取（如果没有 ECH 还能成功）
+    return "", nil
+}
+```
+
+**退路策略**：
+1. **DoH 用户**：使用 URL Path 前缀/后缀承载 ClientID，完全避开 SNI，ECH 不影响
+2. **DoT/DoQ 用户**：
+   - ECH 未启用：SNI 正常提取
+   - ECH 已启用：Outer SNI 仅含公共域名，`clientIDFromClientServerName` 返回空串，客户端回退到 **按 IP/MAC 识别**（走 `ApplyClientFiltering` 的 IP → DHCP MAC 路径）
+
+### 18.4 ECH 启用后的完整识别链路
+
+```
+DoT/DoQ 请求到达
+  ├─ clientServerName() 获取 SNI
+  │   ├─ 无 ECH → 真实 SNI（含 ClientID 子域名）→ 提取成功
+  │   └─ 有 ECH → Outer SNI（仅 dns.example.com）→ 提取失败，clientID = ""
+  └─ ApplyClientFiltering("", remoteIP, setts)
+      ├─ findByClientID("") → 失败
+      ├─ findByIP(remoteIP) → 若该 IP 被 PersistentClient 配置则命中
+      └─ DHCP MACByIP(remoteIP) → 若 DHCP 查到 MAC 且 MAC 被 PersistentClient 配置则命中
+```
+
+**结论**：ECH 只影响 DoT/DoQ 的 SNI 子域名识别，对 DoH（URL Path）和 IP/MAC 匹配无影响。启用 ECH 后 DoT/DoQ 用户应确保 PersistentClient 配置了 IP 或 MAC 而不是只靠 ClientID。
+
+---
+
+## 19. CleanupClients TTL 配置项
+
+### 19.1 不存在 "CleanupClients TTL" 这一显式配置项
+
+AdGuardHome 对 RuntimeClient **没有 TTL 过期机制**，不因为"超过 N 秒未活跃"自动删除。清理完全由**来源数据的变化事件**驱动。
+
+### 19.2 唯一的时间相关配置：`ARPClientsUpdatePeriod`
+
+```go
+// [internal/client/storage.go:117-119]
+type StorageConfig struct {
+    // ARPClientsUpdatePeriod defines how often [SourceARP] runtime client
+    // information is updated.
+    ARPClientsUpdatePeriod time.Duration
+}
+
+// [internal/home/clients.go]
+const arpClientsUpdatePeriod = 10 * time.Minute  // 硬编码默认值
+```
+
+这个参数仅控制 ARP 表的刷新频率，不直接控制 TTL。ARP 刷新流程中隐含了清理：
+```go
+// [internal/client/storage.go:periodicARPUpdate → ReloadARP]
+func (s *Storage) ReloadARP(ctx context.Context) {
+    s.runtimeIndex.clearSource(SourceARP)   // 清除所有 IP 的 ARP 来源字段
+    // ... 填充当前 ARP 表中存在的设备 ...
+    removed := s.runtimeIndex.removeEmpty() // 仅剩下空壳的 RuntimeClient 被删除
+}
+```
+
+→ 一个仅靠 ARP 被识别到的设备，在离线后最长 **10 分钟** 才会被清理（下一次 ARP 刷新周期）。
+
+### 19.3 各来源的隐式"TTL"
+
+| 来源 | 触发清理的事件 | 等效 TTL | 代码位置 |
+|-----|-------------|---------|---------|
+| **SourceHostsFile** | `/etc/hosts` 文件被修改（通过 fsnotify watcher） | 文件系统事件驱动，无时间上限 | `storage.handleHostsUpdates()` |
+| **SourceDHCP** | DHCP 租约刷新（调用 `UpdateDHCP()`） | DHCP 租约更新周期，通常 12h~24h | `storage.UpdateDHCP()` |
+| **SourceARP** | ARP 表定时刷新 | 默认 10 分钟（`arpClientsUpdatePeriod`） | `storage.periodicARPUpdate()` |
+| **SourceRDNS** | rDNS 异步请求返回 | 无周期性刷新，仅在请求时首次填充 | `storage.UpdateAddress()` |
+| **SourceWHOIS** | WHOIS 异步请求返回 | 无周期性刷新，仅在请求时首次填充 | `storage.setWHOISInfo()` |
+| **PersistentClient** | 永不自动清理，仅 API 显式删除 | 永久 | `Storage.Add/Update/RemoveByName()` |
+
+### 19.4 为什么没有 RuntimeClient TTL
+
+AdGuardHome 的设计哲学：
+1. **RuntimeClient 是来源数据的投影**，不是独立对象；来源存在则客户端存在，来源消失则客户端消失
+2. 避免引入「活跃检测」带来的额外开销（需要维护最后访问时间 + 定时扫描）
+3. `removeEmpty()` 提供了惰性清理的锚点——只要至少一个来源仍能提供该 IP 的信息，就保留
+
+如需主动清理，唯一方式是重启进程（PersistentClient 从配置恢复，RuntimeClient 从零开始重新填充）。
+
+---
+
+## 20. 关键配置参数
 
 | 参数 | 类型 | 说明 | 代码位置 |
 |-----|------|------|---------|
@@ -1226,9 +1743,9 @@ func (s *Storage) periodicARPUpdate(ctx context.Context) {
 | `ParentalCacheSize` | uint | 家长控制缓存大小 | [filtering.go:164](internal/filtering/filtering.go#L164) |
 | `SafeSearchCacheSize` | uint | 安全搜索缓存大小 | [filtering.go:163](internal/filtering/filtering.go#L163) |
 | `FiltersUpdateIntervalHours` | uint32 | 规则更新间隔（小时） | [filtering.go:177](internal/filtering/filtering.go#L177) |
-| `ARPClientsUpdatePeriod` | time.Duration | ARP 表刷新周期 | [storage.go:119](internal/client/storage.go#L119) |
+| `ARPClientsUpdatePeriod` | time.Duration | ARP 表刷新周期（控制 RuntimeClient 清理频率） | [storage.go:119](internal/client/storage.go#L119) |
 
-## 14. 调试与排错要点
+## 21. 调试与排错要点
 
 1. **客户端识别问题**：
    - 检查 `Source` 优先级，确认客户端信息来源是否正确
@@ -1236,36 +1753,46 @@ func (s *Storage) periodicARPUpdate(ctx context.Context) {
    - 注意 IP 地址的 zone 索引可能导致匹配失败
    - **DoH/DoT ClientID 不匹配**：检查 URL Path 格式或 SNI 子域名，是否符合提取规则
    - **Persistent vs Runtime 混淆**：过滤决策只看 PersistentClient，RuntimeClient 仅用于展示
+   - **MAC 与 IP 匹配不同客户端歧义**：`clashes()` 方法会阻止标识符被多个客户端共享，若仍出现 IP 匹配 A 但 DHCP→MAC 匹配 B，则走 `findByIP` 先 IP 命中即返回，不会走 MAC 路径
+   - **ECH 导致 DoT/DoQ ClientID 丢失**：启用 ECH 后 Outer SNI 不含 ClientID 子域名，需改用 DoH URL Path 或给 PersistentClient 配置 IP/MAC 作为退路
 
 2. **规则不生效问题**：
    - 检查 `ProtectionEnabled` 和 `FilteringEnabled` 开关
    - 确认 `hostCheckers` 执行顺序，前面的检查可能短路后续检查
    - 白名单规则优先级高于黑名单，检查是否被误放行
    - 客户端 `UseOwnSettings` 开关会覆盖全局设置
-   - **Tag 不匹配**：确认 Tag 是否在 `allowedTags` 白名单内
+   - **Tag 不匹配**：确认 Tag 是否在 `allowedTags` 白名单内（共 25 个内置 Tag）
    - **多 Tag 语法**：`|` 是 OR 逻辑，`&` 是 AND 逻辑，注意不要搞混
    - **$important 修饰符**：会跳过白名单覆盖，检查是否误加
+   - **Tag 数量上限**：实际上限 25 个（等于 allowedTags 长度），但代码无硬编码 `maxTags` 限制
 
 3. **缓存相关问题**：
    - 修改规则后注意缓存 TTL，可临时减小 `CacheTime` 测试
    - 异步更新规则时，需等待新引擎初始化完成
    - 安全浏览/家长控制缓存基于 hash prefix，清除需等待过期
    - **过滤规则变更不立即生效**：DNS proxy cache 不会主动失效，需手动调用 `/control/cache_clear`
-   - **客户端 upstream 缓存**：仅受影响客户端的缓存被清空，全局缓存不受影响
+   - **客户端 upstream 缓存懒重建**：`updateCustomUpstreamConfig` 只打 `isChanged=true` 脏标记，真正清空旧缓存在下一次请求 `customUpstreamConfig()` 时发生
+   - **缓存级联失效**：`/control/cache_clear` 会清空 dnsProxy.Cache + 所有客户端 upstream cache，但 SafeSearch/SafeBrowsing 缓存不清
+   - **SafeSearch 配置变更**：会自动 `ss.cache.Clear()`，无需手动
 
 4. **阻塞服务问题**：
    - 检查 `Schedule.Contains(time.Now())`，调度时间内不阻塞
    - 客户端 `UseOwnBlockedServices` 会替换全局阻塞服务列表
    - `ServicesRules` 字段是生效的规则列表
-   - **services.json 构建时注入**：运行时不会动态下载，规则随二进制版本更新
+   - **services.json 构建时注入**：运行时不会动态下载，规则随二进制版本更新；"热更新"只指用户的 ID 选择列表变更，不是规则库本身
    - **ApplyBlockedServicesList 执行顺序**：先全局→再客户端覆盖→最后按 Schedule 决定是否加载
+   - **serviceRules 重建方式**：`initBlockedServices()` 只在启动时执行一次，无运行时 API 可以重新编译，必须重启进程
 
 5. **ConfigReload 期间问题**：
    - **100ms 端口切换窗口**：新连接可能短暂失败，TCP/UDP 会自动重试
    - **Reconfigure 全局锁**：`serverLock.Lock()` 期间所有新请求排队等待
    - **TLS 证书热加载**：仅重启 HTTPS/TLS listener，不影响 DNS 明文请求
+   - **多层锁事务边界**：`config.RWMutex → clients.lock → Storage.mu → dnsforward.serverLock`，注意加锁顺序避免死锁
+   - **atomicConfig 事务**：配置读取需用 `config.RLock()` 保证多个字段的原子一致性视图
 
 6. **CleanupClients 清理时机问题**：
    - RuntimeClient 不会因「不活跃」被清理，仅在来源数据消失时清理
    - ARP 更新周期默认 10 分钟，离线设备最长需 10 分钟才被清掉
    - 某 IP 仅出现在 ARP 中：下一次 `periodicARPUpdate` 时会被先 `clearSource(ARP)` 再 `removeEmpty()` 删除
+   - **不存在 RuntimeClient TTL 配置项**：不要浪费时间找 `client_ttl` 之类的参数，设计上就没有活跃超时机制
+   - **来源驱动的隐式 TTL**：hosts 文件（fsnotify 事件）、DHCP（租约刷新）、ARP（10 分钟定时）、rDNS/WHOIS（仅首次请求填充，不刷新）
