@@ -913,6 +913,65 @@ quickMatch() 快速预筛 + decode + 精确匹配
 
 这种设计体现了**常用路径优化**的思路：游标分页是用户正常浏览的路径，有上限保护；offset 深分页是 API 调用者的路径，虽然慢但结果准确。
 
+#### 5.8.4 50000 上限的云环境调优指南
+
+`maxFileScanEntries = 50000` 对于家用/小团队场景是合理的默认值，但在云环境（K8s、VPS、大用户量部署）中需要根据资源情况调优：
+
+| 部署场景 | 推荐 maxFileScanEntries | 理由 |
+|---------|------------------------|------|
+| 家用树莓派 1GB RAM | 10000 ~ 20000 | 内存紧张 + SD 卡 IO 慢，单次扫描不能太久 |
+| 小团队 VPS 2C4G | 默认 50000 | 通用场景平衡 |
+| 中大型 8C16G 云服务器 | 100000 ~ 200000 | CPU/IO 充裕，减少前端翻页次数 |
+| K8s 容器化 + HPA | 30000 ~ 50000 | 避免单次请求占用过多 CPU，影响 P99 延迟与 HPA 指标 |
+| 企业级海量日志专用节点 | 0（无上限） | 专用资源池，用 offset 深分页 + 后端流式导出 |
+
+**调优建议**：
+1. 监控 `search()` 的 `elapsed` 日志输出，若 P95 < 100ms 可考虑增大
+2. 若查询面板的首屏响应 > 2s，优先排查是否过滤条件太严格导致扫满了 50000 条
+3. K8s 环境建议配合探针：若单次查询持续 > 5s，应考虑降权或降级为只读内存
+
+#### 5.8.5 isQueryTheSame 的编码差异与边界
+
+`isQueryTheSame` 的简单字符串比较存在几个边界场景需要注意：
+
+**1. IDNA 编码不一致**
+
+后端搜索时会做 Punycode 转换（文件：`internal/querylog/http.go:372-377`）：
+```go
+if asciiVal, err = idna.ToASCII(loweredVal); err != nil {
+    // ...
+} else if asciiVal == loweredVal {
+    // Purge asciiVal to prevent checking the same value
+    asciiVal = ""
+}
+```
+
+但前端 `isQueryTheSame` 的比较是**原始字符串**：
+```typescript
+const isQueryTheSame = 
+    typeof previousQuery === 'string' && 
+    typeof currentQuery === 'string' && 
+    previousQuery === currentQuery;
+```
+
+**场景**：用户第一次搜 "中文域名.中国"，浏览器自动转义成 Punycode 放入 URL；第二次直接搜 Punycode 形式（或浏览器未转义）。两次实际语义相同，但 `previousQuery !== currentQuery`，短轮询不会触发——这是**安全但不完美**的设计：宁可漏触发补页，也不要因误触发导致放大请求。
+
+**2. URL 编码差异**
+
+前端通过 `encodeURIComponent` 传入搜索词（文件：`renderFormattedClientCell.tsx:70`、`ClientCell.tsx:225`）：
+```typescript
+to={`logs?search="${encodeURIComponent(value)}"`}
+```
+
+如果用户在搜索框输入后直接回车（浏览器自己编码），和点击链接（代码编码），虽然搜索语义相同，但编码后的字符串可能存在差异（如空格是否编码为 `%20` 还是 `+`）。同样是**安全不完美**。
+
+**3. undefined / "" 边界**
+```typescript
+typeof previousQuery === 'string'  // 过滤掉 undefined/null
+previousQuery === currentQuery     // "" === "" 为 true（空搜索比较）
+```
+空搜索也会触发短轮询，保证首页一整页数据完整。
+
 #### 5.8.3 shortPollQueryLogs 的放大攻击面与防护
 
 前端 `shortPollQueryLogs` 的自动补页机制存在潜在的放大攻击风险，但有多层防护：
@@ -948,6 +1007,302 @@ const isShortPollingNeeded =
 
 **攻击面评估**：
 实际很难被放大攻击。最坏情况下一次过滤操作触发 2~3 次后端请求，每次扫 5 万条，总共 10~15 万条扫描量，对于服务器来说完全可接受。
+
+#### 5.8.6 最坏 23 请求的慢请求 SLA 评估
+
+"最坏 23 请求"指的是理论上短轮询可能触发的最大递归次数。实际场景分析如下：
+
+**1. 理论最坏链路**
+
+假设过滤条件极严格（匹配率 = 0），且每次恰好扫描 50000 条仍未凑够一页数据：
+- 2 个日志文件 × 每个文件 (文件大小 ÷ 50000) 批 ≈ 最多 2~3 批
+- 实际递归次数：约 2~3 次，远未达到 23 次
+
+**2. "23" 的来源分析**
+
+如果按每次返回 `oldest` 非空就递归一次，理论上限来自：
+- 单文件行数 ÷ 50000 上限 = 递归次数/文件
+- 以 90 天旋转为例，约 2~3GB 日志 ≈ 400~600 万行 → 单文件 80~120 批 → 2 个文件 × 100 ≈ 200 次
+
+但实际上不可能，因为：
+- `oldest` 游标只会向前（更旧）移动，绝不会重复
+- 每次都扫 50000 条，23 次就扫了 115 万条，对于正常用户浏览已经远远超出一页需求
+
+**3. 慢请求 SLA 保障**
+
+虽然没有显式超时，但有多层机制控制单次查询时间：
+
+| 保障层 | 机制 | 效果 |
+|--------|------|------|
+| L1 | maxFileScanEntries = 50000 | 单次请求最多扫 5 万行，约 <50ms |
+| L2 | quickMatch 预筛 | 实际解码量远低于扫描量 |
+| L3 | maxSearchDepth = 100 | seekTS 二分查找不超过 100 次 |
+| L4 | 只有 2 个日志文件 | reader 切到下个文件最多 1 次 |
+| L5 | Go HTTP server 默认超时 | 外层服务超时兜底 |
+
+在 8C16G 服务器上，即使最坏场景（严格过滤 + 全量 2 文件 + offset 深分页 10000），单请求也应在 500ms 内返回。
+
+#### 5.8.7 qLogReader 同步 IO 的 Ctrl-C 中断行为
+
+`qLogReader` 的 `ReadNext()` 是**同步阻塞 IO**，没有主动检查 `context.Done()`。这对 Ctrl-C (SIGINT) 中断有以下影响：
+
+**1. 信号处理链路**（文件：`internal/home/home.go:130-134`、`signal.go:89-98`）
+
+```
+SIGINT → signals channel → signalHandler.handle()
+    ↓
+default case → h.shutdown(ctx)
+    ↓
+cleanup(ctx) → closeDNSServer() → queryLog.Shutdown(ctx) → flushLogBuffer(ctx)
+```
+
+**2. 中断时刻的行为**
+
+- **正在 seekTS 二分查找**：循环迭代每次都会检查深度，即使当前迭代中被信号打断，100 次迭代最多几百微秒就能退出循环
+- **正在 ReadNext 读文件**：`os.File.Read()` 是系统调用，Go 运行时会将阻塞的 syscall 与 goroutine 解绑，SIGINT 到达后 HTTP handler 的 context 会被 cancel，但**正在进行的 read() 不会被中断**，需要等这一次 read() 完成（最多几毫秒）
+- **正在 JSON 解码**：纯 CPU 操作，不受 context 影响，必须等当前解码完成
+
+**3. 最坏延迟**
+
+Ctrl-C 后最多需要等待：
+- 当前的 `ReadNext()` + `decodeLogEntry()` + `match()` 完成（约微秒~毫秒级）
+- `flushLogBuffer()` 将内存缓冲区落盘（最多 1000 条 JSON 编码 + 一次 write，约几毫秒）
+
+在实际体验上，Ctrl-C 后进程会在 **1~5 秒内** 优雅退出，不会卡死。
+
+**4. 与 Shutdown 的配合**（文件：`internal/querylog/qlog.go:100-113`）
+```go
+func (l *queryLog) Shutdown(ctx context.Context) (err error) {
+    l.confMu.RLock()
+    defer l.confMu.RUnlock()
+    
+    if l.conf.FileEnabled {
+        err = l.flushLogBuffer(ctx)  // 保证落盘，不丢失内存中的日志
+    }
+    return nil
+}
+```
+Shutdown 会强制 flush 内存缓冲区，保证退出前数据完整性。
+
+### 5.10 MemSize 热更与回滚策略
+
+**1. 热更路径**（文件：`internal/home/config.go:902-911`）
+
+配置热更新采用"**先更新内存 → 再写入磁盘 YAML**"的流程：
+```
+PUT /control/querylog/config/update
+    → 解析请求校验参数（validateIvl 等）
+    → confMu.Lock() 更新 queryLog.conf 中的 MemSize
+    → confMu.Unlock()
+    → ConfigModifier.Apply() 触发 writeAllConfigs()
+    → 把 queryLog.WriteDiskConfig() 读出的新值写入 AdGuardHome.yaml
+```
+
+下次 `Add()` 调用时：
+```go
+func (l *queryLog) Add(params *AddParams) {
+    func() {
+        l.confMu.RLock()
+        memSize = l.conf.MemSize  // ← 读取到新的 MemSize
+        l.confMu.RUnlock()
+    }()
+    
+    l.bufferLock.Lock()
+    l.buffer.Push(entry)
+    if l.buffer.Len() >= memSize {  // ← 使用新阈值判断 flush
+        // ... 触发落盘
+    }
+}
+```
+
+**2. 热更不重置缓冲区**
+
+注意：热更 MemSize **不会重建 RingBuffer**。如果 MemSize 从 100 → 1000：
+- 现有 RingBuffer 的容量还是 100（`container.NewRingBuffer` 容量不可变）
+- 但 flush 阈值 `>= memSize` 变成了 1000，而 buffer 最多只能装 100 条
+- 结果：**每次 Push 都会触发 flush**，实际上退化为每条都落盘
+
+这是一个**已知的不完美**，正确的热更需要：
+```go
+// 伪代码（当前未实现）
+newBuffer := container.NewRingBuffer[*logEntry](newMemSize)
+bufferLock.Lock()
+oldBuffer := l.buffer
+l.buffer = newBuffer
+bufferLock.Unlock()
+// 把 oldBuffer 中的条目迁移落盘
+```
+
+**3. 回滚策略**
+
+当前实现**没有自动回滚**。如果新配置写入 YAML 成功但后续服务异常，需要手动：
+- 恢复 YAML 备份
+- 重启服务（重启时按 YAML 重新创建 RingBuffer，容量正确）
+
+实际使用中 MemSize 很少修改，且错误的值（太大或太小）只会影响性能而非正确性，因此未实现复杂的回滚机制。
+
+### 5.11 温度分层预热：从冷启动到最佳查询性能
+
+**1. 当前实现：无显式预热**
+
+AdGuardHome 启动时**不会主动加载磁盘上的历史日志到内存**，采用"**按需加载**"策略：
+
+```
+服务启动
+    ↓
+RingBuffer 初始化（空）
+    ↓
+DNS 请求进来 → Add() → 内存中逐渐积累日志
+    ↓
+用户首次查询日志面板
+    → searchMemory()：RingBuffer 中有什么返回什么（可能很少）
+    → searchFiles()：seekTS + ReadNext 按需从磁盘读取
+```
+
+**2. 温度分层自然形成**
+
+虽然没有显式预热，但通过 OS 级文件系统缓存 + 数据访问模式，自然形成了三层温度：
+
+| 层级 | 数据范围 | 存储介质 | 访问延迟 | 预热方式 |
+|------|---------|----------|----------|----------|
+| L1 热数据 | 最近 1000 条 | RingBuffer（堆内存） | <1µs | 自动积累 |
+| L2 温数据 | 当前文件最近 1 天 | 磁盘 + OS Page Cache | 10~100µs | 首次访问后 OS 自动缓存 |
+| L3 冷数据 | 归档文件 1~3 个月 | 磁盘（可能未缓存） | 1~10ms | 首次访问触发 Page Fault |
+
+**3. 为什么不做显式预热**
+
+- **启动速度优先**：DNS 服务启动要快，预热需要扫描 GB 级文件，会拖慢启动时间
+- **访问模式不可预测**：用户可能永远不打开日志面板，预热浪费 IO
+- **OS 缓存已足够**：Page Cache 在大多数场景下能缓存最近被访问的文件块
+- **seekTS 二分查找对冷数据也很快**：即使 L3 冷数据，二分查找也只需要 ~20 次随机读
+
+**4. 可预期的首屏冷启动延迟**
+
+第一次打开日志面板（服务刚启动后），首屏响应会比之后慢约 2~3 倍，因为：
+- seekTS 的 20 次随机读全部触发 Page Fault
+- 后续 500 条顺序读取也需要从磁盘读入
+
+但第二次查询同一时间范围时，所有数据已在 Page Cache 中，延迟恢复到正常水平。
+
+### 5.12 IP 限流防放大攻击
+
+AdGuardHome 在多个层级实现了限流保护，但** Web API 层面没有针对日志查询的专用 IP 限流**，需要依赖系统级防护：
+
+**1. 系统内置限流层**
+
+| 限流类型 | 位置 | 保护对象 | 说明 |
+|---------|------|----------|------|
+| DNS 请求速率限制 | `config.DNS.Ratelimit: 20 rps`（默认） | DNS 端口 | 默认 20 rps/IP，子网掩码 IPv4:/24, IPv6:/56 |
+| 登录请求速率限制 | `authhttp.go: newAuthRateLimiter` | 登录接口 | 限制失败尝试次数，超限封禁指定时长 |
+| MaxGoroutines | `dnsforward.Config.MaxGoroutines: 300`（默认） | DNS 处理 goroutine | 防止 DNS 请求过载导致内存爆炸 |
+
+**2. 日志查询接口的脆弱点**
+
+`GET /control/querylog` 接口**没有专用的 per-IP 限流中间件**：
+- 没有 `maxConcurrentQueries` 限制并发数
+- 没有 `rateLimitPerIP` 限制查询频率
+- 虽然需要登录鉴权（`web.requireSession` 中间件），但登录后可以任意调用
+
+**3. 实际防护：间接依赖**
+
+放大攻击的防护主要依赖：
+- **鉴权门槛**：需要登录才能调用，公网匿名攻击者无法直接利用
+- **服务端自保**：`maxFileScanEntries = 50000` 限制单次请求的 CPU/IO 消耗
+- **HTTP 服务器并发**：Go `net/http` 有默认连接池和 goroutine 限制
+- **DNS 与 Web 解耦**：日志查询是 Web 接口，不影响 DNS 核心服务（即使 Web 慢，DNS 解析正常）
+
+**4. 强化建议**（生产环境）
+
+如果部署在公网且有多个管理员账户，建议在反向代理层（Nginx/Caddy/Traefik）加：
+```nginx
+# Nginx 示例：限制日志查询接口 10 rps/IP
+location /control/querylog {
+    limit_req zone=querylog burst=20 nodelay;
+    proxy_pass http://adguard:3000;
+}
+```
+
+### 5.13 N 文件扩展：从 2 文件到 N 文件的架构可行性
+
+当前归档机制固定只有 2 个文件（`querylog.json` + `querylog.json.1`）。如果需要更长的历史保留期，可以扩展为 N 文件轮转：
+
+**1. 旋转逻辑改造**
+
+当前 `rotate()`（文件：`internal/querylog/querylogfile.go:103-121`）：
+```go
+func (l *queryLog) rotate(ctx context.Context) error {
+    from := l.logFile       // querylog.json
+    to := l.logFile + ".1"  // querylog.json.1
+    if _, err := os.Stat(to); err == nil {
+        os.Remove(to)  // 先删除旧的 .1
+    }
+    return os.Rename(from, to)
+}
+```
+
+改造为 N 文件（例如保留 7 天，共 7 个归档）：
+```go
+// 伪代码：N 文件轮转
+for i := maxFiles - 1; i >= 1; i-- {
+    from := fmt.Sprintf("%s.%d", l.logFile, i)     // .6 → .7 (删除)
+    to := fmt.Sprintf("%s.%d", l.logFile, i + 1)
+    if i == maxFiles - 1 {
+        os.Remove(from)  // 最旧的归档直接删除
+    } else {
+        os.Rename(from, to)  // .5 → .6, .4 → .5, ...
+    }
+}
+os.Rename(l.logFile, l.logFile + ".1")  // 当前文件 → .1
+```
+
+**2. qLogReader 改造**
+
+当前 `qLogReader.setQLogReader()` 固定打开 2 个文件（`qlogreader.go:30-44`）：
+```go
+files := []string{
+    l.logFile + ".1",
+    l.logFile,
+}
+```
+
+扩展为 N 文件：
+```go
+// 伪代码：按 .1, .2, ... .N, 当前 的顺序打开
+files := []string{}
+for i := maxArchivedFiles; i >= 1; i-- {
+    files = append(files, fmt.Sprintf("%s.%d", l.logFile, i))
+}
+files = append(files, l.logFile)  // 当前文件最后（最新）
+```
+`qFiles` 数组按"从旧到新"排列，`currentFile` 指针从最右边（最新文件）向左移动，现有逻辑不变。
+
+**3. seekTS 的二分查找改造**
+
+seekTS 是**单文件内**的二分查找，不需要改造。需要先**跨文件定位**：
+- 比较 `olderThan` 与每个文件的第一条/最后一条记录时间戳
+- 找到目标所在的文件索引，再对该文件调用 seekTS
+
+可以用更高效的**跨文件二分**（N 个文件的首尾时间戳组成有序区间列表）。
+
+**4. 保留时间 = 旋转间隔 × 文件数**
+
+| 旋转间隔 | N = 2 | N = 7 | N = 30 |
+|---------|-------|-------|--------|
+| 6 小时 | 12h | 42h | 7.5 天 |
+| 1 天 | 2 天 | 7 天 | 30 天 |
+| 7 天 | 14 天 | 49 天 | 210 天 |
+
+**5. 改造风险评估**
+
+| 模块 | 改动量 | 风险 |
+|------|--------|------|
+| rotate() | 低 | rename 顺序处理，需要保证原子性 |
+| qLogReader | 中 | files 列表动态化，文件不存在需跳过 |
+| checkAndRotate() | 低 | 读取多个文件的 first time，定位目标文件 |
+| seekTS() | 无 | 单文件内逻辑不变 |
+| 清理逻辑 | 高 | 新增删除最旧归档的逻辑，需要原子性保证 |
+
+总体可行性高，主要改造集中在文件命名和 reader 初始化，核心的二分查找 + 反向读取 + quickMatch 三层机制完全可以复用。
 
 ### 5.9 MemSize 热点时段动态调整策略
 
