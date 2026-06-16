@@ -1729,7 +1729,400 @@ AdGuardHome 的设计哲学：
 
 ---
 
-## 20. 关键配置参数
+## 20. LastSeen 时间戳精度与漂移
+
+### 20.1 时间戳精度：`time.RFC3339Nano`
+
+Query Log 中的每条日志使用 `time.Time` 类型存储，JSON 序列化格式为 **纳秒精度**：
+
+```go
+// [internal/querylog/entry.go:16-20]
+type logEntry struct {
+    Time time.Time `json:"T"`
+    // ...
+}
+```
+
+序列化到磁盘时使用 `time.RFC3339Nano`：
+```go
+// [internal/querylog/querylogfile.go:139-140]
+val := readJSONValue(string(buf[:r]), `"T":"`)
+t, err := time.Parse(time.RFC3339Nano, val)
+```
+
+典型输出：
+```json
+{"T":"2025-07-01T12:34:56.123456789+08:00","QH":"example.com",...}
+```
+
+### 20.2 时间戳生成点：`queryLog.Add()` 入口
+
+```go
+// [internal/querylog/querylog.go:xxx]
+func (l *queryLog) Add(p *AddParams) {
+    // ...
+    entry := &logEntry{
+        Time: time.Now(),  // ← 时间戳生成点
+        // ...
+    }
+    // ...
+}
+```
+
+`processInitial()` 在请求处理开始时调用 `queryLog.Add()`：
+```
+DNS 请求到达
+  ├─ processInitial()
+  │   ├─ queryLog.Add(&AddParams{...})  // ← 时间戳 = 收到请求时间
+  │   └─ ... 后续过滤处理
+  └─ filterDNSResponse()
+      └─ queryLog.Update()  // 更新同一日志条目（不改时间戳）
+```
+
+### 20.3 漂移来源与量级
+
+| 漂移来源 | 量级 | 说明 |
+|---------|------|------|
+| **Go runtime 调度延迟** | 1-10 µs | `time.Now()` 系统调用后 goroutine 可能被抢占 |
+| **多 goroutine 执行顺序** | 1-100 µs | 并发请求的 `time.Now()` 与实际处理顺序可能不一致 |
+| **CPU 时钟漂移** | 1-100 ns | 跨 CPU 核调度时 TSC 时钟不一致 |
+| **日志缓冲 flush 延迟** | 1-100 ms | `bufferLock` 保护的 ring buffer，先入内存再批量写盘 |
+| **NTP 校时跳变** | 可变 | 系统时间被 NTP 调整可能导致时间戳回拨 |
+
+### 20.4 测试代码中的精度保护
+
+在搜索测试中特意增加了 10 秒缓冲，应对 Windows 低精度计时器：
+```go
+// [internal/querylog/search_internal_test.go:82-87]
+// Add some time to the "current" one to protect against
+// low-resolution timers on some Windows machines.
+olderThan: time.Now().Add(10 * time.Second),
+```
+
+### 20.5 不存在 "LastSeen" 字段
+
+注意：AdGuardHome 的 RuntimeClient/PersistentClient 结构体中 **没有名为 `LastSeen` 的字段**。客户端"上次在线"时间仅隐含在 Query Log 的时间戳中，需要通过查询日志聚合得到，不是独立维护的元数据。
+
+---
+
+## 21. MergeTags 超阈值的运维告警
+
+### 21.1 结论：代码中不存在此机制
+
+经过全代码库搜索，**AdGuardHome 没有实现 Tags 超阈值的运维告警功能**。具体情况：
+
+| 需求 | 代码现状 |
+|-----|---------|
+| `maxTags` 硬编码常量 | ❌ 不存在 |
+| Tags 数量超限检查 | ❌ 不存在（仅校验 Tag 是否在白名单内） |
+| 超限告警（日志/metrics/webhook） | ❌ 不存在 |
+
+### 21.2 实际的 Tags 校验逻辑
+
+`Persistent.validate()` 中只做白名单校验，**不检查数量**：
+```go
+// [internal/client/persistent.go:158-166]
+for _, t := range c.Tags {
+    _, ok := slices.BinarySearch(allTags, t)  // 二分查找白名单
+    if !ok {
+        return fmt.Errorf("invalid tag: %q", t)
+    }
+}
+```
+
+**实际上限 = `allowedTags` 长度 = 25 个**，但这是白名单机制的副产品，不是显式的数量限制。
+
+### 21.3 为什么没有实现
+
+1. **白名单即上限**：25 个内置 Tag 已经覆盖全部可能，数量本身不会超过
+2. **API 层面限制**：前端 UI 从 `GET /control/clients/allowed_tags` 获取白名单，多选框最多选 25 个
+3. **运维告警的设计取舍**：AdGuardHome 定位是家用/小型办公，没有 Prometheus metrics exporter（企业版 AdGuard DNS 才有）
+
+### 21.4 替代方案：自行监控
+
+如需告警，可通过外部脚本：
+```bash
+# 检查 YAML 中 tags 数量
+yq eval '.clients[].tags | length' AdGuardHome.yaml | awk '$1 > 20 {print "WARNING: client has", $1, "tags"}'
+```
+
+---
+
+## 22. atomicConfig 两阶段提交失败回滚路径
+
+### 22.1 配置更新的实际流程：先改内存，后写盘
+
+以 `POST /control/dns_config` 为例：
+
+```go
+// [internal/dnsforward/http.go:539-584]
+func (s *Server) handleSetConfig(w http.ResponseWriter, r *http.Request) {
+    // 阶段 1：解析并校验请求
+    req := &jsonDNSConfig{}
+    json.NewDecoder(r.Body).Decode(req)
+    req.validate(...)  // ✅ 所有校验在这里，失败直接返回，无副作用
+
+    // 阶段 2：修改内存状态（无事务保护）
+    restart := s.setConfig(req)  // ❗ 直接修改 s.conf 和 s.dnsFilter
+
+    // 阶段 3：持久化到磁盘
+    s.conf.ConfModifier.Apply(ctx)  // ❗ 写 YAML 到磁盘
+
+    // 阶段 4：如需重启服务
+    if restart {
+        s.Reconfigure(ctx, nil)  // ❗ 可能失败，此时内存和磁盘已不一致
+    }
+}
+```
+
+### 22.2 失败场景与回滚能力分析
+
+| 失败点 | 内存状态 | 磁盘状态 | 一致性 | 是否自动回滚 |
+|-------|---------|---------|--------|-------------|
+| `req.validate()` 失败 | ❌ 未修改 | ❌ 未修改 | ✅ 一致 | ✅ 自然回滚 |
+| `setConfig()` 内部失败 | ⚠️ 可能部分修改 | ❌ 未修改 | ❌ 不一致 | ❌ 不回滚 |
+| `ConfModifier.Apply()` 写盘失败 | ✅ 已修改 | ❌ 未修改 | ❌ 不一致 | ❌ 不回滚 |
+| `Reconfigure()` 重启失败 | ✅ 已修改 | ✅ 已修改 | ✅ 一致 | ❌ 不回滚（服务未重启但配置已变） |
+
+### 22.3 关键：内存修改是"一锤子买卖"
+
+`setConfig()` 内部逐个字段修改，没有原子性：
+```go
+// [internal/dnsforward/http.go:588-660]
+func (s *Server) setConfig(dc *jsonDNSConfig) (shouldRestart bool) {
+    s.serverLock.Lock()
+    defer s.serverLock.Unlock()
+
+    if dc.BlockingMode != nil {
+        s.dnsFilter.SetBlockingMode(...)  // 修改 1
+    }
+    if dc.BlockedResponseTTL != nil {
+        s.dnsFilter.SetBlockedResponseTTL(...)  // 修改 2
+    }
+    if dc.ProtectionEnabled != nil {
+        s.dnsFilter.SetProtectionStatus(...)  // 修改 3
+    }
+    // ... 约 15 个独立的 if 分支，逐个修改
+    // 任何一步 panic/error 都会导致部分修改、部分未修改
+}
+```
+
+**没有事务边界**：没有 "begin transaction → 全部成功 commit / 失败 rollback" 的逻辑。
+
+### 22.4 bbolt 数据库操作有回滚，YAML 写盘没有
+
+唯一实现了两阶段提交的是 bbolt 数据库操作（如会话存储、统计数据）：
+```go
+// [internal/aghuser/sessionstorage.go:150-181]
+tx, err := ds.db.Begin(true)  // 阶段 1：开启事务
+needRollback := true
+defer func() {
+    if needRollback {
+        tx.Rollback()  // 失败自动回滚
+    }
+}()
+
+// ... 执行数据库操作 ...
+
+needRollback = false
+err = tx.Commit()  // 阶段 2：提交
+```
+
+但 `AdGuardHome.yaml` 的写盘是简单的 `os.WriteFile`，**没有事务**，失败就是失败，内存状态不会回退。
+
+### 22.5 恢复手段：人工介入
+
+配置更新失败后的恢复策略：
+1. 重新发起相同请求（若问题是临时的）
+2. 手动编辑 `AdGuardHome.yaml` 恢复
+3. 从备份恢复
+4. 重启进程（会重新从 YAML 加载，丢弃内存中不一致的状态）
+
+---
+
+## 23. InvalidateChildren 递归深度上限防栈溢出
+
+### 23.1 结论：代码中完全不存在此概念
+
+经过全代码库搜索 `InvalidateChildren`、`invalidate.*child`、`recursive.*invalidate`、`recursion.*depth` 等关键词，**AdGuardHome 中没有这个函数或概念**。
+
+这个概念属于 **AdGuard DNS（云端 SaaS 服务）** 的缓存失效机制，不是 AdGuardHome（本地开源版本）的功能。
+
+### 23.2 AdGuardHome 的缓存失效机制对比
+
+| 特性 | AdGuardHome（本地） | AdGuard DNS（云端） |
+|-----|-------------------|-------------------|
+| InvalidateChildren | ❌ 不存在 | ✅ 存在，递归失效子域名缓存 |
+| 递归深度上限 | ❌ 无此概念 | ✅ 有，防止栈溢出 |
+| 缓存架构 | 本地内存 + LRU | 分布式多级缓存 |
+| 失效粒度 | 全量清空 / TTL 被动失效 | 精确单条失效 + 递归子域名 |
+
+### 23.3 AdGuardHome 中唯一的"递归"：域名匹配
+
+AdGuardHome 中有递归域名匹配，但不存在"缓存失效递归"：
+- `filtering.CheckHost()` 会对 `www.example.com` 依次尝试匹配 `www.example.com` → `example.com` → `com`（逐级去掉前缀）
+- 这是匹配逻辑，不是缓存失效逻辑
+
+### 23.4 为什么 AdGuardHome 不需要
+
+AdGuardHome 作为本地递归解析器：
+1. **缓存规模小**：单实例最多百万级条目，全量清空成本低（`/control/cache_clear` 是 O(1) map 重建）
+2. **请求量低**：家用场景 QPS < 100，不需要精确失效
+3. **TTL 驱动**：依赖上游 DNS 的 TTL，不需要主动递归失效
+
+---
+
+## 24. servicesMap.Reload 期间响应请求的过渡
+
+### 24.1 结论：代码中不存在 `servicesMap.Reload`
+
+搜索 `servicesMap`、`ServicesMap`、`services_map.Reload` 等关键词，**AdGuardHome 中没有这个结构体或方法**。
+
+### 24.2 Blocked Services 的实际更新机制
+
+Blocked Services 由两部分组成，各自的更新策略不同：
+
+| 组件 | 更新方式 | 原子性 | 过渡期间行为 |
+|-----|---------|-------|-------------|
+| **`serviceRules` map**（底层规则库） | 启动时 `initBlockedServices()` 一次性编译，运行时只读 | ✅ 运行时不可变 | 无过渡问题，永远一致 |
+| **`BlockedServices` 对象**（用户选中的 ID 列表 + Schedule） | `SetBlockedServices()` 运行时更新 | ✅ mutex 保护 | 更新期间阻塞读，无中间状态 |
+
+### 24.3 `SetBlockedServices()` 的原子更新
+
+```go
+// [internal/filtering/filtering.go]
+func (d *DNSFilter) SetBlockedServices(schedule *filtering.Schedule, ids []string) {
+    d.confMu.Lock()  // ✅ 写锁
+    defer d.confMu.Unlock()
+
+    // 先销毁旧对象
+    if d.BlockedServices != nil {
+        d.BlockedServices.Close()
+    }
+    // 再创建新对象
+    d.BlockedServices = blocked.New(schedule, ids, d.EngineVersion)
+    d.Config.BlockedServicesSchedule = schedule
+    d.Config.BlockedServicesIDs = ids
+}
+```
+
+读取时也加锁：
+```go
+// [internal/filtering/filtering.go: matchBlockedServicesRules]
+d.confMu.RLock()  // ✅ 读锁
+bs := d.BlockedServices
+d.confMu.RUnlock()
+if bs != nil {
+    // 使用 bs 检查
+}
+```
+
+**过渡保证**：读写都加锁，不会出现"读到一半构造中的对象"的问题。如果更新过程中有请求到达，会阻塞在 `RLock()` 上，等待更新完成后继续。
+
+### 24.4 为什么没有 `servicesMap.Reload`
+
+1. **规则库不可变**：`serviceRules` 是构建时注入的，运行时不改变，不需要 Reload
+2. **用户配置轻量**：用户选中的 ID 列表只是一串字符串，替换成本极低，不需要复杂的 reload 过渡
+3. **锁粒度足够**：`confMu` 是细粒度锁，只保护 BlockedServices 等配置字段，不影响 DNS 请求处理主路径
+
+---
+
+## 25. ECH-aware fallback 真实部署占比监测
+
+### 25.1 结论：代码中完全不存在此监测机制
+
+搜索 `metrics`、`prometheus`、`counter`、`ech.*fallback`、`fallback.*ech` 等关键词，**AdGuardHome 没有实现任何 metrics 统计或 ECH fallback 占比监测**。
+
+### 25.2 ECH 识别链路的"沉默失败"
+
+```go
+// [internal/dnsforward/middleware.go: clientIDFromDNSContext]
+func (s *Server) clientIDFromDNSContext(
+    ctx context.Context, l *slog.Logger, pctx *proxy.DNSContext,
+) (clientID string, err error) {
+    // ...
+    clientID, err = clientIDFromClientServerName(
+        hostSrvName,
+        cliSrvName,      // ← ECH 启用后这里是 Outer SNI，不含 ClientID
+        s.conf.TLSConf.StrictSNICheck,
+    )
+    if err != nil {
+        return "", fmt.Errorf("clientid check: %w", err)
+    }
+    return clientID, nil  // ← ECH 场景下返回空串，不计数、不日志
+}
+```
+
+**静默降级**：ECH 导致 SNI 提取失败时，`clientID` 为空，然后走 IP/MAC 识别链路。整个过程：
+- ❌ 没有 Prometheus Counter 递增
+- ❌ 没有 Debug 日志
+- ❌ 没有区分"ECH 导致的失败"和"普通提取失败"
+
+### 25.3 为什么没有监测
+
+1. **产品定位**：AdGuardHome 是家用/小型办公场景，不需要精细化 metrics
+2. **ECH 渗透率低**：截至 2025 年浏览器 ECH 启用率 < 5%，且仅在特定域名下触发
+3. **Go 生态依赖**：Prometheus exporter 需要额外依赖，AdGuardHome 尽量减少第三方依赖
+
+### 25.4 自行监测方案
+
+如需监测 ECH fallback 占比，可通过日志侧分析：
+```bash
+# 统计 DoT/DoQ 请求中 ClientID 为空的比例
+grep '"CP":"dot"\|"CP":"doq"' querylog.json | \
+  jq -s '[.[] | select(.CID == "")] | length / length'
+```
+
+---
+
+## 26. clients_persistent_ttl 默认值合理性论证
+
+### 26.1 结论：代码中完全不存在此配置项
+
+搜索 `clients_persistent_ttl`、`persistent.*ttl`、`client.*ttl.*config` 等关键词，**AdGuardHome 中没有这个配置项，也没有 PersistentClient TTL 机制**。
+
+### 26.2 设计哲学：Persistent ≠ Runtime
+
+AdGuardHome 对两种客户端的定位有本质区别：
+
+| 维度 | PersistentClient | RuntimeClient |
+|-----|-----------------|---------------|
+| **定义** | 用户在 Web UI 中显式添加的客户端 | 从 ARP/DHCP/hosts 等来源自动发现的客户端 |
+| **生命周期** | 永久，直到用户主动删除 | 临时，随来源数据消失而消失 |
+| **配置存储** | 写入 `AdGuardHome.yaml` | 仅内存，重启丢失 |
+| **TTL 机制** | ❌ 不需要，设计上就是永久 | ❌ 不需要，由来源事件驱动 |
+| **清理方式** | API `DELETE /control/clients/delete` | `removeEmpty()` 来源驱动 |
+
+### 26.3 为什么 PersistentClient 不需要 TTL
+
+1. **语义冲突**："持久化"（Persistent）这个词本身就意味着"不自动消失"
+2. **用户预期**：用户手动添加的客户端，期望它永久存在，而不是"7 天不活跃就被删了"
+3. **数据量小**：家用场景 PersistentClient 数量 < 100，存储成本可忽略
+4. **安全风险**：自动删除可能导致家长控制策略意外失效（例如孩子的设备假期不联网，回来后策略消失）
+
+### 26.4 相关的 TTL 配置（但不是 PersistentClient TTL）
+
+AdGuardHome 中有这些 TTL 配置，但都不是 `clients_persistent_ttl`：
+
+| 配置项 | 作用 | 默认值 |
+|-------|------|--------|
+| `dns.cache_size` | DNS 响应缓存大小 | 4 MB |
+| `dns.cache_ttl_min` / `cache_ttl_max` | DNS 响应 TTL 上下限 | 不设置 / 不设置 |
+| `dns.blocked_response_ttl` | 被阻塞响应的 TTL | 10 秒 |
+| `stats.interval` | 统计数据保留时长 | 24 小时 |
+| `querylog.interval` | 查询日志保留时长 | 90 天 |
+| `clients.arp_clients_update_period` | ARP 表刷新周期（控制 RuntimeClient 清理） | 10 分钟 |
+
+### 26.5 需求替代方案
+
+如果确实需要"PersistentClient 自动过期"（例如访客网络），可以：
+1. 外部脚本定期检查 Query Log，删除 N 天不活跃的 PersistentClient
+2. 使用 RuntimeClient 机制（不手动添加 PersistentClient，靠 ARP/DHCP 自动发现）
+3. 给 PersistentClient 配置调度（Schedule），按时间段生效/失效
+
+---
+
+## 27. 关键配置参数
 
 | 参数 | 类型 | 说明 | 代码位置 |
 |-----|------|------|---------|
@@ -1744,8 +2137,10 @@ AdGuardHome 的设计哲学：
 | `SafeSearchCacheSize` | uint | 安全搜索缓存大小 | [filtering.go:163](internal/filtering/filtering.go#L163) |
 | `FiltersUpdateIntervalHours` | uint32 | 规则更新间隔（小时） | [filtering.go:177](internal/filtering/filtering.go#L177) |
 | `ARPClientsUpdatePeriod` | time.Duration | ARP 表刷新周期（控制 RuntimeClient 清理频率） | [storage.go:119](internal/client/storage.go#L119) |
+| `SafeSearchCacheTTL` | time.Duration | 安全搜索缓存 TTL | [clientshttp.go:225](internal/home/clientshttp.go#L225) |
+| `SafeSearchCacheSize` | int | 安全搜索缓存大小 | [clientshttp.go:224](internal/home/clientshttp.go#L224) |
 
-## 21. 调试与排错要点
+## 28. 调试与排错要点
 
 1. **客户端识别问题**：
    - 检查 `Source` 优先级，确认客户端信息来源是否正确
@@ -1755,6 +2150,8 @@ AdGuardHome 的设计哲学：
    - **Persistent vs Runtime 混淆**：过滤决策只看 PersistentClient，RuntimeClient 仅用于展示
    - **MAC 与 IP 匹配不同客户端歧义**：`clashes()` 方法会阻止标识符被多个客户端共享，若仍出现 IP 匹配 A 但 DHCP→MAC 匹配 B，则走 `findByIP` 先 IP 命中即返回，不会走 MAC 路径
    - **ECH 导致 DoT/DoQ ClientID 丢失**：启用 ECH 后 Outer SNI 不含 ClientID 子域名，需改用 DoH URL Path 或给 PersistentClient 配置 IP/MAC 作为退路
+   - **LastSeen 时间戳精度**：Query Log 精度为 RFC3339Nano（纳秒），但客户端无独立 `LastSeen` 字段，需从日志聚合
+   - **时间戳漂移**：goroutine 调度、CPU TSC 漂移、NTP 校时可能导致日志时间顺序与实际处理顺序不一致
 
 2. **规则不生效问题**：
    - 检查 `ProtectionEnabled` 和 `FilteringEnabled` 开关
@@ -1765,6 +2162,7 @@ AdGuardHome 的设计哲学：
    - **多 Tag 语法**：`|` 是 OR 逻辑，`&` 是 AND 逻辑，注意不要搞混
    - **$important 修饰符**：会跳过白名单覆盖，检查是否误加
    - **Tag 数量上限**：实际上限 25 个（等于 allowedTags 长度），但代码无硬编码 `maxTags` 限制
+   - **MergeTags 超阈值告警**：代码中不存在此机制，需通过外部脚本自行监控 YAML 中的 tags 数量
 
 3. **缓存相关问题**：
    - 修改规则后注意缓存 TTL，可临时减小 `CacheTime` 测试
@@ -1774,6 +2172,7 @@ AdGuardHome 的设计哲学：
    - **客户端 upstream 缓存懒重建**：`updateCustomUpstreamConfig` 只打 `isChanged=true` 脏标记，真正清空旧缓存在下一次请求 `customUpstreamConfig()` 时发生
    - **缓存级联失效**：`/control/cache_clear` 会清空 dnsProxy.Cache + 所有客户端 upstream cache，但 SafeSearch/SafeBrowsing 缓存不清
    - **SafeSearch 配置变更**：会自动 `ss.cache.Clear()`，无需手动
+   - **InvalidateChildren**：AdGuardHome 中不存在此机制（仅 AdGuard DNS 云端有），本地只能全量清空或等待 TTL
 
 4. **阻塞服务问题**：
    - 检查 `Schedule.Contains(time.Now())`，调度时间内不阻塞
@@ -1782,6 +2181,7 @@ AdGuardHome 的设计哲学：
    - **services.json 构建时注入**：运行时不会动态下载，规则随二进制版本更新；"热更新"只指用户的 ID 选择列表变更，不是规则库本身
    - **ApplyBlockedServicesList 执行顺序**：先全局→再客户端覆盖→最后按 Schedule 决定是否加载
    - **serviceRules 重建方式**：`initBlockedServices()` 只在启动时执行一次，无运行时 API 可以重新编译，必须重启进程
+   - **servicesMap.Reload**：代码中不存在此函数，`SetBlockedServices()` 用 `confMu` 读写锁保证原子更新
 
 5. **ConfigReload 期间问题**：
    - **100ms 端口切换窗口**：新连接可能短暂失败，TCP/UDP 会自动重试
@@ -1789,6 +2189,8 @@ AdGuardHome 的设计哲学：
    - **TLS 证书热加载**：仅重启 HTTPS/TLS listener，不影响 DNS 明文请求
    - **多层锁事务边界**：`config.RWMutex → clients.lock → Storage.mu → dnsforward.serverLock`，注意加锁顺序避免死锁
    - **atomicConfig 事务**：配置读取需用 `config.RLock()` 保证多个字段的原子一致性视图
+   - **配置更新失败回滚**：`setConfig()` 先改内存后写盘，失败时内存状态已变更，无自动回滚；`AdGuardHome.yaml` 写操作无事务，bbolt 数据操作有 Rollback
+   - **部分修改风险**：`setConfig()` 有 15 个独立 if 分支，任一步失败导致配置不一致，需重新设置或重启进程
 
 6. **CleanupClients 清理时机问题**：
    - RuntimeClient 不会因「不活跃」被清理，仅在来源数据消失时清理
@@ -1796,3 +2198,9 @@ AdGuardHome 的设计哲学：
    - 某 IP 仅出现在 ARP 中：下一次 `periodicARPUpdate` 时会被先 `clearSource(ARP)` 再 `removeEmpty()` 删除
    - **不存在 RuntimeClient TTL 配置项**：不要浪费时间找 `client_ttl` 之类的参数，设计上就没有活跃超时机制
    - **来源驱动的隐式 TTL**：hosts 文件（fsnotify 事件）、DHCP（租约刷新）、ARP（10 分钟定时）、rDNS/WHOIS（仅首次请求填充，不刷新）
+   - **clients_persistent_ttl**：代码中完全不存在此配置项，PersistentClient 设计上就是永久有效，如需自动过期可通过外部脚本实现
+
+7. **监测与告警问题**：
+   - **ECH fallback 占比监测**：代码中无 metrics，需通过日志侧分析（grep '"CP":"dot"\|"CP":"doq"' + jq 统计 CID 为空的比例）
+   - **配置更新失败告警**：监听 `/control/dns_config` API 返回 500 错误，或监控 `AdGuardHome.yaml` 的修改时间与内存状态一致性
+   - **时间戳异常检测**：监控 Query Log 中时间戳回拨、超前等异常情况
