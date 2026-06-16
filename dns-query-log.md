@@ -887,7 +887,7 @@ quickMatch() 快速预筛 + decode + 精确匹配
 - **值越大**：越少的请求次数，越高的单次延迟，越高的瞬时资源占用
 - **值越小**：越多的请求次数，越低的单次延迟，更平滑的资源消耗
 
-#### 5.8.2 50000 上限与分页参数的联动设计
+#### 5.8.4 50000 上限与分页参数的联动设计
 
 `maxFileScanEntries` 与 `limit` / `offset` / `older_than` 三个分页参数之间存在复杂的联动关系：
 
@@ -913,7 +913,7 @@ quickMatch() 快速预筛 + decode + 精确匹配
 
 这种设计体现了**常用路径优化**的思路：游标分页是用户正常浏览的路径，有上限保护；offset 深分页是 API 调用者的路径，虽然慢但结果准确。
 
-#### 5.8.4 50000 上限的云环境调优指南
+#### 5.8.5 50000 上限的云环境调优指南
 
 `maxFileScanEntries = 50000` 对于家用/小团队场景是合理的默认值，但在云环境（K8s、VPS、大用户量部署）中需要根据资源情况调优：
 
@@ -930,7 +930,7 @@ quickMatch() 快速预筛 + decode + 精确匹配
 2. 若查询面板的首屏响应 > 2s，优先排查是否过滤条件太严格导致扫满了 50000 条
 3. K8s 环境建议配合探针：若单次查询持续 > 5s，应考虑降权或降级为只读内存
 
-#### 5.8.5 isQueryTheSame 的编码差异与边界
+#### 5.8.6 isQueryTheSame 的编码差异与边界
 
 `isQueryTheSame` 的简单字符串比较存在几个边界场景需要注意：
 
@@ -972,7 +972,7 @@ previousQuery === currentQuery     // "" === "" 为 true（空搜索比较）
 ```
 空搜索也会触发短轮询，保证首页一整页数据完整。
 
-#### 5.8.3 shortPollQueryLogs 的放大攻击面与防护
+#### 5.8.7 shortPollQueryLogs 的放大攻击面与防护
 
 前端 `shortPollQueryLogs` 的自动补页机制存在潜在的放大攻击风险，但有多层防护：
 
@@ -1008,7 +1008,7 @@ const isShortPollingNeeded =
 **攻击面评估**：
 实际很难被放大攻击。最坏情况下一次过滤操作触发 2~3 次后端请求，每次扫 5 万条，总共 10~15 万条扫描量，对于服务器来说完全可接受。
 
-#### 5.8.6 最坏 23 请求的慢请求 SLA 评估
+#### 5.8.8 最坏 23 请求的慢请求 SLA 评估
 
 "最坏 23 请求"指的是理论上短轮询可能触发的最大递归次数。实际场景分析如下：
 
@@ -1042,7 +1042,7 @@ const isShortPollingNeeded =
 
 在 8C16G 服务器上，即使最坏场景（严格过滤 + 全量 2 文件 + offset 深分页 10000），单请求也应在 500ms 内返回。
 
-#### 5.8.7 qLogReader 同步 IO 的 Ctrl-C 中断行为
+#### 5.8.9 qLogReader 同步 IO 的 Ctrl-C 中断行为
 
 `qLogReader` 的 `ReadNext()` 是**同步阻塞 IO**，没有主动检查 `context.Done()`。这对 Ctrl-C (SIGINT) 中断有以下影响：
 
@@ -1084,7 +1084,7 @@ func (l *queryLog) Shutdown(ctx context.Context) (err error) {
 ```
 Shutdown 会强制 flush 内存缓冲区，保证退出前数据完整性。
 
-### 5.10 MemSize 热更与回滚策略
+### 5.9 MemSize 热更与回滚策略
 
 **1. 热更路径**（文件：`internal/home/config.go:902-911`）
 
@@ -1133,6 +1133,53 @@ bufferLock.Unlock()
 // 把 oldBuffer 中的条目迁移落盘
 ```
 
+#### 5.9.1 RingBuffer 阈值变化的渐进迁移策略
+
+如果要在生产环境需要平滑热更 MemSize 且不能丢数据，可以采用以下**渐进迁移方案**：
+
+**阶段一：阈值从大到小（MemSize 1000 → 100）**
+
+1. 修改配置后，`buffer.Len() >= 100` 立即满足，触发 flush
+2. flush 时 `buffer.Clear()` 清空后 buffer 仍是 1000 容量的 RingBuffer
+3. 后续每次写入 buffer 装到 100 就 flush，退化为近似每条接近实时落盘
+4. 重启服务后 RingBuffer 用正确的容量 100 创建 → 迁移完成
+
+**阶段二：阈值从小到大（MemSize 100 → 1000）**
+
+1. 修改配置后，buffer 只有 100 容量，但阈值变成 1000
+2. buffer 写满 100 就覆盖最旧的一条（RingBuffer 满了自动覆盖）
+3. 永远达不到 1000 的 flush 阈值，内存中数据会被覆盖
+4. 重启服务后 RingBuffer 用正确的容量 1000 创建 → 迁移完成
+
+**无损迁移的正确实现（可落地的生产级方案）：
+
+```go
+// 伪代码：无损热更 MemSize
+func (l *queryLog) resizeMemSize(newSize int) {
+    l.bufferLock.Lock()
+    defer l.bufferLock.Unlock()
+    
+    // 创建新的 RingBuffer
+    newBuf := container.NewRingBuffer[*logEntry](newSize)
+    
+    // 迁移旧 buffer 中的所有条目（按时间从旧到新）
+    if newSize < int(l.buffer.Len()) {
+        // 如果新容量更小，只取最新的 newSize 条
+        // 跳过旧的 len-newSize 条
+    }
+    
+    // 原子替换
+    l.buffer = newBuf
+    l.conf.MemSize = newSize
+    
+    // 如果缩容场景：多余的条目直接丢（或者 flush 到磁盘）
+}
+```
+
+**实际建议**：
+- MemSize 热更频率很低（通常部署时就设定好），不需要复杂的无损迁移收益不大
+- 如果确实需要平滑调整，建议配合重启服务配合**滚动重启**比在运行时扩容更稳妥
+
 **3. 回滚策略**
 
 当前实现**没有自动回滚**。如果新配置写入 YAML 成功但后续服务异常，需要手动：
@@ -1141,7 +1188,7 @@ bufferLock.Unlock()
 
 实际使用中 MemSize 很少修改，且错误的值（太大或太小）只会影响性能而非正确性，因此未实现复杂的回滚机制。
 
-### 5.11 温度分层预热：从冷启动到最佳查询性能
+### 5.10 温度分层预热：从冷启动到最佳查询性能
 
 **1. 当前实现：无显式预热**
 
@@ -1184,7 +1231,75 @@ DNS 请求进来 → Add() → 内存中逐渐积累日志
 
 但第二次查询同一时间范围时，所有数据已在 Page Cache 中，延迟恢复到正常水平。
 
-### 5.12 IP 限流防放大攻击
+#### 5.10.1 L2 Page Cache 的 NUMA 效应
+
+在多 NUMA 节点的服务器（多 CPU 物理插槽）上，Page Cache 的归属 NUMA node 对查询性能有显著影响：
+
+**1. NUMA 对日志查询的影响**
+
+| 场景 | 访问延迟 | 原因 |
+|------|----------|------|
+| 本地 NUMA 节点 Page Cache | 10~30µs | 同节点内存访问 |
+| 跨 NUMA 节点 Page Cache | 60~150µs | QPI/UPI 总线穿越 |
+| 本地 NUMA + 冷磁盘 SSD | 50~200µs | 本地 NVMe 随机读 |
+| 跨 NUMA + 冷磁盘 SSD | 100~300µs | 总线穿越 + 磁盘 IO |
+
+**2. 为什么这个影响值得关注**
+
+- `qLogFile` 的 buffer（约 4KB 读块）是 Go 堆内存，由分配时所在的 goroutine 的 P 所在 NUMA 节点分配
+- `seekTS` 二分查找的 20 次随机读，每次都会把新的页面拉到 Page Cache
+- 如果请求处理 goroutine 在 Node 0 上，而 Page Cache 位于 Node 1，每次内存访问都要跨 NUMA
+
+**3. 优化建议**（高性能场景）
+
+- **Go 运行时 NUMA 感知**：Go 1.5+ 的调度器已经做了 NUMA 友好的调度，通常不需要手动干预
+- **Taskset 绑核**：在高并发查询场景下，用 `taskset -c 0-7` 将 AdGuardHome 绑定到单个 NUMA 节点，可能获得 20~30% 的查询性能提升
+- **禁用 NUMA balancing**：Linux 的自动 NUMA balancing 可能导致页在节点间迁移产生抖动，对延迟敏感的服务建议关闭
+
+> 家用/小型部署通常是单 socket 服务器，NUMA 效应不明显，可以忽略。
+
+#### 5.10.2 L3 冷数据：SSD vs HDD 的性能差异
+
+seekTS 二分查找 + ReadNext 顺序读取的访问模式，在 SSD 和 HDD 上表现差异巨大：
+
+**1. seekTS 二分查找的 IO 模式**
+
+二分查找的访问模式是**随机读**（每次跳到文件中间位置）：
+- 需要约 log₂(行数) ≈ 20 次随机访问
+- 每次访问读约 4KB（一个文件块）
+
+| 存储介质 | 单次随机读延迟 | 20 次总延迟 |
+|---------|---------------|-------------|
+| NVMe SSD | 50~100µs | 1~2ms |
+| SATA SSD | 100~300µs | 2~6ms |
+| 7200rpm HDD | 5~10ms | 100~200ms |
+
+**2. ReadNext 顺序扫描的 IO 模式**
+
+顺序读取 50000 条记录（约 25MB 数据）：
+
+| 存储介质 | 顺序读带宽 | 50000 条扫描时间 |
+|---------|-----------|-----------------|
+| NVMe SSD | 3~7 GB/s | <10ms |
+| SATA SSD | 500MB/s | ~50ms |
+| 7200rpm HDD | 100~200MB/s | ~125~250ms |
+
+**3. 最坏场景对比**（严格过滤 + 50000 条全扫 + seekTS 定位）
+
+| 存储介质 | 首屏冷启动延迟 | 次屏（Page Cache 命中） |
+|---------|---------------|-----------------------|
+| NVMe SSD | 5~20ms | <5ms |
+| SATA SSD | 20~100ms | <10ms |
+| HDD | 200~500ms | ~50ms（OS Page Cache） |
+
+**4. 对部署的启示**
+
+- **家用路由器/树莓派（SD 卡）**：随机读性能极差（几 ms~几十 ms），seekTS 优势不明显，建议调大 MemSize 让更多数据在内存中
+- **SATA SSD VPS**：性价比最佳，seekTS 二分查找完全发挥作用
+- **NVMe 高性能服务器**：冷热数据差异极小，几乎感受不到延迟差异
+- **HDD 物理服务器**：建议将查询日志目录放到 SSD，或者接受首屏几百毫秒的延迟
+
+### 5.11 IP 限流防放大攻击
 
 AdGuardHome 在多个层级实现了限流保护，但** Web API 层面没有针对日志查询的专用 IP 限流**，需要依赖系统级防护：
 
@@ -1222,7 +1337,103 @@ location /control/querylog {
 }
 ```
 
-### 5.13 N 文件扩展：从 2 文件到 N 文件的架构可行性
+#### 5.11.1 4 层间接防护的告警信号
+
+虽然没有专用的查询日志限流，但系统中散布着多个**告警信号点**，当攻击或异常发生时会留下痕迹：
+
+**1. 时间戳解析失败告警**（文件：`internal/querylog/qlogfile.go:478-488`）
+```go
+if len(val) == 0 {
+    logger.ErrorContext(ctx, "couldn't find timestamp", "line", str)
+    return 0
+}
+tm, err := time.Parse(time.RFC3339Nano, val)
+if err != nil {
+    logger.ErrorContext(ctx, "couldn't parse timestamp", "value", val, slogutil.KeyError, err)
+    return 0
+}
+```
+- 触发条件：日志文件损坏或被篡改
+- 告警级别：Error
+- 监控建议：告警阈值 > 5 次/分钟
+
+**2. 文件读取错误告警**（文件：`internal/querylog/search.go:236`）
+```go
+l.logger.ErrorContext(ctx, "reading next entry", slogutil.KeyError, rErr)
+```
+- 触发条件：磁盘 IO 异常、文件被删除、权限问题
+- 告警级别：Error
+
+**3. flush 失败告警**（文件：`internal/querylog/qlog.go:262`）
+```go
+l.logger.ErrorContext(ctx, "flushing after adding", slogutil.KeyError, flushErr)
+```
+- 触发条件：磁盘满、文件系统只读、权限错误
+- 告警级别：Error（这条很严重——日志丢了）
+
+**4. 旋转失败告警**（文件：`internal/querylog/querylogfile.go:201`）
+```go
+l.logger.ErrorContext(ctx, "rotating", slogutil.KeyError, err)
+```
+- 触发条件：rename 系统调用失败
+- 告警级别：Error
+
+**5. 序列化性能调试日志**（文件：`internal/querylog/querylogfile.go:63-71`）
+```go
+l.logger.DebugContext(
+    ctx,
+    "serialized elements via json",
+    "count", bufLen,
+    "elapsed", elapsed,
+    "size", datasize.ByteSize(size),
+    "size_per_entry", datasize.ByteSize(float64(size)/float64(bufLen)),
+    "time_per_entry", elapsed/time.Duration(bufLen),
+)
+```
+- 级别：Debug
+- 可以用来监控 flush 频率，间接反映 DNS 查询量
+
+#### 5.11.2 limit_req 自适应：从静态阈值到动态调整
+
+Nginx 的 `limit_req` 是静态阈值，对于日志查询这种**访问模式差异大**的接口，静态阈值不够灵活。可以考虑以下自适应方案：
+
+**1. 基于时间的自适应**
+
+```nginx
+# Nginx + Lua 示例：工作时间放宽，夜间收紧
+location /control/querylog {
+    access_by_lua_block {
+        local hour = os.date("%H")
+        local limit = 10  -- 默认 10 rps
+        if hour >= 9 and hour <= 18 then
+            limit = 30  -- 工作时间放宽到 30 rps
+        end
+        -- 动态调整 limit_req 速率
+    }
+    proxy_pass http://adguard:3000;
+}
+```
+
+**2. 基于系统负载的自适应**
+
+更高级的方案：根据 CPU 使用率、磁盘 IO 等待时间动态调整：
+- CPU < 50%：放宽到 50 rps
+- CPU 50%~80%：保持 20 rps
+- CPU > 80%：收紧到 5 rps
+- 磁盘 IO await > 50ms：进一步收紧，保护后端存储
+
+**3. 基于错误率的自适应（熔断器模式）**
+
+- 正常：10 rps
+- 连续 3 次 5xx：降低到 5 rps（熔断半开）
+- 持续 1 分钟无 5xx：恢复到 10 rps
+
+**实际建议**：
+- 家用/小型部署：静态 10 rps 足够，不需要自适应
+- 企业多用户场景：建议接入 WAF 或 API 网关，用现成的限流策略
+- 切勿在 AdGuardHome 应用层实现限流——这不是 DNS 服务器的职责边界
+
+### 5.12 N 文件扩展：从 2 文件到 N 文件的架构可行性
 
 当前归档机制固定只有 2 个文件（`querylog.json` + `querylog.json.1`）。如果需要更长的历史保留期，可以扩展为 N 文件轮转：
 
@@ -1255,6 +1466,83 @@ for i := maxFiles - 1; i >= 1; i-- {
 os.Rename(l.logFile, l.logFile + ".1")  // 当前文件 → .1
 ```
 
+#### 5.12.1 N 文件 rotate 的原子 rename 失败处理
+
+扩展为 N 文件后，rename 链中的任何一步失败都可能导致文件处于不一致状态。需要设计完善的失败处理：
+
+**1. 当前 2 文件的失败模式**
+
+当前 `rotate()` 如果 rename 失败：
+- `from`（当前文件）还在，内容完整
+- `to`（.1 文件）不存在或未被覆盖
+- 状态一致：只是没有旋转成功，下次检查会再试
+
+**2. N 文件的失败风险**
+
+倒序 rename 链：`.5→.6, .4→.5, .3→.4, ...`
+
+如果中间某一步失败（比如 .3→.4 失败了）：
+- `.1`, `.2`, `.3` 还在原位置
+- `.4`, `.5`, `.6` 已经被移动了
+- **状态不一致**：出现"时间空洞"或文件重叠
+
+**3. 原子性保证方案**
+
+**方案 A：临时文件 + 最终 rename（推荐）**
+```go
+// 伪代码：用临时目录保证原子性
+tmpDir := l.logFile + ".tmp_rotate"
+os.Mkdir(tmpDir)
+
+// 先把所有新文件准备好（拷贝到临时目录）
+for i := 1; i < maxFiles; i++ {
+    src := fmt.Sprintf("%s.%d", l.logFile, i)
+    dst := fmt.Sprintf("%s/%d", tmpDir, i+1)
+    os.Rename(src, dst)  // 同分区 rename 是原子的
+}
+// 当前文件 → .1
+os.Rename(l.logFile, tmpDir + "/1")
+
+// 最后一次性把临时目录重命名为正式目录（原子操作）
+os.Rename(tmpDir, l.logFile + ".archive")
+```
+- 优点：要么全成功要么全失败
+- 缺点：需要额外的磁盘空间（一次完整复制的空间）
+
+**方案 B：倒序 rename + 失败回滚**
+```go
+// 伪代码：记录 rename 历史，失败时回滚
+var renamed []string
+for i := maxFiles - 1; i >= 1; i-- {
+    from := fmt.Sprintf("%s.%d", l.logFile, i)
+    to := fmt.Sprintf("%s.%d", l.logFile, i+1)
+    if err := os.Rename(from, to); err != nil {
+        // 回滚：把已经移动的文件移回去
+        for _, f := range renamed {
+            os.Rename(f+".next", f)  // 伪代码
+        }
+        return err
+    }
+    renamed = append(renamed, from)
+}
+```
+- 优点：不需要额外空间
+- 缺点：回滚过程也可能失败，状态更混乱
+
+**方案 C：日志索引文件**
+
+用一个索引文件记录每个编号对应的实际文件名，rotate 时只更新索引：
+```
+querylog.idx:
+  1: querylog.20240115_103000.json
+  2: querylog.20240114_103000.json
+  ...
+```
+- 优点：真正的原子操作（原子写索引文件）
+- 缺点：改动量大，reader 也需要按索引查找
+
+**推荐**：方案 A（临时目录 + 最终 rename），实现简单、正确性高，代价是一次旋转需要短暂的双倍空间。
+
 **2. qLogReader 改造**
 
 当前 `qLogReader.setQLogReader()` 固定打开 2 个文件（`qlogreader.go:30-44`）：
@@ -1276,13 +1564,145 @@ files = append(files, l.logFile)  // 当前文件最后（最新）
 ```
 `qFiles` 数组按"从旧到新"排列，`currentFile` 指针从最右边（最新文件）向左移动，现有逻辑不变。
 
-**3. seekTS 的二分查找改造**
+#### 5.12.2 qLogReader 中风险迁移工具
 
-seekTS 是**单文件内**的二分查找，不需要改造。需要先**跨文件定位**：
-- 比较 `olderThan` 与每个文件的第一条/最后一条记录时间戳
-- 找到目标所在的文件索引，再对该文件调用 seekTS
+将 2 文件扩展为 N 文件属于**中等风险**改造，建议配套开发迁移工具和验证工具：
 
-可以用更高效的**跨文件二分**（N 个文件的首尾时间戳组成有序区间列表）。
+**1. 迁移工具（2 文件 → N 文件）**
+
+如果已经有历史数据，升级到 N 文件需要迁移工具：
+```go
+// 伪代码：迁移工具
+func migrateTwoFilesToNFiles(logFile string, maxFiles int) error {
+    // 1. 备份原文件
+    os.Rename(logFile, logFile+".backup_current")
+    os.Rename(logFile+".1", logFile+".backup_old")
+    
+    // 2. 按时间切分
+    // 读取 .backup_old 的内容，按时间戳切分为多个文件
+    // 读取 .backup_current 的内容，按时间戳切分
+    
+    // 3. 生成 .1, .2, ... .N
+    for i := 1; i <= maxFiles; i++ {
+        // ... 写入对应时间段的文件
+    }
+    
+    // 4. 验证通过后删除备份
+    return nil
+}
+```
+
+**2. 验证工具（N 文件完整性检查）**
+
+定期检查 N 文件的连续性：
+```go
+// 伪代码：验证工具
+func validateNFiles(logFile string, maxFiles int) error {
+    // 1. 检查每个文件是否存在
+    // 2. 检查每个文件的首尾时间戳是否连续（前一个的首 = 后一个的尾 + 旋转间隔）
+    // 3. 检查时间戳是否单调递增
+    // 4. 统计损坏行数
+}
+```
+
+**3. 迁移风险点**
+
+| 风险 | 概率 | 影响 | 缓解措施 |
+|------|------|------|----------|
+| 迁移过程中服务写入新日志 | 中 | 数据丢失或重复 | 迁移前先停止 log 写入或 read-only 模式 |
+| 大文件迁移耗时长 | 高 | 服务不可用时间长 | 在线迁移 + 最终 rename 切换 |
+| 迁移后 seekTS 定位不准 | 低 | 查询结果错误 | 迁移后全量验证 + 对比查询结果 |
+| 回滚困难 | 中 | 升级失败无法恢复 | 迁移前完整备份，支持一键回滚 |
+
+**4. 平滑迁移方案（推荐）**
+
+1. 先升级代码，新代码同时支持 2 文件和 N 文件两种布局
+2. 启动时检测：如果只有 2 个文件，按 2 文件模式运行
+3. 下次旋转时自动生成第 3 个文件，渐进式过渡到 N 文件
+4. 经过 N 个旋转周期后，自然完成全量迁移
+
+> 这种方案不需要专门的迁移工具，成本最低。
+
+#### 5.12.3 seekTS 跨文件边界的处理
+
+扩展为 N 文件后，seekTS 需要先**跨文件定位**，再在文件内二分查找。边界处理是最容易出 bug 的地方：
+
+**1. 跨文件定位算法**
+
+```
+N 个文件（按时间从旧到新排列）：
+  [.N]    [.N-1]  ...    [.2]    [.1]    [当前]
+  最旧                     ...                  最新
+```
+
+定位步骤：
+1. 从最新文件（当前文件）的**第一条记录**（最旧）开始比较
+2. 如果 `olderThan >= 文件第一条时间戳` → 目标在这个文件内，对该文件 seekTS
+3. 否则 → 移动到更旧的下一个文件，重复比较
+4. 如果所有文件都比目标新 → 返回 `errTSTooEarly`
+
+**2. 边界文件处理**
+
+**边界场景 1：olderThan 恰好等于某文件的第一条记录时间**
+- 正确行为：应该定位到该文件，并从第一条记录开始读
+- 常见 bug：不小心定位到上一个（更新的）文件的末尾，导致漏掉正好等于边界的那一条
+
+**边界场景 2：olderThan 落在两个文件之间的"时间缝隙"**
+- 理论上不应该有缝隙（rotate 是连续的）
+- 但实际中可能因为服务重启、手动删除文件等原因出现缝隙
+- 处理：找到第一个比 olderThan 新的文件，从它的第一条开始读
+
+**边界场景 3：文件损坏导致首尾时间戳异常**
+- 检测方法：读取文件的第一条和最后一条时间戳，确保第一条比最后一条旧
+- 异常处理：跳过该文件，或回退为顺序扫描
+
+**3. 跨文件二分优化**
+
+如果文件数量很多（比如 30 个以上），线性扫描定位太慢，可以用**跨文件二分**：
+
+```go
+// 伪代码：跨文件二分定位
+func findFileByTS(files []*qLogFile, targetTS int64) (int, error) {
+    left, right := 0, len(files)-1
+    
+    for left <= right {
+        mid := (left + right) / 2
+        firstTS := files[mid].firstTimestamp()  // 缓存的首记录时间戳
+        
+        if targetTS > firstTS {
+            // 目标在更新的文件中（索引更大）
+            left = mid + 1
+        } else {
+            // 目标在这个文件或更旧的文件中
+            right = mid - 1
+        }
+    }
+    
+    if right < 0 {
+        return -1, errTSTooLate  // 比最新文件还新
+    }
+    return right, nil  // right 是目标文件索引
+}
+```
+
+**4. 文件首尾时间戳缓存**
+
+每次读取文件首尾时间戳都需要 IO，建议缓存：
+- 启动时/首次访问时读取并缓存每个文件的首尾时间戳
+- rotate 后更新缓存
+- 文件变更时（如检测到 mtime 变化）重新读取
+
+**5. 边界测试用例清单**
+
+扩展 N 文件后，必须覆盖以下测试场景：
+- [ ] olderThan 比所有文件都新 → 返回空 + oldest=0
+- [ ] olderThan 比所有文件都旧 → 从最旧文件开始读
+- [ ] olderThan 恰好等于某文件第一条 → 从该文件第一条开始
+- [ ] olderThan 恰好等于某文件最后一条 → 从该文件最后一条的下一条开始（即下一个文件的第一条）
+- [ ] 中间某文件损坏，跳过继续
+- [ ] 所有文件都损坏 → 回退为只查内存
+- [ ] 只有 1 个文件（新部署，还没 rotate 过）
+- [ ] N = 1（极端情况，不保留归档）
 
 **4. 保留时间 = 旋转间隔 × 文件数**
 
@@ -1296,15 +1716,15 @@ seekTS 是**单文件内**的二分查找，不需要改造。需要先**跨文�
 
 | 模块 | 改动量 | 风险 |
 |------|--------|------|
-| rotate() | 低 | rename 顺序处理，需要保证原子性 |
+| rotate() | 中 | rename 链 + 原子性保证 + 失败回滚 |
 | qLogReader | 中 | files 列表动态化，文件不存在需跳过 |
-| checkAndRotate() | 低 | 读取多个文件的 first time，定位目标文件 |
+| checkAndRotate() | 中 | 读取多个文件的 first time，定位目标文件 |
 | seekTS() | 无 | 单文件内逻辑不变 |
-| 清理逻辑 | 高 | 新增删除最旧归档的逻辑，需要原子性保证 |
+| 迁移工具 | 高 | 历史数据迁移 + 验证 + 回滚方案 |
 
-总体可行性高，主要改造集中在文件命名和 reader 初始化，核心的二分查找 + 反向读取 + quickMatch 三层机制完全可以复用。
+总体可行性高，核心的二分查找 + 反向读取 + quickMatch 三层机制完全可以复用，主要工作量在文件管理和迁移工具。
 
-### 5.9 MemSize 热点时段动态调整策略
+### 5.13 MemSize 热点时段动态调整策略
 
 **当前实现：静态配置**
 
