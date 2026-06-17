@@ -812,7 +812,487 @@ func (s *server) handleDHCPSetConfig(w http.ResponseWriter, r *http.Request) {
 
 ---
 
-## 九、关键代码文件索引
+## 九、三条路径的加锁顺序对比与死锁风险
+
+### 9.1 三条路径的操作范围
+
+| 路径 | 典型调用入口 | 操作性质 | 触发来源 |
+|------|------------|---------|---------|
+| HTTP API | `AddStaticLease` / `RemoveStaticLease` / `UpdateStaticLease` / `Leases` | 读写混合 | Web 管理后台 POST/GET 请求 |
+| 配置接口 | `handleDHCPSetConfig` → `ResetLeases` / `dbLoad` → `ResetLeases` | 批量写 | 配置变更、服务启动/重启 |
+| DNS 查询 | `HostByIP` / `MACByIP` / `IPByHost` | 只读 | DNS 引擎域名反查查询 |
+
+### 9.2 新版 dhcpsvc：加锁顺序一致，无交叉
+
+新版三条路径统一使用同一把 `leasesMu` 全局读写锁，加锁顺序完全一致：
+
+#### 路径一：DNS 查询（只读）
+
+```go
+// server.go:213-222  HostByIP 示例
+func (srv *DHCPServer) HostByIP(ip netip.Addr) (host string) {
+    srv.leasesMu.RLock()      // ① 加读锁
+    defer srv.leasesMu.RUnlock()
+    // 读取 srv.leases.leaseByAddr(ip)  ← ② 仅访问内存
+    return l.Hostname
+}
+```
+
+`Leases()`、`HostByIP()`、`MACByIP()`、`IPByHost()` 四个查询方法模式完全相同：
+- 第一步：`RLock()`
+- 第二步：直接访问内存索引
+- 第三步：`defer RUnlock()`
+- **全程无嵌套锁、无磁盘 IO**
+
+#### 路径二：HTTP API（写操作）
+
+```go
+// server.go:273-300  AddLease 示例
+func (srv *DHCPServer) AddLease(ctx context.Context, l *Lease) (err error) {
+    // ... ifaceForAddr() 先查接口（无锁） ...
+
+    srv.leasesMu.Lock()         // ① 加写锁
+    defer srv.leasesMu.Unlock()
+
+    err = srv.leases.add(ctx, srv.logger, l, iface)
+    // add() 内部:
+    //   ② 修改内存: iface.addLease() + idx.byAddr[]/byName[]
+    //   ③ 写磁盘:   idx.dbStore()  ← 持锁状态下写盘
+    return nil
+}
+```
+
+`AddLease`、`UpdateStaticLease`、`RemoveLease` 写操作模式：
+- 第一步：`Lock()` 加写锁
+- 第二步：修改 `netInterface.leases` 等内存数据结构
+- 第三步：调用 `dbStore()` 写磁盘（**持锁状态下执行**）
+- 第四步：`defer Unlock()`
+
+#### 路径三：配置接口 — `Reset()` 全量清空
+
+```go
+// server.go:249-269
+func (srv *DHCPServer) Reset(ctx context.Context) (err error) {
+    srv.leasesMu.Lock()          // ① 加写锁
+    defer srv.leasesMu.Unlock()
+
+    for _, iface := range srv.interfaces4 {
+        iface.common.reset()     // ② 清空各接口 leasedOffsets、leases
+    }
+    err = srv.leases.clear(ctx, srv.logger)
+    // clear() 内部:
+    //   ③ 清空 idx.byAddr、idx.byName
+    //   ④ idx.dbStore()  ← 持锁状态下写空 JSON
+    return nil
+}
+```
+
+#### 加锁顺序结论（新版）
+
+三条路径的加锁顺序严格一致：
+
+```
+DNS 查询:       RLock → 读内存 → RUnlock
+HTTP API:       Lock  → 改内存 → 写盘(dbStore) → Unlock
+配置 Reset:     Lock  → 清内存 → 写盘(dbStore) → Unlock
+请求 goroutine: Lock  → 改内存 → 写盘(dbStore) → Unlock  (handler4.go/handler6.go)
+```
+
+**特征**：
+- 所有路径都只获取**一把锁**：`leasesMu`
+- 无任何嵌套锁（获取 A 锁后再获取 B 锁）
+- 所有 `dbStore()` 调用都发生在持有 `leasesMu` 的状态下，满足 `db.go:175` 的前置条件
+- 读操作之间可并行（RLock 共享），读/写、写/写之间互斥
+
+### 9.3 旧版 dhcpd：加锁顺序有微妙差异
+
+旧版三条路径的加锁顺序**不完全一致**，但由于只有一把 `leasesLock` 互斥锁，结构相对简单。
+
+#### 路径一：DNS 查询
+
+```go
+// v4_unix.go:238-250  FindMACbyIP 示例
+func (s *v4Server) FindMACbyIP(ip netip.Addr) (mac net.HardwareAddr) {
+    s.leasesLock.Lock()           // ① 加互斥锁（无读写区分）
+    defer s.leasesLock.Unlock()
+
+    l, ok := s.ipIndex[ip]        // ② 访问内存索引
+    if ok { return l.HWAddr }
+    return nil
+}
+```
+
+特点：使用互斥锁而非读写锁，读操作之间也需串行。
+
+#### 路径二：HTTP API — 关键时序差异
+
+`AddStaticLease` 的加锁/写盘时序与新版不同：
+
+```go
+// v4_unix.go:385-438
+func (s *v4Server) AddStaticLease(l *dhcpsvc.Lease) (err error) {
+    // ... 前置参数校验（MAC/hostname/IP 合法性，无锁） ...
+
+    err = s.updateStaticLease(l)
+    // updateStaticLease() 内部（v4_unix.go:518-533）:
+    //   s.leasesLock.Lock()        ① 加锁
+    //   s.rmDynamicLease(l)        ② 改内存
+    //   s.addLease(l)              ③ 改内存
+    //   s.leasesLock.Unlock()      ④ ← 在这里就释放锁了！
+
+    // ⑤ 锁已释放，此时才触发通知写盘
+    s.conf.notify(LeaseChangedDBStore)  // → onNotify() → s.dbStore()
+    s.conf.notify(LeaseChangedAddedStatic)
+    return nil
+}
+```
+
+**与新版的根本差异**：
+- 新版：`Lock → 改内存 → dbStore(持锁写盘) → Unlock`
+- 旧版：`Lock → 改内存 → Unlock → dbStore(无锁读内存写盘)`
+
+`dbStore()` 在旧版中读取内存时**不持有任何锁**：
+
+```go
+// db.go:152-167
+func (s *server) dbStore() (err error) {
+    leases := []*dbLease{}
+    for _, l := range s.srv4.getLeasesRef() {  // ← 直接读 s.srv4.leases 切片，无锁
+        leases = append(leases, fromLease(l))
+    }
+    // ... v6 同理 ...
+    return writeDB(s.conf.dbFilePath, leases)
+}
+
+// v4_unix.go:180-182
+func (s *v4Server) getLeasesRef() []*dhcpsvc.Lease {
+    return s.leases   // 直接返回内部切片引用，不做复制
+}
+```
+
+#### 路径三：配置接口 — dbLoad → ResetLeases
+
+```go
+// db.go:138-147（dbLoad 的最后几步）
+func (s *server) dbLoad() (err error) {
+    // ... JSON 解析（无锁）...
+    err = s.srv4.ResetLeases(leases4)  // ← ResetLeases 内部持有 leasesLock
+    // ...
+}
+
+// v4_unix.go:148-177
+func (s *v4Server) ResetLeases(leases []*dhcpsvc.Lease) (err error) {
+    s.leasesLock.Lock()              // ① 加锁
+    defer s.leasesLock.Unlock()
+
+    s.leasedOffsets = newBitSet()    // ② 全部清空
+    s.hostsIndex = make(map[...], ...)
+    s.ipIndex = make(map[...], ...)
+    s.leases = nil
+
+    for _, l := range leases {       // ③ 逐条重建
+        err = s.addLease(l)
+    }
+    // ④ defer Unlock() — 全程无磁盘 IO
+    return nil
+}
+```
+
+注意：`ResetLeases` 本身不写盘，写盘由其调用方在外部完成：
+- 冷启动时 `dbLoad()` 只负责加载，加载完成后不立即写盘（读盘后回写无意义）
+- 配置变更时 `handleDHCPSetConfig` 流程结束后，**dbLoad 也不写盘**
+- 只有 `resetLeases()`（HTTP `/control/dhcp/reset`）会在 `ResetLeases` 之后显式调用 `dbStore()`，此时也不持锁
+
+### 9.4 死锁风险分析
+
+#### 新版 dhcpsvc：无死锁风险
+
+```
+结论：死锁风险 = 0
+```
+
+**理由**：
+1. **单把锁**：整个 DHCP 模块只使用 `leasesMu` 一把锁（`sync.RWMutex`），所有路径都只获取这一把锁
+2. **无嵌套**：没有任何代码路径出现 "持有 A 锁 → 获取 B 锁" 的嵌套加锁模式
+3. **锁时序一致**：所有写路径都是 `Lock → 内存操作 + dbStore → Unlock`，读路径 `RLock → 内存读 → RUnlock`
+4. **无回调环路**：`dbStore` 内部通过 `rangeLeases` 遍历只读，不会反过来触发需要锁的操作
+5. **defer 安全**：所有 `Lock()` 都紧跟 `defer Unlock()`，即使中间 `return` 或 panic 也能正确释放
+
+典型死锁所需的四个条件（互斥、持有并等待、不可抢占、循环等待）中，**循环等待**不成立，因此不可能发生死锁。
+
+#### 旧版 dhcpd：无死锁风险，但存在 data race
+
+```
+结论：死锁风险 = 0，但存在并发读写下的 data race
+```
+
+**死锁安全理由**：
+- 同样是单把锁架构（v4 的 `leasesLock` 和 v6 的 `leasesLock` 完全独立，互不影响）
+- v4 和 v6 之间没有互相调用的代码路径
+
+**data race 风险（旧版独有）**：
+
+时序图如下：
+
+```
+线程 A (HTTP API /control/dhcp/add_static_lease)
+  s.leasesLock.Lock()                              ▓▓ 持锁
+  s.rmDynamicLease() + s.addLease()                改内存
+  s.leasesLock.Unlock()                            ░░ 释放
+  s.conf.notify(DBStore)
+    → onNotify() → s.dbStore()
+       for _, l := range s.srv4.getLeasesRef() {   ░░ 无锁读 s.leases 切片
+           ... 读取 l.Hostname / l.Expiry ...      ← 正在遍历
+       }
+
+                    ← 时间线 →
+
+线程 B (eth0 goroutine 处理 DISCOVER)
+  s.leasesLock.Lock()                              ▓▓ 获取锁
+  s.addLease(l)
+    s.leases = append(s.leases, l)                 ← 修改 s.leases 切片！
+  s.leasesLock.Unlock()                            ░░ 释放
+```
+
+线程 A 在 **无锁状态** 下遍历 `s.leases` 切片，同时线程 B 可能持有锁正在 `append` 该切片 —— 这构成了 Go 的 data race（并发读写切片）。
+
+实际后果：
+- **理论最坏**：Go 运行时检测到并发 map 写入会直接 panic，但切片 append 的并发写通常不会被检测
+- **实际后果**：
+  - 遍历到的 `*Lease` 指针本身是内存安全的（指针复制是原子的）
+  - 可能漏掉刚 append 的租约，或读到重复的条目
+  - 但由于写 `leases.json` 是原子的（`maybe.WriteFile`），**磁盘文件不会损坏**
+  - 最坏情况是这次 `dbStore` 写入的数据不完整（少几条租约），下次变更时会纠正
+
+这是一个**可以工作但理论上不严谨**的设计，新版 dhcpsvc 通过持锁写盘消除了这个 race。
+
+### 9.5 加锁时序对比总表
+
+| 维度 | 新版 dhcpsvc | 旧版 dhcpd |
+|------|------------|-----------|
+| 锁类型 | `sync.RWMutex`（读写分离） | `sync.Mutex`（互斥） |
+| 锁数量 | 1 把全局锁 | v4/v6 各 1 把，互不干扰 |
+| DNS 查询加锁 | `RLock`（读之间可并行） | `Lock`（读也互斥） |
+| HTTP API 写盘时机 | **持锁状态下** dbStore | **锁释放后** dbStore |
+| 死锁风险 | 无 | 无 |
+| data race | 无 | 有（dbStore 无锁读切片） |
+| 锁持有时间 | 较长（含磁盘 IO） | 较短（仅内存操作） |
+| 吞吐量 | 读密集场景更优 | 写密集场景写锁释放更快 |
+
+---
+
+## 十、ResetLeases 重建索引过程的锁状态还原逻辑
+
+### 10.1 触发场景
+
+`ResetLeases` 在三种场景下被调用：
+
+| 场景 | 调用路径 | 输入来源 |
+|------|---------|---------|
+| 服务冷启动 | `dhcpd.Create()` → `dbLoad()` → `ResetLeases` | `leases.json` 文件解析结果 |
+| 配置变更重启 | `handleDHCPSetConfig()` → `dbLoad()` → `ResetLeases` | `leases.json` 文件解析结果 |
+| HTTP 重置 API | `/control/dhcp/reset` → `resetLeases()` → `ResetLeases(nil)` | 空切片（全部清空） |
+
+### 10.2 锁的获取与释放
+
+#### 新版 dhcpsvc — `Reset()`
+
+```go
+// server.go:249-269
+func (srv *DHCPServer) Reset(ctx context.Context) (err error) {
+    defer func() { err = errors.Annotate(err, "resetting leases: %w") }()
+
+    srv.leasesMu.Lock()          // ① 获取写锁
+    defer srv.leasesMu.Unlock()  // ② defer 注册：函数退出时必释放
+
+    for _, iface := range srv.interfaces4 {
+        iface.common.reset()     // ③ 清空各接口内存
+    }
+    // ... v6 同理 ...
+    err = srv.leases.clear(ctx, srv.logger)
+    // clear() 内部:
+    //   clear(idx.byAddr) / clear(idx.byName)  ← 清空全局 map
+    //   idx.dbStore(ctx, logger)               ← 持锁写空文件
+
+    return nil                   // ④ 函数返回 → defer Unlock 执行
+}
+```
+
+#### 旧版 dhcpd — `ResetLeases()`
+
+```go
+// v4_unix.go:148-177
+func (s *v4Server) ResetLeases(leases []*dhcpsvc.Lease) (err error) {
+    defer func() { err = errors.Annotate(err, "dhcpv4: %w") }()
+
+    if s.conf == nil {           // 未初始化直接跳过（无锁操作）
+        return nil
+    }
+
+    s.leasesLock.Lock()               // ① 获取互斥锁
+    defer s.leasesLock.Unlock()       // ② defer 注册
+
+    // ③ 全量重建 —— 先清空，再逐条加载
+    s.leasedOffsets = newBitSet()
+    s.hostsIndex = make(map[string]*dhcpsvc.Lease, len(leases))
+    s.ipIndex = make(map[netip.Addr]*dhcpsvc.Lease, len(leases))
+    s.leases = nil
+
+    for _, l := range leases {
+        if !l.IsStatic {
+            l.Hostname = s.validHostnameForClient(l.Hostname, l.IP)
+        }
+        err = s.addLease(l)
+        if err != nil {
+            // 单条失败仅记录日志，不中断，继续下一条
+            log.Error("dhcpv4: reset: re-adding a lease for %s (%s): %s",
+                l.IP, l.HWAddr, err)
+            continue   // ← continue 不触发 defer，锁仍持有
+        }
+    }
+
+    return nil              // ④ 正常返回 → defer Unlock 执行
+}
+```
+
+### 10.3 锁状态还原的三道防线
+
+#### 防线一：`defer Unlock()` 兜底
+
+无论函数以何种方式退出（正常 `return`、循环中 `continue`、中途 `return err`、甚至 panic），`defer` 注册的 `Unlock` 都会被执行：
+
+```go
+s.leasesLock.Lock()
+defer s.leasesLock.Unlock()  // 只要进入了这行，退出时必执行 Unlock
+
+// ... 任意代码路径 ...
+//   return nil            → defer 执行
+//   return err            → defer 执行
+//   continue (循环中)     → defer 不执行，锁继续持有，正确
+//   panic("xxx")          → defer 仍然执行，锁被释放
+```
+
+`continue` 在 `for` 循环中不会退出函数，所以 defer 不触发，锁继续保持——这是正确的行为，因为后续迭代仍在操作共享数据。
+
+#### 防线二：`defer errors.Annotate` 的执行顺序
+
+`ResetLeases` 有两个 defer 语句：
+
+```go
+defer func() { err = errors.Annotate(err, "dhcpv4: %w") }()   // 第一个注册
+// ...
+s.leasesLock.Lock()
+defer s.leasesLock.Unlock()                                    // 第二个注册
+```
+
+Go 的 `defer` 遵循 **LIFO（后进先出）** 顺序执行。因此退出时的实际顺序是：
+
+```
+退出顺序:
+  1. s.leasesLock.Unlock()            ← 先释放锁（第二个 defer）
+  2. err = errors.Annotate(err, ...)  ← 后包装错误（第一个 defer）
+```
+
+这个顺序是**正确且安全**的：锁被尽早释放，错误包装不涉及共享数据，可在无锁状态下自由执行。
+
+#### 防线三：内存操作的幂等与可恢复
+
+`ResetLeases` 采用"先全部清空、再逐条重建"的策略，中途部分失败不影响整体状态：
+
+```
+内存变化时序（持锁状态下）:
+
+  初始状态:  旧 leases[]、旧 ipIndex、旧 hostsIndex、旧 leasedOffsets
+       ↓
+  Step 1:   leasedOffsets = newBitSet()      ← 位图清零
+            hostsIndex = make(map[...])      ← 主机名索引空 map
+            ipIndex = make(map[...])         ← IP 索引空 map
+            leases = nil                     ← 切片置空
+       ↓  (此时内存处于"干净的空状态")
+  Step 2:   遍历 leases 参数:
+              l₁ → addLease(l₁) 成功        ← 写入 l₁
+              l₂ → addLease(l₂) 成功        ← 写入 l₂
+              l₃ → addLease(l₃) 失败 → continue，记录日志，跳过 l₃
+              l₄ → addLease(l₄) 成功        ← 写入 l₄
+       ↓
+  Step 3:   函数返回 → defer Unlock
+
+最终状态:  leases = [l₁, l₂, l₄]   (l₃ 因校验失败被丢弃，对应 JSON 文件中的坏条目)
+```
+
+这种设计的特点：
+- **坏条目不污染整体**：单条 `addLease` 失败（如 IP 重复、MAC 格式错误）不影响其他条目
+- **状态确定性**：清空后再重建，要么空、要么重建后的正确状态，不存在"旧数据+新数据混合"的中间状态被外部观察到
+- **无局部回滚需求**：不需要事务或回滚逻辑，因为清空是第一步，中途失败也只是少加载了几条
+
+### 10.4 无 `recover()` 的 panic 处理
+
+代码中**没有**显式的 `recover()` 语句：
+
+```go
+// 代码中不存在类似以下的 recover:
+// defer func() {
+//     if r := recover(); r != nil {
+//         s.leasesLock.Unlock()  // 不需要，因为 defer Unlock 已注册
+//     }
+// }()
+```
+
+这是因为 `defer s.leasesLock.Unlock()` **即使在 panic 时也会执行**。Go 语言保证：
+- `panic` 触发后，当前 goroutine 中所有已注册的 `defer` 都会被正常执行
+- 只有当 defer 本身 `panic` 才会打断后续 defer 的执行（但 `sync.Mutex.Unlock` 不会 panic，前提是不要重复解锁）
+
+因此即便 `addLease` 内部因某种极端情况（如 nil 指针、slice 越界）panic：
+1. 已注册的 `defer s.leasesLock.Unlock()` 会被执行 → 锁正确释放
+2. 已注册的 `defer errors.Annotate` 会被执行 → 但 `err` 返回值在 panic 场景下无意义，panic 会向上传播到 goroutine 栈顶
+3. 服务层如果有全局 recover（AdGuard Home 的 HTTP 中间件有），则请求返回 500，DHCP 服务本身不崩溃
+
+### 10.5 重建完成后的写盘时序
+
+#### 新版 dhcpsvc：持锁写盘
+
+```
+Reset() 流程:
+  Lock → 清内存 → clear() 内部 dbStore()（持锁）→ Unlock
+```
+
+`clear()` 在 `leaseindex.go:60-70` 中：
+
+```go
+func (idx *leaseIndex) clear(ctx context.Context, logger *slog.Logger) (err error) {
+    clear(idx.byAddr)
+    clear(idx.byName)
+    err = idx.dbStore(ctx, logger)   // ← 调用方 Reset() 已持有 leasesMu
+    return err
+}
+```
+
+#### 旧版 dhcpd：锁外写盘（仅 resetLeases 路径）
+
+```
+resetLeases()（HTTP /control/dhcp/reset）流程:
+  ResetLeases(nil)  →  Lock → 清内存 → Unlock
+    ↓
+  dbStore()         →  无锁状态下读内存写盘（有 data race 风险，见 9.4）
+```
+
+而冷启动 / 配置变更路径 `dbLoad()` 调用的 `ResetLeases` **不触发写盘**，因为刚从磁盘读入的数据没有必要立即回写。
+
+### 10.6 锁状态还原总结
+
+| 场景 | 锁获取 | 锁释放方式 | 还原正确性 |
+|------|-------|-----------|-----------|
+| 正常完成全部重建 | `Lock()` 入口 | `defer Unlock` 返回时 | ✓ |
+| 中途 `return err`（早期校验失败） | 不进入 Lock（`s.conf == nil`） | 无需释放 | ✓ |
+| 单条 `addLease` 失败 `continue` | `Lock()` 已持有 | 不释放，继续循环（正确） | ✓ |
+| 内部 panic | `Lock()` 已持有 | `defer Unlock` panic 时仍执行 | ✓ |
+| 并发读操作冲突 | — | RWMutex 天然互斥，写等待读完成 | ✓ |
+
+**设计评价**：`ResetLeases` 的锁还原机制是简洁而健壮的。它依靠 Go 的 `defer` 机制而非显式 `recover` 来保证锁释放，依靠"先清空再重建"的幂等策略避免部分状态泄露，依靠单锁架构避免死锁。唯一不够严谨的是旧版 `dbStore` 在锁外执行，但这属于写盘流程的设计缺陷，与锁还原逻辑本身无关。
+
+---
+
+## 十一、关键代码文件索引
 
 | 文件 | 核心职责 |
 |------|---------|
@@ -825,18 +1305,22 @@ func (s *server) handleDHCPSetConfig(w http.ResponseWriter, r *http.Request) {
 | `internal/dhcpsvc/interface.go:173-181` | `findExpiredLease` 查找过期 |
 | `internal/dhcpsvc/interface.go:229-267` | `reserveLease` 分配/回收 |
 | `internal/dhcpsvc/server.go:46-47` | `leasesMu` 全局读写锁 |
-| `internal/dhcpsvc/server.go:198-246` | 读操作 RLock 使用示例 |
-| `internal/dhcpsvc/server.go:252-403` | 写操作 Lock 使用示例 |
+| `internal/dhcpsvc/server.go:198-246` | DNS 查询路径 RLock 使用 |
+| `internal/dhcpsvc/server.go:249-269` | `Reset()` 配置接口路径锁还原 |
+| `internal/dhcpsvc/server.go:272-300` | `AddLease` HTTP API 路径加锁 |
+| `internal/dhcpsvc/server.go:303-403` | `UpdateStaticLease`/`RemoveLease` 加锁 |
 | `internal/dhcpsvc/v4.go:210` | 接口 indexMu 指向全局锁 |
-| `internal/dhcpsvc/handler4.go:63-84` | 请求类型分流 |
-| `internal/dhcpsvc/handler4.go:133-181` | REQUEST 二次分流 |
-| `internal/dhcpsvc/db.go:97-130` | `dbLoad` 加载逻辑 |
-| `internal/dhcpsvc/db.go:174-206` | `dbStore` 持久化（调用方需持锁） |
-| `internal/dhcpd/dhcpd.go:106-158` | `Create()` 启动入口 |
+| `internal/dhcpsvc/handler4.go` | 请求 goroutine 加锁示例 |
+| `internal/dhcpsvc/db.go:174-206` | `dbStore` 持锁前置条件 |
+| `internal/dhcpd/dhcpd.go:219-232` | `onNotify` DBStore 回调 |
 | `internal/dhcpd/v4_unix.go:45-46` | 旧版 `leasesLock` 互斥锁 |
-| `internal/dhcpd/v4_unix.go:147-177` | `ResetLeases` 重建内存索引 |
-| `internal/dhcpd/v4_unix.go:201-229` | `GetLeases` 查询时过滤过期项 |
+| `internal/dhcpd/v4_unix.go:147-177` | `ResetLeases` 重建索引与锁还原 |
+| `internal/dhcpd/v4_unix.go:179-182` | `getLeasesRef` 无锁返回切片引用 |
+| `internal/dhcpd/v4_unix.go:238-250` | `FindMACbyIP` DNS 查询路径加锁 |
+| `internal/dhcpd/v4_unix.go:385-438` | `AddStaticLease` HTTP API 路径加锁/写盘时序 |
+| `internal/dhcpd/v4_unix.go:518-533` | `updateStaticLease` 锁内改内存 |
 | `internal/dhcpd/db.go:93-149` | 旧版 `dbLoad` 完整流程 |
+| `internal/dhcpd/db.go:152-167` | 旧版 `dbStore` 无锁读内存写盘 |
 | `internal/dhcpd/migrate.go:63-105` | 旧格式数据迁移 |
 | `internal/dhcpd/http_unix.go:318-380` | 配置变更时的重载流程 |
 | `internal/dhcpd/http_unix.go:787-800` | HTTP API 端点注册 |
