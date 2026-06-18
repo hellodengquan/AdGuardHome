@@ -203,6 +203,103 @@ func (s *StatsCtx) Close() (err error) {
 - 发送 SIGTERM 后，如果能在 `db.Swap(nil)` 和后续 `db.Close()` 之间完成写入 → 数据完整
 - 如果 SIGKILL / 断电在 `Close()` 之前到达 → 当前小时数据全部丢失（与运行时掉电窗口一致）
 
+### 2.4 掉电恢复与反序列化失败容错
+
+#### 2.4.1 GOB 反序列化失败的处理
+
+`loadUnitFromDB()` `unit.go:277-297` 中，如果 GOB 解码失败（典型场景：掉电导致写入半截数据、文件系统损坏、版本升级导致结构不兼容）：
+
+```go
+func (s *StatsCtx) loadUnitFromDB(tx *bbolt.Tx, id uint32) (udb *unitDB) {
+    bkt := tx.Bucket(idToUnitName(id))
+    if bkt == nil { return nil }          // 桶不存在 → nil，上层用空桶补位
+    // ...
+    err := gob.NewDecoder(&buf).Decode(udb)
+    if err != nil {
+        s.logger.Error("gob decode", slogutil.KeyError, err)  // 只打 Error 日志
+        return nil                                                // 返回 nil
+    }
+    return udb
+}
+```
+
+**容错策略：失败即丢弃，不抛出错误**。返回 `nil` 后由上层 `deserialize()` 处理：
+
+```go
+// unit.go:301-314
+func (u *unit) deserialize(udb *unitDB) {
+    if udb == nil { return }          // nil 直接跳过，保持空桶状态
+    // ... 正常赋值
+}
+```
+
+#### 2.4.2 启动加载阶段的错误传播
+
+`New()` `stats.go:155-214` 中有三处容错：
+
+| 错误点 | 代码位置 | 处理方式 | 是否影响启动 |
+|---|---|---|---|
+| `openDB()` 打开失败 | `stats.go:187` | 直接 return err | ✅ 启动失败 |
+| `Begin(true)` 事务开启失败 | `stats.go:195` | 直接 return err | ✅ 启动失败 |
+| `finishTxn()` 提交失败 | `stats.go:203-206` | 仅 Error 日志，继续 | ❌ 不影响启动 |
+| `loadUnitFromDB()` 加载当前桶失败 | `stats.go:201` | udb=nil，deserialize 跳过 | ❌ 不影响启动 |
+
+> ⚠️ **重要边界**：bbolt 数据库文件如果整体损坏（如头部 magic number 不对），`bbolt.Open()` 会返回错误，导致整个 stats 模块初始化失败，进程启动失败。这是一种 fail-fast 策略，避免在损坏的数据库上继续写入造成更大破坏。
+
+#### 2.4.3 loadUnits 时的损坏桶补位
+
+读取 API 路径上 `loadUnits()` `stats.go:572-625` 对每个桶做容错：
+
+```go
+for i := firstID; i != curID; i++ {
+    u := s.loadUnitFromDB(tx, i)
+    if u == nil {
+        u = &unitDB{NResult: make([]uint64, resultLast)}  // 空桶补位
+    }
+    units = append(units, u)
+}
+```
+
+**行为**：如果中间某个历史桶损坏了（GOB 解码失败），它会被一个全零的空桶替代，不影响后续桶的读取。Dashboard 上对应那个小时的数据会显示为 0，而不是整个图表崩溃。
+
+#### 2.4.4 flushDB 事务回滚后的内存桶状态
+
+这是最精妙也最容易被忽略的边界。`flushDB()` `stats.go:446-489` 的执行顺序：
+
+```go
+func (s *StatsCtx) flushDB(id, limit uint32, ptr *unit) (cont bool, sleepFor time.Duration) {
+    isCommitable := true
+    tx, err := db.Begin(true)        // ① 开启事务
+    defer func() { finishTxn(tx, isCommitable) }()  // ⑤ 最后提交/回滚
+
+    s.curr = newUnit(id)             // ② 先换桶！事务还没提交
+
+    udb := ptr.serialize()           // ③ 旧桶序列化
+    flushErr := s.flushUnitToDB(udb, tx, ptr.id)  // ④a 写旧桶到 DB
+    delErr := tx.DeleteBucket(id - limit)          // ④b 删最旧桶
+
+    // flushErr / delErr 严重 → isCommitable=false → 事务回滚
+    return true, 0
+}
+```
+
+**如果事务回滚了，内存桶状态如何？**
+
+| 位置 | 状态 |
+|---|---|
+| `s.curr` | **已经是新桶（ID = id）**，新的 `Update()` 会写入这个新桶 |
+| 旧桶数据 | `ptr` 是局部变量，函数返回后被 GC → **旧桶这一小时增量丢失** |
+| 磁盘状态 | 回滚后旧桶未写入、最旧桶未删除，与 flush 前一致 |
+
+**后果推演**：
+- 下一秒 `periodicFlush` 再次调用 `flush()`
+- `ptr.id == id`？不，因为 `s.curr.id = id`，而 `unitIDGen()` 还是返回 `id`（同一小时内）
+- 所以 `ptr.id == id` 为 **true**，不再触发 flush
+- 结果：新桶一直在内存中增长，直到**下一个整点**才会再次触发 flush
+- 丢失的是**上一个整点到本次失败之间**的所有数据（最多接近 1 小时）
+
+> 💡 **设计取舍**：先换桶再写库，好处是换桶瞬间完成，新的 DNS 查询不会被阻塞；代价是一旦写库失败，旧桶数据就丢了。这是一个"可用性优先于数据完整性"的选择——DNS 查询延迟比统计数据准确更重要。
+
 ---
 
 ## 三、读写并发互斥锁真实代码位置与锁顺序
@@ -723,7 +820,90 @@ func (s *StatsCtx) fillCollectedStatsDaily(
 
 ---
 
-## 八、完整数据流总结
+## 八、HTTP API 暴露口与调用链
+
+### 8.1 stats 模块注册的所有端点
+
+`initWeb()` `http.go:300-310` 在 `Start()` 时调用，通过 `aghhttp.Registrar` 接口注册到上层 HTTP 路由：
+
+```go
+// http.go:300-310
+func (s *StatsCtx) initWeb() {
+    s.httpReg.Register(http.MethodGet, "/control/stats", s.handleStats)
+    s.httpReg.Register(http.MethodPost, "/control/stats_reset", s.handleStatsReset)
+    s.httpReg.Register(http.MethodGet, "/control/stats/config", s.handleGetStatsConfig)
+    s.httpReg.Register(http.MethodPut, "/control/stats/config/update", s.handlePutStatsConfig)
+
+    // Deprecated handlers.
+    s.httpReg.Register(http.MethodGet, "/control/stats_info", s.handleStatsInfo)
+    s.httpReg.Register(http.MethodPost, "/control/stats_config", s.handleStatsConfig)
+}
+```
+
+| 方法 | 路径 | 处理器 | 说明 |
+|---|---|---|---|
+| GET | `/control/stats` | `handleStats` | 获取统计数据（Dashboard 主数据） |
+| POST | `/control/stats_reset` | `handleStatsReset` | 重置（清空所有统计数据） |
+| GET | `/control/stats/config` | `handleGetStatsConfig` | 获取统计配置（新 API） |
+| PUT | `/control/stats/config/update` | `handlePutStatsConfig` | 更新统计配置（新 API） |
+| GET | `/control/stats_info` | `handleStatsInfo` | ⚠️ 废弃，获取统计间隔 |
+| POST | `/control/stats_config` | `handleStatsConfig` | ⚠️ 废弃，设置统计间隔 |
+
+### 8.2 handleStats 完整调用链路
+
+Dashboard 拉取数据的主路径：
+
+```
+GET /control/stats?recent=720
+  │
+  ▼
+handleStats(w, r)  [http.go:60-97]
+  ├─ 解析 recent 参数 → parseRecent()  [http.go:101-122]
+  │     └─ 校验：必须是 1 小时的整数倍，且在 [1h, limit] 范围内
+  ├─ confMu.RLock 读 s.limit 快照  [http.go:67-72]
+  └─ s.getData(uint32(limit.Hours()))  [unit.go:412-436]
+        ├─ s.loadUnits(limit)  [stats.go:572-625]
+        │     ├─ currMu.RLock
+        │     ├─ db.Begin(true)  // 用可写事务确保读到最新提交
+        │     ├─ 循环加载 limit 个历史桶（损坏则补空桶）
+        │     ├─ finishTxn(tx, false)  // 只读，回滚
+        │     └─ 追加 curr.serialize() 的当前桶
+        └─ s.dataFromUnits(units, curID)  [unit.go:439-480]
+              ├─ topsCollector() × 3 (Queried/Blocked/Clients)
+              ├─ topUpstreamsPairs()
+              ├─ fillCollectedStats()  // 时段序列
+              └─ 总计计数器累加
+  │
+  ▼
+JSON 响应 (StatsResp)
+```
+
+### 8.3 配置更新调用链
+
+```
+PUT /control/stats/config/update
+  │
+  ▼
+handlePutStatsConfig(w, r)  [http.go:227-282]
+  ├─ JSON 解码 body → getConfigResp
+  ├─ 构造新 IgnoreEngine
+  ├─ 校验 ivl 合法性（1h ~ 1y）
+  ├─ confMu.Lock
+  ├─ 同步更新 s.ignored / s.limit / s.enabled
+  └─ configModifier.Apply(ctx)  // 异步持久化到配置文件
+```
+
+### 8.4 关于 Prometheus / metrics
+
+**stats 模块本身不暴露 Prometheus metrics 端点**。搜索整个代码库未发现 stats 相关的 prometheus 指标注册。AdGuard Home 的 /metrics 如果存在，也是在更上层（home 模块或全局）实现，不通过 stats 包提供。
+
+stats 包的核心职责是：
+1. 收集 DNS 查询统计数据（内存 + bbolt 持久化）
+2. 通过 `/control/stats` HTTP 接口返回 Dashboard 所需的 JSON 格式数据
+
+---
+
+## 九、完整数据流总结
 
 ```
          DNS 请求到达
@@ -792,15 +972,20 @@ func (s *StatsCtx) fillCollectedStatsDaily(
 
 ---
 
-## 九、关键设计要点
+## 十、关键设计要点
 
 1. **写入零 I/O**：实时查询只累加内存 map，不会阻塞 DNS 响应
-2. **整点原子切桶**：`currMu.Lock` 下替换 `s.curr` 指针 + bbolt 事务保证"写新删旧"原子性
+2. **先换桶再写库**：`flushDB()` 先替换 `s.curr` 指针再写 bbolt，换桶瞬间完成；代价是写库失败时旧桶数据丢失（可用性 > 完整性）
 3. **批量截断**：每小时仅保留 Top 100 各类别，控制存储膨胀
 4. **滑动窗口淘汰**：切桶时原子替换 + 删除过期桶，数据量恒定
 5. **双次过滤**：写入时检查忽略列表，读取时再检查，支持配置热更新
 6. **双锁顺序约定**：`confMu → currMu → bbolt 事务`，代码注释明确标注，防止死锁
-7. **UTC 桶 ID**：使用绝对小时数（Unix÷3600）作为桶 ID，天然免疫时区和 DST 对桶连续性的干扰
-8. **按天 UTC 对齐**：`countHours` 基于桶 ID 的 `mod 24` 裁剪，"今日"是 UTC 自然日而非本地日历日
-9. **掉电窗口最多 1 小时**：只有整点 flush 和 Close() 会落盘，期间异常退出会丢失当前小时内存桶
-10. **粒度自适应**：时段图表自动在"小时/天"间切换，平衡数据精度与展示密度
+7. **损坏即丢弃**：GOB 反序列化失败只打 Error 日志并返回 nil，上层用空桶补位，单个桶损坏不影响整体读取
+8. **空桶补位**：`loadUnits()` 中损坏/缺失的历史桶用全零 `unitDB` 填补，Dashboard 不会因为某个桶损坏而崩溃
+9. **Fail-Fast 启动**：bbolt 文件整体损坏（头部 magic 不对）时 `Open()` 直接报错，stats 模块初始化失败，进程启动失败
+10. **UTC 桶 ID**：使用绝对小时数（Unix÷3600）作为桶 ID，天然免疫时区和 DST 对桶连续性的干扰
+11. **按天 UTC 对齐**：`countHours` 基于桶 ID 的 `mod 24` 裁剪，"今日"是 UTC 自然日而非本地日历日
+12. **掉电窗口最多 1 小时**：只有整点 flush 和 Close() 会落盘，期间异常退出会丢失当前小时内存桶
+13. **粒度自适应**：时段图表自动在"小时/天"间切换，平衡数据精度与展示密度
+14. **Registrar 解耦**：HTTP 路由通过 `aghhttp.Registrar` 接口注入，stats 模块不直接依赖 web server，便于单元测试
+15. **无 Prometheus 指标**：stats 模块只提供 JSON Dashboard API，不暴露 prometheus metrics，监控指标由上层模块负责
