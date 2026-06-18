@@ -383,6 +383,89 @@ s.curr.add(e)
 
 > ⚠️ **绝不允许**反过来 `currMu → confMu`，也不允许持有 bbolt 事务后再去请求 currMu，否则会形成死锁（bbolt 事务内部也有锁）。
 
+### 3.4 多实例/集群部署：桶 ID 全局唯一性与 bbolt 文件锁
+
+#### 3.4.1 桶 ID 在多实例下的唯一性
+
+桶 ID 计算只依赖 `time.Now().Unix()` 这一个全局一致输入：
+
+```go
+// unit.go:184-188
+func newUnitID() (id uint32) {
+    const secsInHour = int64(time.Hour / time.Second)
+    return uint32(time.Now().Unix() / secsInHour)
+}
+```
+
+**唯一性分析**：
+
+| 场景 | 是否唯一 | 说明 |
+|---|---|---|
+| 单进程单实例 | ✅ 绝对唯一 | 自增序列，不可能重复 |
+| 同主机多进程（端口不同） | ⚠️ 同小时 ID 相同 | 两进程同一小时桶 ID 完全相同，但 bbolt 文件锁**阻止共享同一 db 文件** |
+| 多主机集群（NTP 同步） | ⚠️ 同小时 ID 相同 | 各节点桶 ID 相同，但各写各自本地 db，**不做跨节点合并** |
+| 多主机集群（时钟漂移 1h 内） | ❌ 不唯一 | 不影响各节点独立统计准确性，只是各节点按自己的本地时间切桶 |
+
+**结论：stats 模块完全不支持集群部署下的跨节点统计合并。** AdGuard Home 是单节点设计：
+
+- **Config 无节点标识**：无 Node/hostname 字段，无法区分桶数据来自哪台机器
+- **无分布式锁**：只有进程内 mutex + 本机文件锁，不支持跨节点协调
+- **无跨节点聚合 API**：`/control/stats` 只返回本节点数据
+- **桶 ID 仅为时间轴坐标**：各节点写自己的内存桶和 bbolt 文件，互不干扰。如需集群汇总统计，必须由上层工具拉取各节点 API 后在外部聚合 Dashboard
+
+#### 3.4.2 bbolt 文件锁的处理路径
+
+`openDB()` 使用 `bbolt.Open(filename, 0644, nil)`，传 `nil` 作为 `Options`，即使用 bbolt 全部默认值：
+
+```go
+// stats.go:389-418
+func (s *StatsCtx) openDB() (err error) {
+    s.logger.Debug("opening database")
+    var db *bbolt.DB
+    db, err = bbolt.Open(s.filename, aghos.DefaultPermFile, nil)
+    if err != nil {
+        if err.Error() == "invalid argument" {
+            // ... 文件系统不支持 mmap/文件锁的提示
+        }
+        return err
+    }
+    s.db.Store(db)
+    return nil
+}
+```
+
+bbolt 默认文件锁行为（基于 bbolt v1.x 源码）：
+- **`Options.Timeout = 0`**：获取文件锁**无限期阻塞**，不返回超时错误
+- **排他锁**：使用 `flock(LOCK_EX)`（BSD/Linux）或 `LockFileEx`（Windows）对整个 db 文件加排他锁
+- **`NoFreelistSync = false`**：每次写事务提交时同步 freelist 页，崩溃恢复安全但略慢
+- **`NoSync = false`**：每次写事务调用 `fdatasync`/`fsync` 刷盘，确保数据持久化
+
+**多进程冲突场景**：
+
+| 场景 | bbolt 行为 | 进程表现 |
+|---|---|---|
+| 同主机起两个 AGH 指向同一 stats.db | `Open()` 中 `flock` 阻塞 | 进程 2 启动 Hang 死等，直到进程 1 `Close()` 释放锁 |
+| 进程 A 写事务中，进程 A 内另一 goroutine 开读事务 | bbolt 内部读写锁（mmap 读写） | 正常并发，bbolt 内部保证单写多读 |
+| 不同主机通过 NFS 共享 stats.db | **未定义行为**：NFS `flock` 实现各异，可能绕过锁 | 可能出现数据库损坏，绝对不推荐 |
+
+#### 3.4.3 掉电后 bbolt 一致性
+
+bbolt 的 Crash-Safety 来自三个机制：
+
+1. **写时复制（CoW B+tree）**：写事务从不修改正在使用的页，先写入新页，元数据页切换指针
+2. **`fdatasync` 刷盘**：`NoSync=false` 时提交前刷脏页到磁盘，确保下一个事务开始前新页物理持久
+3. **元数据页双写**：有两份 meta page，刷盘时交替写 page 0 和 page 1，避免掉电刚好写坏 meta
+
+**掉电后果矩阵**：
+
+| 掉电时机 | 后果 |
+|---|---|
+| 写事务 `fdatasync` 之前 | 本次事务所有变更丢失，db 回到上一次提交状态（安全） |
+| `fdatasync` 过程中断电 | 取决于 meta page：如果新 meta 已成功写入 → 新事务生效；如果 meta 未完整写入 → 从旧 meta 恢复，仍安全 |
+| `Close()` 写入过程中断电 | 当前桶写一半 → GOB 反序列化时 `Decode` 失败 → 返回 nil → 空桶补位（仅丢失这一小时） |
+
+综上：**单个桶损坏不影响其他桶，整体数据库不会结构性损坏**（除非 NFS/VM 环境下文件系统本身丢写）。
+
 ---
 
 ## 四、DST 跨日切换与 countHours 桶数组截断边界
@@ -901,6 +984,132 @@ stats 包的核心职责是：
 1. 收集 DNS 查询统计数据（内存 + bbolt 持久化）
 2. 通过 `/control/stats` HTTP 接口返回 Dashboard 所需的 JSON 格式数据
 
+### 8.5 stats 端点的中间件挂载链与限流
+
+stats 模块的 6 个 HTTP 端点**不单独配置限流或中间件**，所有中间件都是通过上层 home 模块的 `aghhttp.DefaultRegistrar` 在注册时统一注入的。
+
+#### 8.5.1 Registrar 注入链路
+
+整个挂载流程从 home 启动开始：
+
+```
+home.go:772-774  setupContext()
+  ├─ mw := &webMw{}
+  ├─ mux := http.NewServeMux()
+  └─ httpReg := aghhttp.NewDefaultRegistrar(mux, mw.wrap)
+            │
+            ▼
+  dns.go:57-73  initStats()
+    ├─ statsConf.HTTPReg = httpReg  // 注入 stats.Config
+    └─ stats.New(statsConf)
+            │
+            ▼
+  stats.go:240  Start()
+    └─ initWeb()  [http.go:300-310]
+          └─ s.httpReg.Register(GET, "/control/stats", s.handleStats)
+                    │
+                    ▼
+      aghhttp/registrar.go:46-48  DefaultRegistrar.Register()
+        ├─ wrapped := r.wrapFn(method, h)   // 调用 mw.wrap 注入中间件
+        └─ r.mux.Handle(path, wrapped)
+```
+
+#### 8.5.2 webMw.wrap 注入的中间件
+
+`control.go:232-247` — `webMw.wrap()` 在每个 handler 注册时注入三层中间件：
+
+```
+mw.wrap(method, handler)
+  └─ mw.ensureMw(method, handler)
+        └─ web.postInstallHandler(
+              gziphandler.GzipHandler(
+                  web.ensure(method, handler)
+              )
+           )
+```
+
+| 中间件 | 代码位置 | 作用 |
+|---|---|---|
+| `ensure()` | `control.go:251-280` | 校验 HTTP method 匹配；校验 `X-Forwarded-For` 信任链 |
+| `gziphandler.GzipHandler` | `control.go:236` | 启用 gzip 响应压缩 |
+| `postInstallHandler` | `control.go:380-394` | 首次安装后禁止访问安装页（检查 `!a.isFirstRun()`） |
+
+#### 8.5.3 HTTP Server 外层再加的三层中间件
+
+在 `web.go:266-274` 创建 HTTP Server 时，在 mux 外面再包三层全局中间件：
+
+```
+http.Server.Handler =
+  web.auth.middleware().Wrap(          // ① 最外层：Session Cookie 认证
+      logMw.Wrap(                      // ② 访问日志
+          withMiddlewares(mux,         // ③ mux 基础 + 中间件数组
+              limitRequestBody         //    请求体大小限制
+          )
+      )
+  )
+```
+
+**从外到内的完整调用链（stats 端点请求）：**
+
+```
+外部请求 → http.Server
+  │
+  ├─ [1] auth.middleware()  [auth.go:159-190]
+  │     ├─ 跳过白名单路径（/login, /apple/*, /robots.txt, DoH/DoT 端口路径）
+  │     ├─ 读取 Session Cookie / Authorization Bearer
+  │     ├─ session.Valid() 校验（查 sessions bbolt DB）
+  │     └─ 认证失败 → 403 Forbidden，或跳 /install.html
+  │
+  ├─ [2] logMw.Wrap()  [web.go:271]
+  │     └─ Debug 日志记录请求 method/path
+  │
+  ├─ [3] limitRequestBody()  [middlewares.go:58-74]
+  │     ├─ 默认 64KB body（stats 端点全部是 GET，所以其实不生效）
+  │     └─ 仅 /control/access/set、/control/filtering/set_rules 放宽到 4MB
+  │
+  ├─ [4] http.ServeMux → 路由匹配到 "/control/stats"
+  │
+  ├─ [5] postInstallHandler()  [control.go:380-394]
+  │     └─ 首次运行拦截（AGH 配置完成前才触发）
+  │
+  ├─ [6] gziphandler.GzipHandler()
+  │     └─ 根据 Accept-Encoding 启用 gzip 压缩
+  │
+  └─ [7] web.ensure() + s.handleStats()  [stats/http.go:60]
+        ├─ method 校验（GET vs 注册时的 method）
+        ├─ X-Forwarded-For 校验
+        └─ handleStats() 执行真正逻辑
+```
+
+#### 8.5.4 登录限流 vs stats 端点限流
+
+**注意：loginRateLimiter 只作用于登录接口，不限制 stats 端点。**
+
+```go
+// authratelimiter.go:12-16
+type loginRateLimiter interface {
+    check(usrID string) (left time.Duration)
+    inc(usrID string)
+}
+```
+
+- 仅在 `/control/login` 处理中调用 `check()` + `inc()`，防止暴力破解
+- stats 端点（GET/POST）**没有 QPS 限流或并发控制**，完全由 Session 认证作为门禁
+- **唯一的"限流"**是认证本身：未登录或会话过期直接 403，无法访问任何 stats 接口
+
+#### 8.5.5 HTTPS/TLS/HTTP3 同样的中间件链
+
+`web.go:365-369`（HTTPS）和 `web.go:433`（HTTP/3）创建的 Server 复用完全相同的中间件链，只是多一层 TLS 握手：
+
+```go
+// web.go:369
+Handler: web.auth.middleware().Wrap(
+    logMw.Wrap(
+        withMiddlewares(web.conf.mux, limitRequestBody)
+    )
+)
+```
+
 ---
 
 ## 九、完整数据流总结
@@ -989,3 +1198,8 @@ stats 包的核心职责是：
 13. **粒度自适应**：时段图表自动在"小时/天"间切换，平衡数据精度与展示密度
 14. **Registrar 解耦**：HTTP 路由通过 `aghhttp.Registrar` 接口注入，stats 模块不直接依赖 web server，便于单元测试
 15. **无 Prometheus 指标**：stats 模块只提供 JSON Dashboard API，不暴露 prometheus metrics，监控指标由上层模块负责
+16. **单节点设计**：不支持跨节点统计合并，Config 无节点标识、无分布式锁、无聚合 API，集群统计必须在上层拉取各节点 API 后外部合并
+17. **bbolt 排他文件锁**：使用默认 Options（Timeout=0 无限期阻塞），多进程指向同一 db 文件时第二个进程启动 Hang 死等，避免同时写导致损坏
+18. **CoW 崩溃安全**：bbolt 写时复制 + meta 双写 + `fdatasync` 刷盘，掉电后要么整事务生效要么整体回退，不会出现半写入的结构性损坏
+19. **双层中间件注入**：Registrar 时注入 3 层（ensure+gzip+postInstall），Server 外层再包 3 层（auth+log+bodyLimit），共 7 层调用链，stats 自身不配置限流
+20. **Session 认证即门禁**：stats 端点无独立 QPS 限流，仅靠 `auth.middleware()` Session 校验控制访问，未登录直接 403
