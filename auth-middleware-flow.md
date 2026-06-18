@@ -742,7 +742,107 @@ mw.logger.ErrorContext(ctx, "no authentication cookie", slogutil.KeyError, err)
 mw.logger.DebugContext(ctx, "authentication token has expired")
 ```
 
-### 10.5 通用 API 错误审计
+### 10.5 审计日志下游 Sink
+
+AdGuard Home 没有独立的审计日志系统，所有鉴权相关日志**直接通过主日志管道输出**。以下是完整的日志写入链路。
+
+#### 10.5.1 日志初始化入口
+
+**位置**：[internal/next/cmd/log.go:13-39](internal/next/cmd/log.go#L13-L39)
+
+```go
+func newBaseLogger(opts *options) (baseLogger *slog.Logger) {
+    var output io.Writer
+    switch opts.confFile {
+    case "stdout":
+        output = os.Stdout
+    case "stderr":
+        output = os.Stderr
+    case "syslog":
+        // TODO(a.garipov):  Add a syslog handler to golibs.
+    default:
+        // TODO(a.garipov):  Use the path.
+    }
+
+    return slogutil.New(&slogutil.Config{
+        Output: output,           // 输出 sink
+        Format: slogutil.FormatText,  // 格式：文本
+        Level:  lvl,              // 级别：Info / Debug
+        AddTimestamp: true,
+    })
+}
+```
+
+#### 10.5.2 完整的日志 Sink 链路
+
+```
+slog.Logger.ErrorContext() / InfoContext() / DebugContext()
+    ↓
+golibs/logutil/slogutil  (标准库 slog 的包装层)
+    ↓
+slog.TextHandler (标准库)
+    ↓
+io.Writer (os.Stdout / os.Stderr)
+    ↓
+进程标准输出 / 标准错误
+    ↓
+由 systemd / docker / 终端 等外部环境收集
+```
+
+**关键说明**：
+
+| 项目 | 值 | 说明 |
+|------|---|------|
+| 日志框架 | Go 标准库 `log/slog` | 结构化日志 |
+| 格式 | `slogutil.FormatText` | 文本格式（非 JSON） |
+| 默认输出 | `os.Stderr` | 标准错误输出 |
+| 可选输出 | `os.Stdout` / syslog（TODO） | 通过命令行配置 |
+| 文件输出 | **未实现** | `default:` 分支是 TODO |
+| 时间戳 | 启用 | `AddTimestamp: true` |
+| 日志级别 | Info（默认）/ Debug（verbose 模式） | |
+
+#### 10.5.3 鉴权日志的 Sink 路径
+
+**登录相关日志**：
+
+```
+handleLogin()
+    ↓
+web.logger.ErrorContext / InfoContext
+    ↓  (logger 来自 web.auth.logger, 继承自 baseLogger)
+baseLogger (slog.Logger 实例)
+    ↓
+slog.TextHandler
+    ↓
+os.Stderr
+```
+
+**Session 存储日志**：
+
+[internal/aghuser/sessionstorage.go:136-137](internal/aghuser/sessionstorage.go#L136-L137)
+
+```go
+bl = &bbolt.DefaultLogger{
+    Writer: slog.NewLogLogger(l.Handler(), slog.LevelDebug),
+}
+```
+
+bbolt 数据库的内部日志通过 `slog.NewLogLogger` 桥接到 `log.Logger` 接口，再转发回 slog handler。
+
+#### 10.5.4 审计能力评估
+
+| 审计需求 | 是否满足 | 说明 |
+|---------|---------|------|
+| 登录成功记录 | ✅ | `"successful login"` 含用户名和 IP |
+| 登录失败记录 | ✅ | `"invalid username or password"` 含 IP |
+| 限流封禁记录 | ✅ | `"auth: blocked for X"` 含 IP |
+| 未授权 API 访问 | ❌ | 仅 Debug 级别 `"no user found in request"`，不含 IP |
+| 登出记录 | ❌ | 未找到显式登出审计日志 |
+| 持久化审计文件 | ❌ | 仅输出到 stdout/stderr，无文件 sink |
+| 结构化审计字段 | ❌ | 日志非 JSON 格式，解析成本高 |
+| 独立审计通道 | ❌ | 鉴权日志与其他日志混在一起 |
+
+### 10.6 通用 API 错误审计
 
 [internal/aghhttp/aghhttp.go:31-53](internal/aghhttp/aghhttp.go#L31-L53)
 
@@ -850,6 +950,148 @@ func (ds *DefaultSessionStorage) FindByToken(ctx context.Context, t SessionToken
 | 实际会话有效期 | **取决于 Session TTL**（取较短者） | sessionstorage.go:330 |
 
 Cookie 365 天过期 ≠ 会话 365 天有效。Cookie 只是浏览器端保存 Token 的容器，实际会话有效期由服务端 Session TTL 决定。
+
+### 11.5 关于 "自动刷新" 注释的澄清
+
+配置注释中写道：
+
+[internal/home/config.go:195](internal/home/config.go#L195)
+
+```go
+// An active session is automatically refreshed once a day.
+```
+
+**但实际代码中并没有实现 session 自动刷新逻辑**。这是一个**文档与代码不一致**的问题：
+
+- 注释声称 "活跃会话每天自动刷新一次"
+- 但 `FindByToken` 方法仅检查过期，不更新 `Expire` 时间
+- 没有找到任何后台 goroutine 或定时刷新机制
+- `SessionStorage` 接口也没有 `Refresh` / `Extend` 方法
+
+> **结论**：该注释是历史遗留或计划中的功能描述，**当前版本（代码库现状）并未实现 session 自动刷新**。
+
+### 11.6 多 Tab 并发刷新的竞争路径分析
+
+由于 Session 没有续期机制，"多 Tab 同时刷新" 的并发竞争主要体现在**读取层面**。以下是并发安全设计的详细分析。
+
+#### 11.6.1 Session 存储的并发锁（单点锁）
+
+**锁定义**：[internal/aghuser/sessionstorage.go:74-75](internal/aghuser/sessionstorage.go#L74-L75)
+
+```go
+// mu protects sessions.
+mu *sync.Mutex
+```
+
+**锁粒度**：**全局单锁**（整个 storage 一个 Mutex）
+
+这就是所谓的"单点锁" —— 所有 session 操作共享同一个互斥锁。
+
+#### 11.6.2 各方法的锁持有范围
+
+| 方法 | 锁类型 | 锁内操作 | 锁外操作 | 代码位置 |
+|------|-------|---------|---------|---------|
+| `New` | 写锁（互斥） | 内存 map 写入 | bbolt 写入（store） | sessionstorage.go:338-343 |
+| `FindByToken` | 读锁（互斥） | 内存 map 查找 + 过期检查 + 删除 | 无 | sessionstorage.go:381-399 |
+| `DeleteByToken` | 写锁（互斥） | 内存 map 删除 + bbolt 删除 | 无 | sessionstorage.go:405-409 |
+
+**注意**：`New` 方法中，bbolt 数据库写入（`ds.store(s)`）是在锁外执行的，只有最后写入内存 map 时才加锁。这降低了锁的持有时间，但也意味着：
+
+1. bbolt 写入成功但加锁前如果有并发同 token 的删除，可能有不一致（但 token 是随机的，概率极低）
+2. 锁的粒度是"整个 sessions map"，而不是 per-session
+
+#### 11.6.3 多 Tab 并发刷新的实际执行流
+
+当用户打开多个 Tab 同时刷新页面时，每个 Tab 都会触发一次认证中间件：
+
+```
+Tab 1: GET /                    Tab 2: GET /
+    │                               │
+    ▼                               ▼
+authMiddlewareDefault.Wrap      authMiddlewareDefault.Wrap
+    │                               │
+    ▼                               ▼
+userFromCookie()                 userFromCookie()
+    │                               │
+    ▼                               ▼
+sessions.FindByToken(token)    sessions.FindByToken(token)
+    │                               │
+    └───────────┬───────────────────┘
+                │
+                ▼
+        ds.mu.Lock()  ← 串行化，只有一个能进入
+                │
+                ▼
+        内存 map 查找
+        过期检查（都不会过期，因为 TTL 30 天）
+        返回 session 指针
+                │
+                ▼
+        ds.mu.Unlock()
+                │
+    ┌───────────┴───────────────────┐
+    ▼                               ▼
+users.ByLogin(login)             users.ByLogin(login)
+    │                               │
+    ▼                               ▼
+db.mu.Lock()  ← 用户 DB 也是单点锁
+    │
+    ▼
+loginToUserID 映射查找
+返回 user 指针
+    │
+    ▼
+db.mu.Unlock()
+    │
+    ▼
+注入上下文 → 业务 Handler
+```
+
+**并发特征**：
+
+1. **读操作串行化**：所有 `FindByToken` 调用被 `ds.mu` 强制串行，N 个并发请求会排队
+2. **无 singleflight 合并**：N 个相同 token 的并发请求会执行 N 次相同的查找
+3. **锁持有时间很短**：仅内存 map 查找，无 IO，通常微秒级
+4. **对性能影响小**：因为锁内操作极快，即使并发很高也不会成为瓶颈
+
+#### 11.6.4 两层单点锁的嵌套关系
+
+认证中间件的完整调用路径中，存在**两层嵌套的单点锁**：
+
+```
+authMiddlewareDefault.handleAuthenticatedUser
+    ↓
+userFromCookie
+    ↓
+sessions.FindByToken  →  ds.mu.Lock()  [外层锁：session storage]
+    ├─ sessions map 查找
+    └─ ds.mu.Unlock()
+    ↓
+users.ByLogin  →  db.mu.Lock()  [内层锁：user DB]
+    ├─ loginToUserID 查找
+    └─ db.mu.Unlock()
+```
+
+两层都是**全局单锁**设计：
+- `ds.mu`：保护 session 内存 map
+- `db.mu`：保护用户数据的两个 map（`loginToUserID` 和 `userIDToUser`）
+
+#### 11.6.5 并发安全保证
+
+SessionStorage 接口明确要求所有方法必须并发安全：
+
+[internal/aghuser/sessionstorage.go:20](internal/aghuser/sessionstorage.go#L20)
+
+```go
+// All methods must be safe for concurrent use.
+```
+
+**安全保证方式**：
+- 读操作：`ds.mu.Lock()` → 内存查找 → `ds.mu.Unlock()`
+- 写操作：先写 bbolt（事务内）→ 再加锁写内存 map
+- 删除操作：加锁 → 删 bbolt → 删内存 → 解锁
+
+> **注意**：`New` 方法的 bbolt 写入在锁外执行，存在理论上的 TOCTOU 风险。但由于 session token 是 16 字节加密随机数，冲突概率可忽略不计，这是一个可接受的权衡。
 
 ---
 
@@ -1046,7 +1288,42 @@ ensure(method, handler)
 业务 handler
 ```
 
-### 13.3 用户上下文传递
+### 13.3 全局控制锁（controlLock）
+
+在路由级中间件的 `ensure` 方法中，所有数据修改操作（POST/PUT/DELETE）都会被**全局控制锁**串行化。
+
+**锁定义**：[internal/home/home.go:73](internal/home/home.go#L73)
+
+```go
+controlLock sync.Mutex
+```
+
+**锁的作用域**：全局单实例，保护所有 `control/*` 修改类 API 的并发执行。
+
+**挂载位置**：[internal/home/control.go:275-277](internal/home/control.go#L275-L277)
+
+```go
+if modifiesData(m) {
+    if !web.ensureContentType(w, r) {
+        return
+    }
+    globalContext.controlLock.Lock()
+    defer globalContext.controlLock.Unlock()
+}
+```
+
+**并发影响**：
+
+| 影响 | 说明 |
+|------|------|
+| 所有写操作串行 | POST/PUT/DELETE 请求会排队，同一时间只有一个能执行 |
+| 读操作不受影响 | GET 请求不持有该锁，可并发执行 |
+| 锁粒度粗 | 所有修改类 API 共享一把锁，而非 per-resource |
+| 锁持有时间长 | 整个业务 handler 执行期间都持有锁 |
+
+**典型场景**：多 Tab 同时提交配置修改时，请求会被强制串行，避免并发写入导致的配置不一致。
+
+### 13.4 用户上下文传递
 
 认证成功后，用户信息通过 Context 传递到业务层：
 
@@ -1078,7 +1355,7 @@ if !ok {
 name = string(u.Login)
 ```
 
-### 13.4 三种 Server 的中间件一致性
+### 13.5 三种 Server 的中间件一致性
 
 HTTP、HTTPS、HTTP/3 三个服务器使用相同的中间件链：
 
@@ -1110,4 +1387,7 @@ HTTP、HTTPS、HTTP/3 三个服务器使用相同的中间件链：
 | 路由注册器 | [internal/aghhttp/registrar.go](internal/aghhttp/registrar.go) |
 | HTTP 错误审计 | [internal/aghhttp/aghhttp.go](internal/aghhttp/aghhttp.go) |
 | 会话配置 | [internal/home/config.go](internal/home/config.go) |
+| 日志基础设置 | [internal/next/cmd/log.go](internal/next/cmd/log.go) |
+| 日志工具常量 | [internal/aghslog/aghslog.go](internal/aghslog/aghslog.go) |
+| 全局控制锁 | [internal/home/home.go](internal/home/home.go) |
 | Profile 鉴权消费示例 | [internal/home/profilehttp.go](internal/home/profilehttp.go) |
