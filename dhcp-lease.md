@@ -1695,7 +1695,273 @@ err = srv.leases.add(ctx, srv.logger, l, iface)
 | `internal/dhcpd/db.go:152-167` | 旧版 `dbStore` 全量遍历写盘（每次覆盖） |
 | `internal/dhcpd/db.go:189` | `maybe.WriteFile` 原子写入磁盘 |
 | `internal/dhcpd/v6_unix.go:234` | v6 `notify` 在 Lock 内调用（吞吐量问题） |
+| `internal/dhcpd/v6_unix.go:292` | v6 RemoveStaticLease notify 在 Lock 内 |
 | `internal/dhcpd/v6_unix.go:401` | v6 `commitDynamicLease` notify 在 Lock 内 |
 | `internal/dhcpd/migrate.go:63-105` | 旧格式数据迁移 |
 | `internal/dhcpd/http_unix.go:318-380` | 配置变更时的重载流程 |
 | `internal/dhcpd/http_unix.go:787-800` | HTTP API 端点注册 |
+
+---
+
+## 十四、异步写盘模式的可行性与代价分析
+
+第十二章指出 v6 把 `notify(DBStore)` 放在 `Lock()` 内部调用，导致写盘 IO 阻塞所有并发操作，吞吐量受影响。本章从代码层面分析：如果改成异步写盘（把 dbStore 放到后台 goroutine），会涉及哪些问题。
+
+### 14.1 仓库中现成的异步队列模式可参考
+
+仓库中已有两种成熟的异步/批量写盘模式，可以直接借鉴：
+
+#### 模式一：querylog — 阈值触发 + 异步 goroutine
+
+**核心代码**：`internal/querylog/qlog.go:219-264`
+
+```go
+// qlog.go:255-264
+if !l.flushPending && fileIsEnabled && l.buffer.Len() >= memSize {
+    l.flushPending = true
+
+    // TODO(s.chzhen):  Fix occasional rewrite of entires.
+    go func() {
+        flushErr := l.flushLogBuffer(ctx)
+        if flushErr != nil {
+            l.logger.ErrorContext(ctx, "flushing after adding", slogutil.KeyError, flushErr)
+        }
+    }()
+}
+```
+
+**模式特点**：
+- **触发条件**：内存缓冲 `buffer` 达到 `MemSize` 阈值
+- **去重机制**：`flushPending` 标志位，同一时间只有一个刷盘 goroutine 在跑
+- **同步锁**：`bufferLock` 保护内存缓冲，`fileFlushLock` 保护刷盘操作
+- **关闭时补刷**：`Shutdown()` 调用 `flushLogBuffer()` 强制落盘（`qlog.go:99-105`）
+- **数据结构**：环形缓冲 `container.RingBuffer`（用 `buffer.Push / Clear / Range` 操作）
+
+**可套用到 DHCP 的地方**：
+- `flushPending` 标志位模式可以直接复用，避免频繁触发异步刷盘
+- `fileFlushLock` 模式可以防止并发写同一文件
+
+**不适用的地方**：
+- querylog 是**增量追加**（append-only），DHCP 租约是**全量覆盖**（每次 dbStore 写完整快照）
+- querylog 丢几条日志问题不大，DHCP 租约丢失可能导致 IP 冲突
+
+#### 模式二：stats — 定时周期刷盘
+
+**核心代码**：`internal/stats/stats.go:239-242`、`stats.go:420-475`
+
+```go
+// stats.go:239-242
+func (s *StatsCtx) Start() {
+    s.initWeb()
+    go s.periodicFlush()   // 后台 goroutine 定时刷盘
+}
+
+// stats.go:420-441  flush() 循环
+func (s *StatsCtx) flush() (cont bool, sleepFor time.Duration) {
+    // 检查是否跨小时单位，是则刷盘
+    // 否则 sleep 1 秒再检查
+}
+```
+
+**模式特点**：
+- **触发条件**：按时间单位（小时）滚动，到点就刷
+- **存储引擎**：bbolt 嵌入式数据库（事务性写入）
+- **数据结构**：`currMu`（RWMutex）保护当前统计单元，刷盘时切换新单元
+
+**可套用到 DHCP 的地方**：
+- 定时刷盘 + 内存状态分离的思路可以借鉴
+- `Close()` 时强制刷盘的模式
+
+**不适用的地方**：
+- stats 是统计数据，丢失一两个小时的统计问题不大
+- DHCP 租约是状态数据，丢失有业务后果
+
+### 14.2 add / remove 高并发下异步写盘的实际节奏
+
+如果把 dbStore 改成异步，实际写盘节奏取决于三个因素：
+
+#### 因素一：触发策略
+
+| 策略 | 写盘频率 | 数据丢失窗口 | 适用场景 |
+|------|---------|------------|---------|
+| 每次变更都触发（debounce） | 等于变更频率 | debounce 窗口大小 | 低变更频率场景 |
+| 阈值触发（类似 querylog） | 达到 N 条变更才刷 | 最多 N-1 条丢失 | 高变更频率场景 |
+| 定时触发（类似 stats） | 固定时间间隔 | 最多一个时间间隔 | 对一致性要求不高 |
+
+**DHCP 的实际变更频率**：
+- 正常家庭/小型办公网络：每分钟几条到几十条 DISCOVER/REQUEST
+- 大规模网络（上千客户端）：可能每秒几条
+- DHCP 租约的变更都是"全量快照"式的，不像 querylog 是"增量追加"
+
+#### 因素二：全量快照 vs 增量追加
+
+DHCP 的 dbStore 是**全量遍历 + 整体覆盖**，这与异步模式有一个天然矛盾：
+
+```
+时间线:
+  T0: 内存状态 S0 → 触发异步 dbStore()，开始遍历 s.leases
+  T1: 变更 A（add L1）→ 内存状态 S1
+  T2: 变更 B（remove L2）→ 内存状态 S2
+  T3: 异步 dbStore 完成遍历，写入磁盘
+        ↓
+      写入的是哪个状态？
+      - 如果遍历过程中读的是实时内存：数据混乱（部分 S0 + 部分 S2）
+      - 如果遍历前拷贝了一份快照：写入的是 S0，漏掉了 A 和 B
+```
+
+**问题本质**：全量快照式写盘在异步模式下，要么读不一致（遍历中途数据被改），要么写的是过期数据（拍的是旧快照）。
+
+相比之下，querylog 的增量追加模式没有这个问题——新数据在 buffer 里，下次 flush 自然会写。
+
+#### 因素三：debounce 模式下的写盘合并
+
+如果用 debounce（每次变更触发，但等一小段时间再写，期间的变更合并到同一次写盘），写盘频率会从"每次变更一次"降为"每 debounce 窗口一次"。
+
+以 100ms debounce 窗口为例：
+- 100 QPS 的变更频率 → 写盘频率降至 10 次/秒
+- 500 QPS 的变更频率 → 写盘频率仍约 10 次/秒（窗口内合并）
+
+DHCP 的变更频率通常远低于这个量级，debounce 带来的吞吐量提升有限，但实现复杂度增加不少。
+
+### 14.3 重启时半截队列待写入会不会丢失？
+
+**结论：会丢失，除非在 Stop/Close 时强制刷盘。**
+
+#### querylog 的处理方式：
+
+```go
+// qlog.go:99-105  Shutdown 时强制刷盘
+func (l *queryLog) Shutdown(ctx context.Context) (err error) {
+    l.confMu.RLock()
+    defer l.confMu.RUnlock()
+
+    if l.conf.FileEnabled {
+        err = l.flushLogBuffer(ctx)   // 强制把缓冲里的数据刷到磁盘
+    }
+    return err
+}
+```
+
+**DHCP 如果改异步，需要做的事情**：
+
+1. **Stop() 时同步刷盘**：在 `server.Stop()` 或 `dhcpd.Stop()` 返回前，等待所有异步 dbStore 完成，必要时强制执行一次
+2. **配置变更时同步刷盘**：`handleDHCPSetConfig` 重建服务前，必须确保前一个实例的写盘都已完成
+3. **context 取消处理**：如果用 context 控制生命周期，取消时需要刷盘
+
+**极端场景下仍然可能丢失**：
+- 进程被 `kill -9` 强杀 → 所有待写入都丢失（这是任何设计都无法避免的）
+- 正常关闭（SIGTERM）→ 只要 Stop() 里有 flush 就不会丢
+
+**对 DHCP 的实际影响**：
+- 丢失几条动态租约 → 客户端下次 REQUEST 时找不到，走 INIT-REBOOT 重新验证，不影响使用
+- 丢失静态租约 → 配置变更后立即重启才会发生，概率极低
+- IP 重复分配 → 仅发生在"丢失租约 + 重启 + 该 IP 恰好被分配给新客户端"三重巧合
+
+### 14.4 leasedOffsets 位图与 ipIndex 在异步模式下能不能继续兜底？
+
+**结论：内存级别的 IP 唯一性保障完全不受影响，兜底能力 100% 保留。**
+
+#### 为什么不受影响：
+
+```
+内存操作路径（同步）：
+  addLease(l):
+    s.leasedOffsets.set(offset)    ← 在 Lock() 内执行，同步的
+    s.ipIndex[l.IP] = l             ← 在 Lock() 内执行，同步的
+    s.leases = append(s.leases, l)  ← 在 Lock() 内执行，同步的
+
+磁盘写入路径（异步）：
+  dbStore():
+    for _, l := range s.leases { ... }  ← 异步读取内存，可能读到不一致
+    writeDB(file, leases)                ← 异步写磁盘
+```
+
+**内存状态是同步更新的**，异步的只是"把内存快照写到磁盘"这一步。只要 `leasesLock` 正确保护了所有内存操作：
+- `leasedOffsets` 位图的正确性 ✔ 不受影响
+- `ipIndex` 哈希表的正确性 ✔ 不受影响
+- 新客户端分配 IP 时的唯一性检查 ✔ 不受影响
+
+**磁盘可能比内存"旧"几个版本**，但这是异步模式的正常现象，不影响运行时正确性。只有重启后从磁盘加载时，才会用到磁盘上的状态（见 14.3 节）。
+
+#### 类比理解：
+
+```
+内存 = 数据库的内存页（真实状态）
+磁盘 = 数据库的 WAL / 快照（持久化状态）
+
+异步写盘 ≈ 数据库的异步 checkpoint
+内存锁    ≈ 数据库的行锁/表锁
+
+只要锁保护了内存操作，运行时一致性就有保障；
+磁盘只是异步持久化，落后几个版本不影响正确性，
+最多就是崩溃恢复时丢失最后几次变更。
+```
+
+### 14.5 异步改造的取舍总结
+
+| 维度 | 当前 v6 同步写盘（Lock 内） | 改成异步写盘 |
+|------|-------------------------|-------------|
+| 吞吐量 | 低（写盘 IO 阻塞所有操作） | 高（内存操作立即返回） |
+| 实现复杂度 | 低 | 中（需加 flushPending、异步 goroutine、Stop 时 flush） |
+| 数据一致性 | 强（磁盘=内存） | 弱（磁盘可能落后内存几个版本） |
+| IP 唯一性保障 | ✔ 有 | ✔ 仍然有（内存级） |
+| 重启后数据丢失 | 不会 | 正常关闭不会，异常关闭可能会 |
+| 与现有代码风格一致性 | 差（v4 是同步+race） | 好（与 querylog/stats 模式一致） |
+| data race 风险 | 无（持锁写盘） | 需要仔细设计，否则可能引入新 race |
+
+**结论**：异步写盘在 DHCP 场景下是可行的，但收益有限。因为 DHCP 租约的变更频率远低于 DNS 查询/统计数据，v6 持锁写盘的吞吐量问题在实际使用中可能并不明显。如果要改，建议：
+1. 采用 `flushPending` + 单次异步 goroutine 的模式（与 querylog 一致）
+2. 在 `Stop()` / `Shutdown()` 中同步等待并强制刷盘
+3. 写盘时做一次内存快照拷贝再写（避免遍历中途数据被改）
+4. IP 分配正确性由内存锁+位图保证，不受异步写盘影响
+
+---
+
+## 十五、关键代码文件索引（更新）
+
+| 文件 | 核心职责 |
+|------|---------|
+| `internal/dhcpsvc/lease.go:24-41` | `Lease` 结构体定义 |
+| `internal/dhcpsvc/lease.go:71-82` | `updateExpiry` 租期更新 |
+| `internal/dhcpsvc/leaseindex.go` | 全局租约索引 |
+| `internal/dhcpsvc/interface.go` | 接口级租约存储 |
+| `internal/dhcpsvc/interface.go:53-54` | `indexMu` 锁字段定义 |
+| `internal/dhcpsvc/interface.go:132-153` | `blockLease` 阻塞租约 |
+| `internal/dhcpsvc/interface.go:173-181` | `findExpiredLease` 查找过期 |
+| `internal/dhcpsvc/interface.go:229-267` | `reserveLease` 分配/回收 |
+| `internal/dhcpsvc/server.go:46-47` | `leasesMu` 全局读写锁 |
+| `internal/dhcpsvc/server.go:198-246` | DNS 查询路径 RLock 使用 |
+| `internal/dhcpsvc/server.go:249-269` | `Reset()` 配置接口路径锁还原 |
+| `internal/dhcpsvc/server.go:272-300` | `AddLease` HTTP API 路径加锁（持锁写盘，修复 race） |
+| `internal/dhcpsvc/server.go:303-403` | `UpdateStaticLease`/`RemoveLease` 加锁 |
+| `internal/dhcpsvc/v4.go:210` | 接口 indexMu 指向全局锁 |
+| `internal/dhcpsvc/handler4.go` | 请求 goroutine 加锁示例 |
+| `internal/dhcpsvc/db.go:174-206` | `dbStore` 持锁前置条件 |
+| `internal/dhcpd/dhcpd.go:219-232` | `onNotify` DBStore 回调 |
+| `internal/dhcpd/v4_unix.go:45-46` | 旧版 `leasesLock` 互斥锁 |
+| `internal/dhcpd/v4_unix.go:147-177` | `ResetLeases` 重建索引与锁还原 |
+| `internal/dhcpd/v4_unix.go:179-182` | `getLeasesRef` 无锁返回切片引用（race 根源） |
+| `internal/dhcpd/v4_unix.go:238-250` | `FindMACbyIP` DNS 查询路径加锁 |
+| `internal/dhcpd/v4_unix.go:326-376` | `addLease` IP 唯一性检查（位图 + 索引） |
+| `internal/dhcpd/v4_unix.go:653-681` | `reserveLease` 分配逻辑，保障内存级 IP 唯一 |
+| `internal/dhcpd/v4_unix.go:735-768` | `handleDiscover` notify 位置（race 路径 1） |
+| `internal/dhcpd/v4_unix.go:960-997` | `handleRequest` notify 位置（race 路径 2） |
+| `internal/dhcpd/v4_unix.go:1000-1050` | `handleDecline` notify 在 Lock 之前（最严重 race） |
+| `internal/dhcpd/v4_unix.go:1071-1111` | `handleRelease` notify 位置（race 路径 4） |
+| `internal/dhcpd/v4_unix.go:385-438` | `AddStaticLease` HTTP API 路径加锁/写盘时序（race 路径 5） |
+| `internal/dhcpd/v4_unix.go:518-533` | `updateStaticLease` 锁内改内存 |
+| `internal/dhcpd/v4_unix.go:536-565` | `RemoveStaticLease` notify 位置（race 路径 6） |
+| `internal/dhcpd/v6_unix.go:234` | v6 `notify` 在 Lock 内调用（吞吐量问题） |
+| `internal/dhcpd/v6_unix.go:292` | v6 RemoveStaticLease notify 在 Lock 内 |
+| `internal/dhcpd/v6_unix.go:401` | v6 `commitDynamicLease` notify 在 Lock 内 |
+| `internal/dhcpd/db.go:93-149` | 旧版 `dbLoad` 完整流程 |
+| `internal/dhcpd/db.go:152-167` | 旧版 `dbStore` 全量遍历写盘（每次覆盖） |
+| `internal/dhcpd/db.go:189` | `maybe.WriteFile` 原子写入磁盘 |
+| `internal/dhcpd/migrate.go:63-105` | 旧格式数据迁移 |
+| `internal/dhcpd/http_unix.go:318-380` | 配置变更时的重载流程 |
+| `internal/dhcpd/http_unix.go:787-800` | HTTP API 端点注册 |
+| `internal/querylog/qlog.go:219-264` | querylog 异步刷盘模式（可参考） |
+| `internal/querylog/qlog.go:99-105` | querylog Shutdown 时强制 flush |
+| `internal/querylog/qlog.go:49-53` | querylog fileFlushLock / flushPending |
+| `internal/stats/stats.go:239-242` | stats 定时刷盘 goroutine |
+| `internal/stats/stats.go:420-475` | stats flush 循环逻辑 |
