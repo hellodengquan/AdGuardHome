@@ -1324,3 +1324,378 @@ resetLeases()（HTTP /control/dhcp/reset）流程:
 | `internal/dhcpd/migrate.go:63-105` | 旧格式数据迁移 |
 | `internal/dhcpd/http_unix.go:318-380` | 配置变更时的重载流程 |
 | `internal/dhcpd/http_unix.go:787-800` | HTTP API 端点注册 |
+
+---
+
+## 十二、data race 漏写租约的真实影响分析
+
+### 12.1 问题回顾
+
+第九章 9.4 节指出旧版 `dhcpd` 存在 data race：HTTP API 在 `Lock → 改内存 → Unlock` 后，于**无锁状态**下调用 `dbStore()` 写盘；此时接口 goroutine 可能持有锁正在 `append(s.leases, l)` 修改同一切片。
+
+本章从代码层面深入分析该 race 的**实际业务影响**。
+
+### 12.2 漏写的租约会被下一次 dbStore 自然覆盖回来吗？
+
+**结论：是的，只要内存里的租约没有被提前删除，下一次 dbStore 一定会写回来。**
+
+#### 代码证据：
+
+`dbStore()` 每次执行时都会**全量遍历**内存切片，而非增量写入：
+
+```go
+// db.go:152-167
+func (s *server) dbStore() (err error) {
+    leases := []*dbLease{}
+
+    for _, l := range s.srv4.getLeasesRef() {  // 每次全量遍历 s.leases 切片
+        leases = append(leases, fromLease(l))
+    }
+    // ... v6 同理 ...
+    return writeDB(s.conf.dbFilePath, leases)    // 整体覆盖写入
+}
+
+// v4_unix.go:180-182
+func (s *v4Server) getLeasesRef() []*dhcpsvc.Lease {
+    return s.leases   // 返回内存中完整切片的引用
+}
+```
+
+`writeDB` 使用 `maybe.WriteFile` 做原子替换写入（`db.go:189`），每次写入都会**完全替换** `leases.json` 的内容。
+
+#### 具体场景推演：
+
+假设事件时序如下：
+```
+T0: 内存 leases = [L1, L2]，磁盘 JSON = [L1, L2]
+
+T1: HTTP API 线程开始 AddStaticLease(L3)
+      Lock → 改内存 → leases = [L1, L2, L3] → Unlock
+
+T2: 开始执行 dbStore()，进入 for 循环遍历 s.leases
+      已读出 L1、L2，正准备读 L3
+
+T3: 接口 goroutine 抢到锁，执行 DISCOVER 分配 L4
+      Lock → append(s.leases, L4) → leases = [L1, L2, L3, L4] → Unlock
+                                               ↑
+                                     切片底层数组可能因扩容而重分配！
+
+T4: HTTP API 的 for 循环继续，但此时切片引用已失效
+      - 如果 T3 未触发扩容：可能读到 L3、漏掉 L4，写盘 [L1, L2, L3]
+      - 如果 T3 触发扩容：底层数组指针改变，for 循环仍用旧指针
+                      读到旧数组的 L3、L4 为零值，写盘 [L1, L2, L3]
+                      （最极端情况：完全乱序或重复）
+
+T5: 磁盘 JSON = [L1, L2, L3]，漏掉了 L4 ✗
+
+T6: 下一次任何变更触发 dbStore()（如 L4 续约、其他客户端请求）
+      全量遍历内存 s.leases = [L1, L2, L3, L4]
+      写盘 JSON = [L1, L2, L3, L4] ✓  // L4 被补回来了
+```
+
+**漏写是"一过性"的**，仅影响本次 `dbStore` 的输出文件。只要内存中的 `s.leases` 切片仍然正确持有 L4 的指针，下一次 `dbStore` 就会全量重写，把漏掉的租约补回来。
+
+### 12.3 有没有显式的 sync 调用补刷？
+
+**结论：没有显式的 sync/fsync 补刷机制，但变更驱动的通知系统确保了快速自愈。**
+
+代码中不存在类似以下的补刷逻辑：
+```go
+// 代码中不存在：
+// s.conf.notify(SyncDBStore)        // 不存在
+// s.dbStoreWithRetry()              // 不存在
+// s.dbStoreForceSync()              // 不存在
+// s.ticklerGoroutine -> dbStore()   // 不存在后台定时刷盘
+```
+
+但实际上无需补刷，因为**每次租约变更都会触发 `notify(LeaseChangedDBStore)`**，从而调用 `dbStore()` 全量重写。
+
+所有状态变更路径都会触发写盘：
+
+| 操作 | 触发点 | 漏写自愈时间 |
+|------|-------|------------|
+| DISCOVER 分配新 IP | `handleDiscover` line 738 `defer notify(DBStore)` | 下次任何租约变更 |
+| REQUEST SELECTING | `handleRequest` line 973 `defer notify(DBStore)` | 下次任何租约变更 |
+| REQUEST RENEW 续约 | `handleRequest` line 973（同一 defer） | 下次任何租约变更 |
+| DECLINE 冲突换 IP | `handleDecline` line 1001 `notify(DBStore)` | 下次任何租约变更 |
+| RELEASE 主动释放 | `handleRelease` line 1080 `defer notify(DBStore)` | 下次任何租约变更 |
+| HTTP API 加静态租约 | `AddStaticLease` line 435 `notify(DBStore)` | 下次任何租约变更 |
+| HTTP API 删静态租约 | `RemoveStaticLease` line 557 `notify(DBStore)` | 下次任何租约变更 |
+
+**自愈窗口分析**：
+- 网络正常、有客户端活动时，两次 `dbStore` 的间隔通常在秒级甚至毫秒级
+- 极端安静场景（无任何 DHCP 活动、无人操作 Web），漏写状态可能持续到下次租约变更
+- 服务重启时会从 `leases.json` 重新加载，**漏写的租约在重启后会永久丢失**（见 12.6 节）
+
+### 12.4 漏写具体发生在哪条租约状态变更路径？
+
+data race 发生在**所有调用 `notify(LeaseChangedDBStore)` 时不持有锁**的路径。让我们逐条核对 v4 的每条路径：
+
+#### 路径一：HTTP API — 加静态租约 ✗ 有 race
+
+```go
+// v4_unix.go:385-438  AddStaticLease
+func (s *v4Server) AddStaticLease(l *dhcpsvc.Lease) (err error) {
+    err = s.updateStaticLease(l)
+    // updateStaticLease() 内部：
+    //   Lock() → rmDynamicLease() + addLease() → Unlock()   锁已释放
+
+    s.conf.notify(LeaseChangedDBStore)     // ← 无锁状态下调用 dbStore()
+    s.conf.notify(LeaseChangedAddedStatic)
+    return nil
+}
+```
+
+#### 路径二：HTTP API — 删静态租约 ✗ 有 race
+
+```go
+// v4_unix.go:536-565  RemoveStaticLease
+defer func() {
+    s.conf.notify(LeaseChangedDBStore)      // ← defer 在 Unlock 之后执行
+    s.conf.notify(LeaseChangedRemovedStatic)
+}()
+s.leasesLock.Lock()
+defer s.leasesLock.Unlock()
+return s.rmLease(l)
+```
+
+#### 路径三：HTTP API — 改静态租约 ✗ 有 race
+
+```go
+// v4_unix.go:442-477  UpdateStaticLease
+defer func() {
+    s.conf.notify(LeaseChangedDBStore)      // ← defer 在 Unlock 之后执行
+    s.conf.notify(LeaseChangedRemovedStatic)
+}()
+s.leasesLock.Lock()
+defer s.leasesLock.Unlock()
+// ... 修改内存 ...
+```
+
+#### 路径四：DISCOVER 分配新 IP ✗ 有 race
+
+```go
+// v4_unix.go:738  handleDiscover
+defer s.conf.notify(LeaseChangedDBStore)   // ← defer 在 Unlock 之后执行
+
+s.leasesLock.Lock()
+defer s.leasesLock.Unlock()
+l, err = s.allocateLease(mac)   // 内部 append(s.leases, l)
+```
+
+#### 路径五：REQUEST 分配/续约 ✗ 有 race
+
+```go
+// v4_unix.go:971-974  handleRequest
+defer func() {
+    s.conf.notify(LeaseChangedAdded)
+    s.conf.notify(LeaseChangedDBStore)     // ← defer 在 Unlock 之后执行
+}()
+
+s.leasesLock.Lock()
+defer s.leasesLock.Unlock()
+s.commitLease(lease, hostname)
+```
+
+#### 路径六：DECLINE 冲突换 IP ✗ 有 race（更严重的位置）
+
+```go
+// v4_unix.go:1001  handleDecline
+s.conf.notify(LeaseChangedDBStore)        // ← 在 Lock() 之前调用！
+
+s.leasesLock.Lock()
+defer s.leasesLock.Unlock()
+// rmDynamicLease(oldLease) + allocateLease(new) + addLease(newLease)
+```
+
+`handleDecline` 的问题最严重：`notify` 放在 `Lock()` **之前**，意味着 `dbStore` 读取内存时，本次 Decline 导致的租约变更**还没发生**！写入的是变更前的状态。
+
+#### 路径七：RELEASE 主动释放 ✗ 有 race
+
+```go
+// v4_unix.go:1080  handleRelease
+defer s.conf.notify(LeaseChangedDBStore)   // ← defer 在 Unlock 之后执行
+
+s.leasesLock.Lock()
+defer s.leasesLock.Unlock()
+// rmDynamicLease(l)
+```
+
+**结论：所有 7 条租约变更路径都存在 data race。** 没有任何一条旧版 v4 路径是"持锁写盘"的。
+
+#### v6 的情况更糟糕：notify 甚至在 Lock() 内部调用
+
+```go
+// v6_unix.go:234  AddStaticLease
+s.addLease(l)
+s.conf.notify(LeaseChangedDBStore)   // ← Lock() 内部调用！
+s.leasesLock.Unlock()
+
+// v6_unix.go:292  RemoveStaticLease
+s.rmLease(l)
+s.conf.notify(LeaseChangedDBStore)   // ← Lock() 内部调用！
+s.leasesLock.Unlock()
+
+// v6_unix.go:401  commitDynamicLease
+s.leasesLock.Lock()
+s.conf.notify(LeaseChangedDBStore)   // ← Lock() 内部调用！
+s.leasesLock.Unlock()
+```
+
+v6 中 `notify(DBStore)` 在 `Lock()` 持有状态下调用，从锁保护角度看是"安全的"，但这意味着写磁盘 IO 发生在**持有锁**的状态下，会阻塞所有其他并发操作，吞吐量问题比 v4 更严重。
+
+### 12.5 漏写会不会导致重复签发同一 IP？
+
+**结论：绝对不会。** 因为 IP 唯一性由**内存锁 + 位图**双重保护，与 `dbStore` 是否漏写无关。
+
+#### 内存中的 IP 唯一性保障机制：
+
+**第一道防线：`leasedOffsets` 位图**
+
+```go
+// v4_unix.go:326-376  addLease
+func (s *v4Server) addLease(l *dhcpsvc.Lease) (err error) {
+    // ... 检查 IP 是否在范围内 ...
+
+    // 位图检查：该 IP 偏移是否已被标记
+    if !l.IsStatic {
+        s.leasedOffsets.set(offset)       // 标记位图，防止重复分配
+    }
+
+    // 唯一性检查
+    if dup, ok := s.ipIndex[l.IP]; ok {   // IP 索引检查
+        return ErrDupIP
+    }
+    if hostname != "" {
+        if dup, ok := s.hostsIndex[hostname]; ok {  // 主机名索引检查
+            return ErrDupHostname
+        }
+    }
+
+    s.leases = append(s.leases, l)       // 加入切片
+    s.ipIndex[l.IP] = l
+    s.hostsIndex[lowercaseHostname] = l
+    return nil
+}
+```
+
+**第二道防线：`reserveLease` 的分配逻辑**
+
+```go
+// v4_unix.go:653-681  reserveLease
+func (s *v4Server) reserveLease(mac net.HardwareAddr) (l *dhcpsvc.Lease, err error) {
+    nextIP := s.nextIP()                  // 从未标记的位图中找下一个
+    if nextIP == nil {
+        i := s.findExpiredLease()         // 无空闲 IP 时回收过期租约
+        if i < 0 { return nil, nil }
+        copy(s.leases[i].HWAddr, mac)
+        return s.leases[i], nil
+    }
+
+    l.IP = netIP
+    err = s.addLease(l)                   // addLease 内部会 set 位图
+    return l, nil
+}
+```
+
+**为什么漏写不会导致重复分配：**
+
+```
+内存正确性是 IP 分配的唯一依据，磁盘只是异步镜像：
+
+  内存状态：leases = [L1(192.168.1.100), L2(192.168.1.101)]
+            leasedOffsets = [1,1,0,0,...]   ← 位图标记前两个已用
+            ipIndex = {.100: L1, .101: L2}
+
+  ↓ 发生 data race 漏写，磁盘 JSON 只写了 [L1]，漏掉了 L2
+
+  磁盘状态：leases.json = [L1(192.168.1.100)]
+
+  ↓ 下一个客户端 DISCOVER 请求分配
+
+  reserveLease():
+    nextIP() 检查 leasedOffsets 位图 → 前两位都是 1，返回 .102
+
+  addLease(.102):
+    检查 ipIndex[.102] → 不存在 ✓
+    标记位图第三位 → leasedOffsets = [1,1,1,...]
+
+  结果：分配 192.168.1.102 给新客户端，不会重复分配 .101
+```
+
+即使 `leases.json` 中漏掉了 L2，内存中的 `leasedOffsets` 位图和 `ipIndex` 仍然正确标记了 `.101` 已被占用，分配器绝不会把它再分配出去。
+
+**唯一的风险场景是服务重启**：如果漏写发生后立即重启，`dbLoad()` 从磁盘加载，会漏掉 L2，此时 `.101` 的位图未被标记，可能被重新分配给新客户端。这是**重启前漏写 + 重启**两个条件同时满足才会发生的极端场景。
+
+### 12.6 对客户端的真实影响总结
+
+| 影响 | 发生条件 | 客户端表现 |
+|------|---------|-----------|
+| leases.json 漏掉几条租约 | 写盘时恰好有并发的切片 append | 无感，下次变更自动补回 |
+| 重启后永久丢失租约 | 漏写发生后立即重启服务 | 已在线的客户端不受影响；已分配的 IP 可能被重新分配给新客户端 |
+| 重复签发同一 IP | 仅当漏写 + 重启同时发生 | 罕见的 IP 冲突，客户端检测后会重新申请 |
+| 写盘内容乱序/重复 | 切片扩容导致底层数组重分配 | 无感，下次 dbStore 自动修复 |
+| HTTP API 操作响应变慢 | 写盘 IO 被阻塞 | 操作响应延迟，但功能正常 |
+
+### 12.7 新版 dhcpsvc 的修复方案
+
+新版通过在 `Lock()` 持有状态下调用 `dbStore()`，从根本上消除了 race：
+
+```go
+// server.go:283-286  新版 AddLease
+srv.leasesMu.Lock()
+defer srv.leasesMu.Unlock()
+
+err = srv.leases.add(ctx, srv.logger, l, iface)
+// add() 内部:
+//   iface.addLease(l) → 改内存
+//   idx.byAddr[l.IP] = l → 改全局索引
+//   idx.dbStore(ctx, logger) → 持锁写盘 ✓  无 race
+```
+
+代价是写盘 IO 发生在持锁状态下，锁持有时间变长，多接口并发处理 DHCP 请求时吞吐量会有所下降。但与 data race 导致的潜在数据丢失相比，这是合理的取舍。
+
+---
+
+## 十三、关键代码文件索引（更新）
+
+| 文件 | 核心职责 |
+|------|---------|
+| `internal/dhcpsvc/lease.go:24-41` | `Lease` 结构体定义 |
+| `internal/dhcpsvc/lease.go:71-82` | `updateExpiry` 租期更新 |
+| `internal/dhcpsvc/leaseindex.go` | 全局租约索引 |
+| `internal/dhcpsvc/interface.go` | 接口级租约存储 |
+| `internal/dhcpsvc/interface.go:53-54` | `indexMu` 锁字段定义 |
+| `internal/dhcpsvc/interface.go:132-153` | `blockLease` 阻塞租约 |
+| `internal/dhcpsvc/interface.go:173-181` | `findExpiredLease` 查找过期 |
+| `internal/dhcpsvc/interface.go:229-267` | `reserveLease` 分配/回收 |
+| `internal/dhcpsvc/server.go:46-47` | `leasesMu` 全局读写锁 |
+| `internal/dhcpsvc/server.go:198-246` | DNS 查询路径 RLock 使用 |
+| `internal/dhcpsvc/server.go:249-269` | `Reset()` 配置接口路径锁还原 |
+| `internal/dhcpsvc/server.go:272-300` | `AddLease` HTTP API 路径加锁（持锁写盘，修复 race） |
+| `internal/dhcpsvc/server.go:303-403` | `UpdateStaticLease`/`RemoveLease` 加锁 |
+| `internal/dhcpsvc/v4.go:210` | 接口 indexMu 指向全局锁 |
+| `internal/dhcpsvc/handler4.go` | 请求 goroutine 加锁示例 |
+| `internal/dhcpsvc/db.go:174-206` | `dbStore` 持锁前置条件 |
+| `internal/dhcpd/dhcpd.go:219-232` | `onNotify` DBStore 回调 |
+| `internal/dhcpd/v4_unix.go:45-46` | 旧版 `leasesLock` 互斥锁 |
+| `internal/dhcpd/v4_unix.go:147-177` | `ResetLeases` 重建索引与锁还原 |
+| `internal/dhcpd/v4_unix.go:179-182` | `getLeasesRef` 无锁返回切片引用（race 根源） |
+| `internal/dhcpd/v4_unix.go:238-250` | `FindMACbyIP` DNS 查询路径加锁 |
+| `internal/dhcpd/v4_unix.go:326-376` | `addLease` IP 唯一性检查（位图 + 索引） |
+| `internal/dhcpd/v4_unix.go:653-681` | `reserveLease` 分配逻辑，保障内存级 IP 唯一 |
+| `internal/dhcpd/v4_unix.go:735-768` | `handleDiscover` notify 位置（race 路径 1） |
+| `internal/dhcpd/v4_unix.go:960-997` | `handleRequest` notify 位置（race 路径 2） |
+| `internal/dhcpd/v4_unix.go:1000-1050` | `handleDecline` notify 在 Lock 之前（最严重 race） |
+| `internal/dhcpd/v4_unix.go:1071-1111` | `handleRelease` notify 位置（race 路径 4） |
+| `internal/dhcpd/v4_unix.go:385-438` | `AddStaticLease` HTTP API 路径加锁/写盘时序（race 路径 5） |
+| `internal/dhcpd/v4_unix.go:518-533` | `updateStaticLease` 锁内改内存 |
+| `internal/dhcpd/v4_unix.go:536-565` | `RemoveStaticLease` notify 位置（race 路径 6） |
+| `internal/dhcpd/db.go:93-149` | 旧版 `dbLoad` 完整流程 |
+| `internal/dhcpd/db.go:152-167` | 旧版 `dbStore` 全量遍历写盘（每次覆盖） |
+| `internal/dhcpd/db.go:189` | `maybe.WriteFile` 原子写入磁盘 |
+| `internal/dhcpd/v6_unix.go:234` | v6 `notify` 在 Lock 内调用（吞吐量问题） |
+| `internal/dhcpd/v6_unix.go:401` | v6 `commitDynamicLease` notify 在 Lock 内 |
+| `internal/dhcpd/migrate.go:63-105` | 旧格式数据迁移 |
+| `internal/dhcpd/http_unix.go:318-380` | 配置变更时的重载流程 |
+| `internal/dhcpd/http_unix.go:787-800` | HTTP API 端点注册 |
