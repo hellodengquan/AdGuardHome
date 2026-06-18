@@ -498,7 +498,601 @@ HTTP 请求
 
 ---
 
-## 九、核心文件索引
+## 九、CSRF 防御机制
+
+AdGuard Home **没有采用** 传统的 CSRF Token 方案，而是通过多层间接防御来阻止跨站请求伪造。以下逐一说明每一层防御的代码挂载位置和原理。
+
+### 9.1 SameSite Cookie 策略（核心防御层）
+
+**挂载位置**：登录成功时设置 Cookie 的属性
+
+[internal/home/authhttp.go:235-241](internal/home/authhttp.go#L235-L241)
+
+```go
+return &http.Cookie{
+    Name:     sessionCookieName,
+    Value:    hex.EncodeToString(sess.Token[:]),
+    HttpOnly: true,
+    SameSite: http.SameSiteLaxMode,
+}, nil
+```
+
+**防御原理**：`SameSite=Lax` 意味着：
+- 跨站顶级导航的 GET 请求**会**携带 Cookie（允许从外部链接跳转到 AGH）
+- 跨站的 POST/PUT/DELETE 请求**不会**携带 Cookie（阻止 CSRF 攻击）
+- 同站请求正常携带 Cookie
+
+这是 AdGuard Home **最核心** 的 CSRF 防御手段。攻击者从恶意网站发起的跨站 POST 请求将被浏览器拦截 Session Cookie，导致认证失败。
+
+### 9.2 Content-Type 校验（路由级防御层）
+
+**挂载位置**：路由注册时的 `ensure` 方法 → `ensureContentType`
+
+[internal/home/control.go:251-282](internal/home/control.go#L251-L282)
+
+```go
+func (web *webAPI) ensure(method string, handler func(http.ResponseWriter, *http.Request)) http.HandlerFunc {
+    return func(w http.ResponseWriter, r *http.Request) {
+        m := r.Method
+        if m != method {
+            // 405 Method Not Allowed
+            return
+        }
+
+        if modifiesData(m) {  // POST / PUT / DELETE
+            if !web.ensureContentType(w, r) {
+                return  // 415 Unsupported Media Type
+            }
+            globalContext.controlLock.Lock()
+            defer globalContext.controlLock.Unlock()
+        }
+
+        handler(w, r)
+    }
+}
+```
+
+[internal/home/control.go:289-336](internal/home/control.go#L289-L336)
+
+```go
+func (web *webAPI) ensureContentType(w http.ResponseWriter, r *http.Request) (ok bool) {
+    cType := r.Header.Get(httphdr.ContentType)
+    if r.ContentLength == 0 {
+        if cType == "" {
+            return true  // 无 body 且无 content-type，放行
+        }
+        // 有 content-type 但无 body → 拒绝
+    }
+
+    if cType == aghhttp.HdrValApplicationJSON {
+        return true  // 仅允许 application/json
+    }
+    // 415 Unsupported Media Type
+    return false
+}
+```
+
+**防御原理**：
+- HTML `<form>` 提交的 Content-Type 是 `application/x-www-form-urlencoded` 或 `multipart/form-data`
+- AGH 的所有数据修改 API **强制要求** `Content-Type: application/json`
+- 浏览器同源策略禁止跨域 JavaScript 设置非标准 Content-Type（除非 CORS 预检通过）
+- 因此 CSRF 攻击者无法伪造合法的 `application/json` 请求
+
+**路由级中间件注册链**：
+
+[internal/home/home.go:772-774](internal/home/home.go#L772-L774)
+
+```go
+mw := &webMw{}
+mux := http.NewServeMux()
+httpReg := aghhttp.NewDefaultRegistrar(mux, mw.wrap)
+```
+
+[internal/home/control.go:232-237](internal/home/control.go#L232-L237)
+
+```go
+func (mw *webMw) set(web *webAPI) {
+    mw.postInstallMw = web.postInstallHandler
+    mw.ensureMw = func(method string, h http.HandlerFunc) http.Handler {
+        return web.postInstallHandler(gziphandler.GzipHandler(web.ensure(method, h)))
+    }
+}
+```
+
+即每个通过 `httpReg.Register` 注册的 API 路由会经过：
+
+```
+httpReg.Register(method, path, handler)
+    ↓
+mw.wrap(method, handler)
+    ↓
+mw.ensureMw(method, handler)
+    ↓
+postInstallHandler → gzipHandler → ensure(method检查 + contentType检查) → handler
+```
+
+### 9.3 CORS 限制（跨域隔离层）
+
+**挂载位置**：HTTPS 重定向处理中
+
+[internal/home/control.go:410-421](internal/home/control.go#L410-L421)
+
+```go
+originURL := &url.URL{
+    Scheme: urlutil.SchemeHTTP,
+    Host:   r.Host,
+}
+respHdr.Set(httphdr.AccessControlAllowOrigin, originURL.String())
+respHdr.Set(httphdr.Vary, httphdr.Origin)
+```
+
+**防御原理**：
+- `Access-Control-Allow-Origin` 仅设置为 `http://<当前Host>`，不使用通配符 `*`
+- 跨域 JavaScript 请求因 CORS 策略被浏览器阻止
+- 此层仅在 HTTPS 强制重定向场景下生效
+
+### 9.4 CSRF 防御总结
+
+| 防御层 | 机制 | 挂载位置 | 防护范围 |
+|--------|------|---------|---------|
+| SameSite=Lax | 浏览器阻止跨站 POST Cookie | authhttp.go:241 | 所有需要认证的 POST 请求 |
+| Content-Type 校验 | 拒绝非 JSON 请求 | control.go:271-278 | 所有数据修改 API |
+| 空Body+ContentType 拒绝 | 阻止表单风格伪造 | control.go:303-313 | 有 ContentType 但无 Body 的请求 |
+| CORS Origin 限制 | 仅允许同源域 | control.go:415-421 | 跨域 JS 请求 |
+
+> **结论**：AdGuard Home 没有使用 CSRF Token，而是依赖 `SameSite=Lax` + `Content-Type: application/json` 强制要求的双重间接防御。这在现代浏览器（2020+）环境下是有效的，但对非常老的浏览器（不支持 SameSite）不提供保护。
+
+---
+
+## 十、鉴权失败审计日志
+
+### 10.1 登录接口审计
+
+**挂载位置**：`handleLogin` 中的 `writeErrorWithIP`
+
+[internal/home/authhttp.go:85-105](internal/home/authhttp.go#L85-L105)
+
+```go
+func (web *webAPI) writeErrorWithIP(
+    ctx context.Context,
+    err error,
+    r *http.Request,
+    w http.ResponseWriter,
+    code int,
+    remoteIP string,
+) {
+    web.logger.ErrorContext(
+        ctx,
+        "http error",
+        "host", r.Host,
+        "method", r.Method,
+        "url", r.URL,
+        "status", code,
+        "ip", remoteIP,
+        slogutil.KeyError, err,
+    )
+    http.Error(w, err.Error(), code)
+}
+```
+
+**审计日志触发点**（登录流程）：
+
+| 场景 | HTTP 状态码 | 日志级别 | 日志内容 | 代码位置 |
+|------|-----------|---------|---------|---------|
+| 远程地址解析失败 | 400 | Error | `auth: getting remote address` | authhttp.go:125-135 |
+| 限流命中 | 429 | Error | `auth: blocked for <duration>` | authhttp.go:140-151 |
+| IP 地址解析失败 | 500 | Error | `auth: parsing remote address` | authhttp.go:165-175 |
+| 用户名或密码错误 | 403 | Error | `invalid username or password` | authhttp.go:184 |
+
+**登录成功审计**：
+
+[internal/home/authhttp.go:189](internal/home/authhttp.go#L189)
+
+```go
+web.logger.InfoContext(ctx, "successful login", "user", req.Name, "ip", logIP)
+```
+
+### 10.2 认证中间件审计
+
+**挂载位置**：`authMiddlewareDefault.handleAuthenticatedUser`
+
+[internal/home/authhttp.go:436-444](internal/home/authhttp.go#L436-L444)
+
+```go
+u, err := mw.userFromRequest(ctx, r)
+if err != nil {
+    mw.logger.ErrorContext(ctx, "retrieving user from request", slogutil.KeyError, err)
+}
+if u == nil {
+    mw.logger.DebugContext(ctx, "no user found in request")
+    return false
+}
+```
+
+| 场景 | 日志级别 | 日志内容 | 说明 |
+|------|---------|---------|------|
+| Session Token 解析/查找出错 | Error | `retrieving user from request` | Cookie 存在但 Token 非法或存储异常 |
+| 无有效凭据 | Debug | `no user found in request` | Cookie 缺失 + Basic Auth 缺失，或凭据无效 |
+
+> **注意**：认证中间件中**没有**记录未认证请求的来源 IP。中间件在无凭据时仅记录 Debug 级别的 `"no user found in request"`，不包含 IP 信息。仅登录接口 (`handleLogin`) 通过 `writeErrorWithIP` 记录了来源 IP。
+
+### 10.3 Basic Auth 审计
+
+**挂载位置**：`userFromRequestBasicAuth`
+
+[internal/home/authhttp.go:575-597](internal/home/authhttp.go#L575-L597)
+
+Basic Auth 的审计**不在中间件层**，而是通过限流计数间接体现：
+- 限流命中：`rateLimiter.check` 返回 `left > 0` → 中间件返回 `nil`，上层记录 Error
+- 用户名错误：`errInvalidLogin` → defer 中 `rateLimiter.inc`
+- 密码错误：`errInvalidLogin` → defer 中 `rateLimiter.inc`
+- 成功：defer 中 `rateLimiter.remove`
+
+### 10.4 GLiNet 审计
+
+[internal/home/authglinet.go:147](internal/home/authglinet.go#L147)
+
+```go
+mw.logger.ErrorContext(ctx, "no authentication cookie", slogutil.KeyError, err)
+```
+
+[internal/home/authglinet.go:165](internal/home/authglinet.go#L165)
+
+```go
+mw.logger.DebugContext(ctx, "authentication token has expired")
+```
+
+### 10.5 通用 API 错误审计
+
+[internal/aghhttp/aghhttp.go:31-53](internal/aghhttp/aghhttp.go#L31-L53)
+
+```go
+func ErrorAndLog(ctx context.Context, l *slog.Logger, r *http.Request, w http.ResponseWriter,
+    code int, format string, args ...any) {
+    text := fmt.Sprintf(format, args...)
+    l.WarnContext(ctx, "http error",
+        "host", r.Host,
+        "method", r.Method,
+        "raddr", r.RemoteAddr,
+        "request_uri", r.RequestURI,
+        "status", code,
+        slogutil.KeyError, text,
+    )
+    http.Error(w, text, code)
+}
+```
+
+**审计信息字段**：
+
+| 字段 | 来源 | 说明 |
+|------|------|------|
+| `host` | `r.Host` | 请求的 Host 头 |
+| `method` | `r.Method` | HTTP 方法 |
+| `url` / `request_uri` | `r.URL` / `r.RequestURI` | 请求路径 |
+| `status` | 函数参数 | HTTP 状态码 |
+| `ip` / `raddr` | `remoteIP` / `r.RemoteAddr` | 客户端 IP |
+| `error` | 错误信息 | 具体错误描述 |
+
+---
+
+## 十一、Session 续期分析
+
+### 11.1 Session TTL 配置
+
+**配置**：[internal/home/config.go:194-196](internal/home/config.go#L194-L196)
+
+```go
+type httpConfig struct {
+    SessionTTL timeutil.Duration `yaml:"session_ttl"`
+}
+```
+
+**默认值**：[internal/home/config.go:462](internal/home/config.go#L462)
+
+```go
+SessionTTL: timeutil.Duration(30 * timeutil.Day),  // 默认 30 天
+```
+
+### 11.2 Session 创建时的过期时间
+
+[internal/aghuser/sessionstorage.go:325-331](internal/aghuser/sessionstorage.go#L325-L331)
+
+```go
+func (ds *DefaultSessionStorage) New(ctx context.Context, u *User) (*Session, error) {
+    s := &Session{
+        Token:     NewSessionToken(),
+        UserID:    u.ID,
+        UserLogin: u.Login,
+        Expire:    ds.clock.Now().Add(ds.sessionTTL),  // 创建时间 + TTL
+    }
+    // ...
+}
+```
+
+### 11.3 Session 查找时的过期检查（无续期）
+
+[internal/aghuser/sessionstorage.go:380-400](internal/aghuser/sessionstorage.go#L380-L400)
+
+```go
+func (ds *DefaultSessionStorage) FindByToken(ctx context.Context, t SessionToken) (*Session, error) {
+    ds.mu.Lock()
+    defer ds.mu.Unlock()
+
+    s, ok := ds.sessions[t]
+    if !ok {
+        return nil, nil
+    }
+
+    now := ds.clock.Now()
+    if now.After(s.Expire) {
+        err = ds.deleteByToken(ctx, t)
+        return nil, nil  // 过期则删除，不续期
+    }
+
+    return s, nil  // 未过期则返回，但不更新 Expire
+}
+```
+
+**关键结论**：AdGuard Home **没有实现 Session 续期机制**。
+
+- Session 创建时设置 `Expire = now + sessionTTL`
+- 每次 `FindByToken` 仅检查是否过期，过期则删除
+- **不会**在用户活动时延长过期时间
+- Cookie 的 `Expires` 字段设为 `time.Now().Add(cookieTTL)`（365 天），但 Session 本身的 TTL 由配置决定（默认 30 天）
+- 这意味着：即使用户每天活跃使用，Session 也会在 30 天后硬性过期，用户必须重新登录
+
+### 11.4 Cookie TTL 与 Session TTL 的关系
+
+| 时间维度 | 值 | 代码位置 |
+|---------|---|---------|
+| Cookie `Expires` | 365 天 | authhttp.go:29,239 |
+| Session `Expire` | 默认 30 天（可配置 `session_ttl`） | config.go:462 |
+| 实际会话有效期 | **取决于 Session TTL**（取较短者） | sessionstorage.go:330 |
+
+Cookie 365 天过期 ≠ 会话 365 天有效。Cookie 只是浏览器端保存 Token 的容器，实际会话有效期由服务端 Session TTL 决定。
+
+---
+
+## 十二、限流命中后的回退响应
+
+### 12.1 登录接口限流响应
+
+**挂载位置**：[internal/home/authhttp.go:137-151](internal/home/authhttp.go#L137-L151)
+
+```go
+if rateLimiter := web.auth.rateLimiter; rateLimiter != nil {
+    if left := rateLimiter.check(remoteIPStr); left > 0 {
+        w.Header().Set(httphdr.RetryAfter, strconv.Itoa(int(left.Seconds())))
+        web.writeErrorWithIP(
+            ctx,
+            fmt.Errorf("auth: blocked for %s", left),
+            r,
+            w,
+            http.StatusTooManyRequests,
+            remoteIPStr,
+        )
+        return
+    }
+}
+```
+
+**响应格式**：
+
+```http
+HTTP/1.1 429 Too Many Requests
+Retry-After: <剩余封禁秒数>
+Content-Type: text/plain; charset=utf-8
+
+auth: blocked for 1m30s
+```
+
+**响应特征**：
+- 状态码 `429 Too Many Requests`
+- `Retry-After` 头告知客户端剩余封禁时间（秒）
+- 响应体为纯文本错误描述
+- 日志记录 Error 级别，包含来源 IP
+
+### 12.2 Basic Auth 限流响应
+
+**挂载位置**：[internal/home/authhttp.go:575-578](internal/home/authhttp.go#L575-L578)
+
+```go
+rateLimiter := mw.rateLimiter
+if left := rateLimiter.check(remoteIP); left > 0 {
+    return nil, fmt.Errorf("login attempt blocked for %s", left)
+}
+```
+
+**响应特征**：
+- Basic Auth 的限流发生在中间件层的 `userFromRequestBasicAuth` 中
+- 限流命中时返回 `nil, error`
+- 上层 `handleAuthenticatedUser` 检测到 `u == nil`，走到 `handlePublicAccess` 或返回 `401`
+- **不会返回 429**，而是返回 `401 Unauthorized`
+- **不设置 `Retry-After` 头**
+- 审计日志仅为 Debug 级别的 `"no user found in request"`
+
+> **注意**：这是一个设计上的不一致。登录接口限流返回 429 + Retry-After，但 Basic Auth 限流被"吞掉"变成 401。客户端无法通过 HTTP 状态码区分"密码错误"和"被限流"。
+
+### 12.3 限流状态流转
+
+```
+初始状态: 无记录
+    ↓ inc(ip)
+1次失败: num=1, until=now+1min
+    ↓ inc(ip)
+2次失败: num=2, until=now+1min  (保留原 until)
+    ↓ ...
+N次失败 (N ≥ maxAttempts): num=N, until=now+blockDur  (延长封禁)
+    ↓ check(ip)
+返回 left = until - now > 0 → 429 / 401
+    ↓ 等待 until 过期
+cleanupLocked 自动清理
+    ↓ 或认证成功
+remove(ip) → 清除记录
+```
+
+---
+
+## 十三、认证中间件完整执行顺序
+
+### 13.1 全局中间件链（HTTP Server 层）
+
+以 HTTP 明文服务器为例，完整链路：
+
+[internal/home/web.go:262-290](internal/home/web.go#L262-L290)
+
+```
+HTTP 请求到达
+    ↓
+┌────────────────────────────────────────────────┐
+│ 1. http.Server                                  │
+│    - ReadTimeout / WriteTimeout                 │
+│    - ReadHeaderTimeout                          │
+│    - Protocols: HTTP/1.1, unencrypted H2        │
+└───────────────────────┬────────────────────────┘
+                        ↓
+┌────────────────────────────────────────────────┐
+│ 2. auth.middleware().Wrap(hdlr)                 │
+│    即 authMiddlewareDefault.Wrap               │
+│    ┌──────────────────────────────────────────┐│
+│    │ 2a. needsAuthentication?                 ││
+│    │     否 → 跳过认证                        ││
+│    │     是 ↓                                 ││
+│    │ 2b. handleAuthenticatedUser              ││
+│    │     ├─ userFromCookie                    ││
+│    │     │   ├─ Cookie 不存在 →               ││
+│    │     │   └─ Cookie 存在 →                 ││
+│    │     │       ├─ hex解码 → sessionTokenFromHex│
+│    │     │       ├─ 查找会话 → sessions.FindByToken│
+│    │     │       └─ 查找用户 → users.ByLogin   ││
+│    │     └─ userFromRequestBasicAuth           ││
+│    │         ├─ Basic Auth 头不存在 → nil      ││
+│    │         ├─ 限流检查 → rateLimiter.check   ││
+│    │         ├─ 用户查找 → users.ByLogin       ││
+│    │         ├─ 密码验证 → bcrypt              ││
+│    │         └─ 成功 remove/失败 inc 限流计数   ││
+│    │ 2c. handlePublicAccess                    ││
+│    │     ├─ isPublicResource                   ││
+│    │     ├─ isDoHRoute                         ││
+│    │     └─ 根路径重定向                        ││
+│    │ 2d. 401 Unauthorized                      ││
+│    └──────────────────────────────────────────┘│
+└───────────────────────┬────────────────────────┘
+                        ↓
+┌────────────────────────────────────────────────┐
+│ 3. logMw.Wrap(hdlr)                             │
+│    日志中间件 (slog LevelDebug)                 │
+└───────────────────────┬────────────────────────┘
+                        ↓
+┌────────────────────────────────────────────────┐
+│ 4. withMiddlewares(mux, limitRequestBody)       │
+│    请求体大小限制 (64KB / 4MB)                  │
+└───────────────────────┬────────────────────────┘
+                        ↓
+┌────────────────────────────────────────────────┐
+│ 5. http.ServeMux 路由分发                       │
+└───────────────────────┬────────────────────────┘
+                        ↓
+           ┌────────────┴────────────┐
+           ↓                         ↓
+    /control/* API路由          / 静态资源路由
+           ↓                         ↓
+┌─────────────────────┐   ┌──────────────────────┐
+│ 6. ensure(method,h) │   │ postInstallHandler   │
+│   ├─ 方法检查       │   │   ├─ 安装状态检查     │
+│   ├─ Content-Type   │   │   └─ HTTPS重定向      │
+│   └─ controlLock    │   │ gzipHandler          │
+└─────────┬───────────┘   └──────────────────────┘
+          ↓
+┌─────────────────────┐
+│ 7. 业务 Handler      │
+│   可通过            │
+│   webUserFromContext │
+│   获取当前用户      │
+└─────────────────────┘
+```
+
+### 13.2 路由级中间件链（API 路由）
+
+通过 `httpReg.Register` 注册的 API 路由：
+
+[internal/home/control.go:232-237](internal/home/control.go#L232-L237)
+
+```
+httpReg.Register(method, path, handler)
+    ↓ wrapFn(method, handler)
+    ↓ mw.ensureMw(method, handler)
+    ↓
+postInstallHandler(handler)
+    ├─ firstRun → 重定向到 /install.html
+    └─ !firstRun ↓
+handleHTTPSRedirect(handler)
+    ├─ forceHTTPS + 非TLS → 307 重定向到 HTTPS
+    ├─ 设置 HSTS 头
+    ├─ 设置 Access-Control-Allow-Origin
+    └─ 继续 ↓
+gzipHandler(handler)
+    ↓
+ensure(method, handler)
+    ├─ 方法不匹配 → 405
+    ├─ 数据修改方法 (POST/PUT/DELETE) →
+    │   ├─ ensureContentType
+    │   │   ├─ Content-Length=0 + 无CT → 放行
+    │   │   ├─ Content-Length=0 + 有CT → 415
+    │   │   ├─ CT=application/json → 放行
+    │   │   └─ 其他CT → 415
+    │   └─ globalContext.controlLock (并发保护)
+    └─ 继续 ↓
+业务 handler
+```
+
+### 13.3 用户上下文传递
+
+认证成功后，用户信息通过 Context 传递到业务层：
+
+[internal/home/context.go:37-55](internal/home/context.go#L37-L55)
+
+```
+authMiddlewareDefault.handleAuthenticatedUser
+    ↓
+withWebUser(ctx, u)  →  context.WithValue(ctx, ctxKeyWebUser, u)
+    ↓
+r.WithContext(withUser)  →  新 Request 带用户上下文
+    ↓
+h.ServeHTTP(w, r)  →  传递到后续中间件和 Handler
+    ↓
+业务 Handler 中:
+    u, ok := webUserFromContext(ctx)  →  获取当前用户
+```
+
+**消费位置示例**：
+
+[internal/home/profilehttp.go:54-61](internal/home/profilehttp.go#L54-L61)
+
+```go
+u, ok := webUserFromContext(ctx)
+if !ok {
+    w.WriteHeader(http.StatusUnauthorized)
+    return
+}
+name = string(u.Login)
+```
+
+### 13.4 三种 Server 的中间件一致性
+
+HTTP、HTTPS、HTTP/3 三个服务器使用相同的中间件链：
+
+| 服务器 | Handler 构建 | 代码位置 |
+|--------|-------------|---------|
+| HTTP | `auth.middleware().Wrap(logMw.Wrap(limitRequestBody(mux)))` | web.go:266-274 |
+| HTTPS | `auth.middleware().Wrap(logMw.Wrap(limitRequestBody(mux)))` | web.go:365-369 |
+| HTTP/3 | `auth.middleware().Wrap(limitRequestBody(mux))` | web.go:433 |
+
+> **注意**：HTTP/3 服务器**缺少**日志中间件 `logMw`，这可能是疏忽。
+
+---
+
+## 十四、核心文件索引
 
 | 功能模块 | 文件路径 |
 |---------|---------|
@@ -511,3 +1105,9 @@ HTTP 请求
 | 用户数据库 | [internal/aghuser/db.go](internal/aghuser/db.go) |
 | 通用中间件 | [internal/home/middlewares.go](internal/home/middlewares.go) |
 | 中间件注册 | [internal/home/web.go](internal/home/web.go) |
+| 路由级中间件 (ensure/ContentType) | [internal/home/control.go](internal/home/control.go) |
+| 用户上下文传递 | [internal/home/context.go](internal/home/context.go) |
+| 路由注册器 | [internal/aghhttp/registrar.go](internal/aghhttp/registrar.go) |
+| HTTP 错误审计 | [internal/aghhttp/aghhttp.go](internal/aghhttp/aghhttp.go) |
+| 会话配置 | [internal/home/config.go](internal/home/config.go) |
+| Profile 鉴权消费示例 | [internal/home/profilehttp.go](internal/home/profilehttp.go) |
