@@ -642,57 +642,322 @@ respHdr.Set(httphdr.Vary, httphdr.Origin)
 
 > **结论**：AdGuard Home 没有使用 CSRF Token，而是依赖 `SameSite=Lax` + `Content-Type: application/json` 强制要求的双重间接防御。这在现代浏览器（2020+）环境下是有效的，但对非常老的浏览器（不支持 SameSite）不提供保护。
 
+### 9.5 CSRF Token 轮换：代码不存在与并发风险推演
+
+#### 9.5.1 代码库中不存在 CSRF Token 轮换
+
+经过对整个代码库的搜索，确认以下事实：
+
+| 搜索关键词 | 搜索范围 | 结果 |
+|-----------|---------|------|
+| `csrf` / `xsrf` / `csrfToken` | `**/*.go` | 无匹配 |
+| `rotate` / `rotation` / `regenerate` | `**/*.go` | 仅匹配 querylog 轮转，无鉴权相关 |
+| `nonce` | `**/*.go` | 无匹配 |
+| `_token` | `**/*.go` | 仅匹配 GLiNet `gl_token_*` 文件前缀 |
+
+**结论**：代码库中**完全没有** CSRF Token 的生成、验证、轮换逻辑。因此也不存在 "CSRF token 轮换时并发更新" 的代码挂载点。
+
+#### 9.5.2 Session Token 是唯一的 Token 机制
+
+AdGuard Home 唯一与 "token" 相关的机制是 **Session Token**，它在登录时生成：
+
+[internal/aghuser/session.go:14-21](internal/aghuser/session.go#L14-L21)
+
+```go
+func NewSessionToken() (t SessionToken) {
+    _, _ = rand.Read(t[:])  // 16字节 crypto/rand
+    return t
+}
+```
+
+**Session Token 的生命周期**：
+
+```
+创建:  登录成功 → sessions.New() → NewSessionToken() → store(bbolt) → 内存map写入
+使用:  每次请求 → Cookie 携带 → FindByToken() → 内存map查找
+销毁:  登出 → DeleteByToken() → remove(bbolt) → 内存map删除
+过期:  FindByToken() 检查 Expire → deleteByToken()
+```
+
+**关键点**：Session Token 在创建后**永远不会被轮换或替换**。同一个 Token 从登录到过期/登出始终不变。
+
+#### 9.5.3 如果存在 CSRF Token 轮换，并发风险会挂载在哪里
+
+虽然代码库没有 CSRF Token 轮换，但为了理解 "如果存在" 时的并发风险，以下是推演分析。
+
+**假设 CSRF Token 轮换设计**：每次请求后重新生成 CSRF Token，新旧 Token 短暂并存。
+
+**并发风险挂载点推演**：
+
+```
+假设的 CSRF Token 轮换流程:
+    请求到达
+    ↓
+验证 CSRF Token (读 map[token] → 比对)
+    ↓
+生成新 CSRF Token (crypto/rand → 新 token)
+    ↓
+更新存储 (map[old] = nil, map[new] = value)  ← 并发风险挂载点
+    ↓
+写入响应 Header / Cookie (Set-Cookie: new_token)
+```
+
+**并发风险场景**：
+
+```
+Tab 1: 请求 → 验证 token_A → 生成 token_B → 存储 token_B → 响应 Set-Cookie: token_B
+Tab 2: 请求 → 验证 token_A (还没收到 token_B) → 生成 token_C → 存储 token_C
+    问题: Tab 1 收到 token_B 但 Tab 2 已经生成了 token_C
+    token_B 和 token_C 哪个有效？如果只保留最新，Tab 1 的 token_B 失效
+```
+
+**在当前代码中的等价风险**：
+
+虽然不存在 CSRF Token 轮换，但**多 Tab 同时登录**会触发类似的并发场景：
+
+```
+Tab 1: POST /control/login → newCookie() → sessions.New() → Token_A
+Tab 2: POST /control/login → newCookie() → sessions.New() → Token_B
+```
+
+两个 Tab 登录成功后会创建**两个不同的 Session**，各自有独立的 Token。这不是 bug（设计如此），但意味着同一用户可以同时持有多个有效 Session。
+
+**并发写入的实际代码挂载点**：
+
+[internal/aghuser/sessionstorage.go:325-343](internal/aghuser/sessionstorage.go#L325-L343)
+
+```go
+func (ds *DefaultSessionStorage) New(ctx context.Context, u *User) (s *Session, err error) {
+    s = &Session{
+        Token:  NewSessionToken(),   // ① 锁外：生成随机 Token
+        // ...
+    }
+
+    err = ds.store(s)               // ② 锁外：写入 bbolt（事务内）
+    if err != nil {
+        return nil, fmt.Errorf("storing session: %w", err)
+    }
+
+    ds.mu.Lock()                    // ③ 加锁
+    defer ds.mu.Unlock()
+    ds.sessions[s.Token] = s        // ④ 锁内：写入内存 map
+    return s, nil
+}
+```
+
+**并发风险分析**：
+
+| 步骤 | 是否在锁内 | 并发风险 |
+|------|-----------|---------|
+| ① 生成 Token | ❌ 锁外 | 无风险（Token 是随机的，碰撞概率可忽略） |
+| ② 写入 bbolt | ❌ 锁外 | bbolt 内部有事务锁，不会并发冲突 |
+| ③④ 内存 map 写入 | ✅ 锁内 | `ds.mu` 保护，不会并发冲突 |
+
+**结论**：多 Tab 同时登录时，`sessions.New()` 的并发写入是安全的。但不存在 Token 轮换，因此不存在 Token 轮换时的并发更新风险。
+
 ---
 
 ## 十、鉴权失败审计日志
 
-### 10.1 登录接口审计
+### 10.1 管理员登录成功路径的完整审计链
 
-**挂载位置**：`handleLogin` 中的 `writeErrorWithIP`
+登录成功的代码从 `handleLogin` 到最终 HTTP 响应，经过以下完整审计链路：
 
-[internal/home/authhttp.go:85-105](internal/home/authhttp.go#L85-L105)
-
-```go
-func (web *webAPI) writeErrorWithIP(
-    ctx context.Context,
-    err error,
-    r *http.Request,
-    w http.ResponseWriter,
-    code int,
-    remoteIP string,
-) {
-    web.logger.ErrorContext(
-        ctx,
-        "http error",
-        "host", r.Host,
-        "method", r.Method,
-        "url", r.URL,
-        "status", code,
-        "ip", remoteIP,
-        slogutil.KeyError, err,
-    )
-    http.Error(w, err.Error(), code)
-}
+```
+POST /control/login
+    │
+    ▼
+[步骤 1] JSON 解码
+    代码: authhttp.go:111-117
+    失败: aghhttp.ErrorAndLog → 400 + Warn 级别 "http error" (含 method/raddr/request_uri)
+    审计字段: method, request_uri, status, error
+    缺失字段: ❌ 无 IP（此时还未提取 IP）
+    │
+    ▼ 成功
+[步骤 2] 提取远程 IP
+    代码: authhttp.go:119-135
+    失败: writeErrorWithIP → 400 + Error 级别 "auth: getting remote address"
+    审计字段: host, method, url, status, ip, error
+    ✅ 此处开始有 IP 审计
+    │
+    ▼ 成功
+[步骤 3] 限流检查
+    代码: authhttp.go:137-151
+    命中: writeErrorWithIP → 429 + Error 级别 "auth: blocked for <duration>"
+          + Retry-After 响应头
+    审计字段: host, method, url, status, ip, error
+    ✅ 有 IP，有封禁时长
+    │
+    ▼ 未命中
+[步骤 4] 解析 realIP（用于日志显示）
+    代码: authhttp.go:153-161
+    失败: Error 级别 "getting real ip" + remote_ip
+    注意: 此步骤仅影响日志中显示的 IP（logIP），不影响认证
+    如果解析失败，logIP 退回到 remoteIPStr
+    │
+    ▼
+[步骤 5] 解析 remoteIP（用于可信代理判断）
+    代码: authhttp.go:163-175
+    失败: writeErrorWithIP → 500 + Error 级别 "auth: parsing remote address"
+    审计字段: host, method, url, status, ip, error
+    ✅ 有 IP
+    │
+    ▼ 成功
+[步骤 6] 确定日志 IP（logIP）
+    代码: authhttp.go:177-180
+    逻辑: 如果 remoteIP 在 trustedProxies 内，logIP = realIP
+          否则 logIP = remoteIPStr
+    无审计: 仅内部变量赋值
+    │
+    ▼
+[步骤 7] 创建 Cookie（认证核心）
+    代码: authhttp.go:182 → newCookie() → authhttp.go:202-243
+    失败路径 (7a): 用户不存在
+        代码: authhttp.go:215-218
+        操作: rateLimiter.inc(addr)
+        返回: errInvalidLogin → writeErrorWithIP → 403 + Error 级别
+        审计字段: host, method, url, status, ip, error
+        ✅ 有 IP，有限流计数
+        ❌ 但日志内容仅为 "invalid username or password"，无法区分用户不存在还是密码错误
+    失败路径 (7b): 密码错误
+        代码: authhttp.go:221-226
+        操作: rateLimiter.inc(addr)
+        返回: errInvalidLogin → writeErrorWithIP → 403 + Error 级别
+        审计字段: 同上
+        ❌ 与用户不存在返回相同错误信息（安全设计，但影响审计可读性）
+    成功路径 (7c): 认证成功
+        代码: authhttp.go:228
+        操作: rateLimiter.remove(addr)
+        无独立日志: 仅清除限流计数
+    │
+    ▼ 成功
+[步骤 8] 创建 Session
+    代码: newCookie() → authhttp.go:230-233
+    失败: sessions.New() 返回错误 → 直接返回，无独立审计日志
+          上层 writeErrorWithIP → 403 + Error 级别 "storing session"
+    │
+    ▼ 成功
+[步骤 9] 登录成功审计日志 ★
+    代码: authhttp.go:189
+    ────────────────────────────────────────────
+    web.logger.InfoContext(ctx, "successful login",
+        "user", req.Name,
+        "ip", logIP)
+    ────────────────────────────────────────────
+    审计字段: user (用户名), ip (经过可信代理判断的 IP)
+    日志级别: Info
+    ✅ 有用户名 + IP
+    ❌ 无 User-ID、无 Session Token、无 User-Agent、无请求路径
+    │
+    ▼
+[步骤 10] 设置响应
+    代码: authhttp.go:191-198
+    操作: Set-Cookie (agh_session) + Cache-Control: no-store + OK
+    无审计
 ```
 
-**审计日志触发点**（登录流程）：
+**登录成功路径审计链总览**：
 
-| 场景 | HTTP 状态码 | 日志级别 | 日志内容 | 代码位置 |
-|------|-----------|---------|---------|---------|
-| 远程地址解析失败 | 400 | Error | `auth: getting remote address` | authhttp.go:125-135 |
-| 限流命中 | 429 | Error | `auth: blocked for <duration>` | authhttp.go:140-151 |
-| IP 地址解析失败 | 500 | Error | `auth: parsing remote address` | authhttp.go:165-175 |
-| 用户名或密码错误 | 403 | Error | `invalid username or password` | authhttp.go:184 |
+| 步骤 | 代码位置 | 审计动作 | 日志级别 | 关键字段 |
+|------|---------|---------|---------|---------|
+| 2 | authhttp.go:124-135 | IP 提取失败 | Error | ip, error |
+| 3 | authhttp.go:137-151 | 限流命中 | Error | ip, error, Retry-After |
+| 4 | authhttp.go:153-161 | realIP 解析失败 | Error | remote_ip, error |
+| 5 | authhttp.go:163-175 | remoteIP 解析失败 | Error | ip, error |
+| 7a | authhttp.go:215-218 + 184 | 用户不存在 | Error | ip, error |
+| 7b | authhttp.go:221-226 + 184 | 密码错误 | Error | ip, error |
+| **9** | **authhttp.go:189** | **登录成功** | **Info** | **user, ip** |
+| 10 | authhttp.go:191-198 | 设置 Cookie + OK | 无 | — |
 
-**登录成功审计**：
+### 10.2 管理员登录失败路径的完整审计链
 
-[internal/home/authhttp.go:189](internal/home/authhttp.go#L189)
+登录失败的所有可能路径和审计记录：
 
-```go
-web.logger.InfoContext(ctx, "successful login", "user", req.Name, "ip", logIP)
+```
+POST /control/login
+    │
+    ├─ [FAIL-A] JSON 解码失败
+    │     代码: authhttp.go:112-117
+    │     响应: 400 Bad Request
+    │     审计: aghhttp.ErrorAndLog → Warn "http error"
+    │     字段: method, raddr, request_uri, status, error
+    │     缺失: ❌ 无 IP（此时尚未提取）
+    │     日志输出: "json decode: <error>"
+    │
+    ├─ [FAIL-B] 远程 IP 提取失败
+    │     代码: authhttp.go:124-135
+    │     响应: 400 Bad Request
+    │     审计: writeErrorWithIP → Error "http error"
+    │     字段: host, method, url, status, ip=r.RemoteAddr, error
+    │     日志输出: "auth: getting remote address: <error>"
+    │
+    ├─ [FAIL-C] 限流命中
+    │     代码: authhttp.go:137-151
+    │     响应: 429 Too Many Requests + Retry-After 头
+    │     审计: writeErrorWithIP → Error "http error"
+    │     字段: host, method, url, status, ip, error
+    │     日志输出: "auth: blocked for 1m30s"
+    │     特殊: 响应体包含封禁时长，Retry-After 头包含秒数
+    │
+    ├─ [FAIL-D] remoteIP 解析失败
+    │     代码: authhttp.go:163-175
+    │     响应: 500 Internal Server Error
+    │     审计: writeErrorWithIP → Error "http error"
+    │     字段: host, method, url, status, ip=r.RemoteAddr, error
+    │     日志输出: "auth: parsing remote address: <error>"
+    │
+    ├─ [FAIL-E] 用户不存在
+    │     代码: authhttp.go:215-218 → 184
+    │     响应: 403 Forbidden
+    │     审计: writeErrorWithIP → Error "http error"
+    │     字段: host, method, url, status, ip=logIP, error
+    │     日志输出: "invalid username or password"
+    │     副作用: rateLimiter.inc(addr) — 限流计数 +1
+    │     特殊: ❌ 无法区分 "用户不存在" 和 "密码错误"
+    │
+    ├─ [FAIL-F] 密码错误
+    │     代码: authhttp.go:221-226 → 184
+    │     响应: 403 Forbidden
+    │     审计: writeErrorWithIP → Error "http error"
+    │     字段: 同 FAIL-E
+    │     日志输出: "invalid username or password"
+    │     副作用: rateLimiter.inc(addr) — 限流计数 +1
+    │     特殊: ❌ 与 FAIL-E 返回完全相同的错误信息
+    │
+    └─ [FAIL-G] Session 创建失败
+          代码: authhttp.go:230-233 → 184
+          响应: 403 Forbidden
+          审计: writeErrorWithIP → Error "http error"
+          字段: host, method, url, status, ip=logIP, error
+          日志输出: "storing session: <error>"
+          副作用: rateLimiter.remove(addr) — 已清除限流（因为认证已通过）
+          特殊: 认证成功但 Session 存储失败，理论上不应该发生
 ```
 
-### 10.2 认证中间件审计
+**登录失败路径审计字段完整性**：
+
+| 字段 | FAIL-A | FAIL-B | FAIL-C | FAIL-D | FAIL-E | FAIL-F | FAIL-G |
+|------|--------|--------|--------|--------|--------|--------|--------|
+| IP 地址 | ❌ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ |
+| 用户名 | ❌ | ❌ | ❌ | ❌ | ❌ | ❌ | ❌ |
+| HTTP 方法 | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ |
+| 请求路径 | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ |
+| 状态码 | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ |
+| 错误详情 | ✅ | ✅ | ✅ | ✅ | ❌* | ❌* | ✅ |
+| 限流状态 | — | — | ✅ | — | ✅ (inc) | ✅ (inc) | ✅ (remove) |
+| User-Agent | ❌ | ❌ | ❌ | ❌ | ❌ | ❌ | ❌ |
+
+*FAIL-E/F 的错误信息统一为 `"invalid username or password"`，无法区分具体原因。
+
+**关键审计缺陷**：
+
+1. **FAIL-A 无 IP**：JSON 解码失败时还未提取远程 IP，无法追溯恶意请求来源
+2. **FAIL-E/F 不区分原因**：安全设计选择（防止用户名枚举），但降低了审计可读性
+3. **所有失败路径无 User-Agent**：无法识别攻击工具特征
+4. **所有失败路径无用户名**：即使 FAIL-E/F 时已知提交的用户名，也不记录
+5. **无限流计数审计**：`rateLimiter.inc()` 是内存操作，不产生日志
+
+### 10.3 认证中间件审计
 
 **挂载位置**：`authMiddlewareDefault.handleAuthenticatedUser`
 
