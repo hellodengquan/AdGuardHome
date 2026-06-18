@@ -716,6 +716,107 @@ if u == nil {
 
 > **注意**：认证中间件中**没有**记录未认证请求的来源 IP。中间件在无凭据时仅记录 Debug 级别的 `"no user found in request"`，不包含 IP 信息。仅登录接口 (`handleLogin`) 通过 `writeErrorWithIP` 记录了来源 IP。
 
+#### 10.2.1 未授权 API 访问漏审计的完整代码路径
+
+未授权 API 请求从进入到返回 401，经过的完整代码路径和审计点如下：
+
+```
+请求到达 authMiddlewareDefault.Wrap
+    │
+    ├─ [审计点 1] needsAuthentication() → 无用户时直接放行
+    │     (无审计)
+    │
+    └─ 有用户 → handleAuthenticatedUser()
+          │
+          ├─ userFromRequest()
+          │     ├─ 尝试 Cookie 认证 → userFromCookie
+          │     │     ├─ Cookie 不存在 → 无日志
+          │     │     ├─ Token 解析失败 → 错误向上传递
+          │     │     └─ Session 不存在/过期 → 返回 nil
+          │     └─ 失败则尝试 Basic Auth → userFromRequestBasicAuth
+          │           ├─ 无 Basic Auth 头 → 返回 nil, nil
+          │           ├─ 限流命中 → 返回 nil, error
+          │           └─ 密码错误 → 返回 nil, error
+          │
+          ├─ [审计点 2] err != nil → Error 级别 "retrieving user from request"
+          │     (无 IP，只有错误信息)
+          │
+          ├─ [审计点 3] u == nil → Debug 级别 "no user found in request"
+          │     (无 IP，无路径，无方法)
+          │
+          └─ return false → 进入 handlePublicAccess()
+                │
+                ├─ 公开资源 → 直接放行 (无审计)
+                ├─ DoH 路由 → 直接放行 (无审计)
+                └─ 根路径 → 重定向到 login.html (无审计)
+                      │
+                      └─ 其他路径 → 最终返回 401
+                            │
+                            └─ [审计点 4] w.WriteHeader(401)
+                                  (完全没有审计日志！)
+```
+
+**四处关键漏审计位置**：
+
+| 位置 | 场景 | 审计缺失 | 代码位置 |
+|------|------|---------|---------|
+| 审计点 1 | 首次安装/无用户时跳过认证 | 所有请求都无审计 | authhttp.go:408-412 |
+| 审计点 2 | 认证过程出错（如限流命中） | Error 级别但不含 IP | authhttp.go:437-439 |
+| 审计点 3 | 无有效凭据（最常见） | Debug 级别且不含 IP/方法/路径 | authhttp.go:441-444 |
+| 审计点 4 | 最终返回 401 | **完全没有日志** | authhttp.go:423 |
+
+**最严重的漏审计：最终 401 响应**
+
+[internal/home/authhttp.go:423](internal/home/authhttp.go#L423)
+
+```go
+// Wrap 方法最后一行
+w.WriteHeader(http.StatusUnauthorized)
+```
+
+这行代码直接返回 401，**没有任何日志记录**。既不记录请求来源 IP，也不记录请求路径和方法。这意味着：
+
+- 攻击者暴力扫描 API 路径时不会留下审计痕迹
+- 无法事后追溯哪些未授权请求访问了哪些接口
+- 无法统计未授权访问的频率和来源
+
+#### 10.2.2 各认证方式的审计粒度对比
+
+| 认证方式 | 成功审计 | 失败审计 | 失败时是否有 IP | 日志级别 |
+|---------|---------|---------|---------------|---------|
+| 登录接口 (Session) | ✅ `"successful login"` 含用户+IP | ✅ 含 IP | ✅ | Info / Error |
+| Session Cookie | ❌ 无成功审计 | ❌ 仅 Debug | ❌ | Debug |
+| Basic Auth | ❌ 无成功审计 | ❌ 仅 Debug（限流时 Error） | ❌ | Debug / Error |
+| GLiNet Token | ❌ 无成功审计 | ✅ Error 级 "no authentication cookie" | ❌ | Error / Debug |
+| 最终 401 响应 | — | ❌ **完全无日志** | ❌ | 无 |
+
+**设计不一致性**：
+- 登录接口的审计最完善（有 IP、有用户、有明确级别）
+- 认证中间件的审计粒度极粗（Debug 级别，无 IP）
+- 最终返回 401 时完全没有审计
+
+这导致一个安全盲区：攻击者可以通过 API 接口进行大量未授权尝试，而只会在日志中留下模糊的 `"no user found in request"` Debug 记录，甚至在某些路径上什么都不留下。
+
+#### 10.2.3 业务层二次鉴权的漏审计
+
+除了认证中间件层的漏审计，部分业务 Handler 内部还会进行二次鉴权检查，这些检查的失败也通常没有审计：
+
+**示例：profile 接口**
+
+[internal/home/profilehttp.go:53-59](internal/home/profilehttp.go#L53-L59)
+
+```go
+u, ok := webUserFromContext(ctx)
+if !ok {
+    w.WriteHeader(http.StatusUnauthorized)
+    return
+}
+```
+
+- 直接返回 401，**完全没有日志**
+- 理论上不会走到这里（中间件已认证），但属于防御性编程
+- 如果中间件出现逻辑漏洞导致绕过，这里也不会留下审计痕迹
+
 ### 10.3 Basic Auth 审计
 
 **挂载位置**：`userFromRequestBasicAuth`
@@ -1322,6 +1423,67 @@ if modifiesData(m) {
 | 锁持有时间长 | 整个业务 handler 执行期间都持有锁 |
 
 **典型场景**：多 Tab 同时提交配置修改时，请求会被强制串行，避免并发写入导致的配置不一致。
+
+#### 13.3.1 "多 Tab 刷新 token 触发 controlLock" 的澄清
+
+首先需要澄清：**AdGuard Home 没有 "刷新 token" 这个 API 操作**。
+
+`config.go:195` 的注释 "An active session is automatically refreshed once a day" 是**文档与代码不一致**，实际代码中不存在 session 自动刷新或 token 刷新逻辑。
+
+但如果将"刷新 token"广义理解为以下场景，controlLock 的性能影响如下：
+
+| 场景 | HTTP 方法 | 是否触发 controlLock | 性能影响 |
+|------|----------|---------------------|---------|
+| 多 Tab 刷新页面（GET /） | GET | ❌ 否 | 无影响，完全并发 |
+| 多 Tab 获取 profile（GET /control/profile） | GET | ❌ 否 | 无影响，完全并发 |
+| 多 Tab 同时登录（POST /control/login） | POST | ❌ 否 | 无影响（直接用 mux.Handle 注册，不走 httpReg） |
+| 多 Tab 同时登出（GET /control/logout） | GET | ❌ 否 | 无影响 |
+| 多 Tab 同时更新 profile（PUT /control/profile/update） | PUT | ✅ 是 | 串行执行 |
+| 多 Tab 同时修改 DNS 配置（POST /control/dns_config） | POST | ✅ 是 | 串行执行 |
+
+**关键路径对比**：
+
+```
+登录接口 (POST /control/login):
+  auth middleware → mux.Handle → handleLogin
+  (不经过 httpReg → ensure → controlLock)
+
+其他写接口 (POST /control/*):
+  auth middleware → mux → httpReg → ensureMw → ensure → controlLock.Lock → handler
+```
+
+登录接口特殊之处在于它是通过 `mux.Handle("POST /control/login", ...)` 直接注册的，**不经过** `httpReg.Register`，因此也**不会**被 `ensure` 中间件的 `controlLock` 保护。
+
+#### 13.3.2 controlLock 串行的性能影响分析
+
+**写操作延迟 = 排队时间 + 执行时间**
+
+假设 N 个 Tab 同时发起写请求：
+
+```
+Tab 1:  ████████ (执行 100ms)
+Tab 2:    ████████ (等待 0ms + 执行 100ms)
+Tab 3:      ████████ (等待 100ms + 执行 100ms)
+Tab N:        ...
+```
+
+**性能影响因素**：
+
+| 因素 | 影响程度 | 说明 |
+|------|---------|------|
+| 写操作耗时 | 🔴 高 | 写操作越慢，排队等待越长 |
+| 并发写数量 | 🟡 中 | N 个并发的总耗时约为 N × 单次耗时 |
+| 读写比例 | 🟢 低 | AGH 绝大多数是读操作，写操作很少 |
+| 用户数 | 🟢 低 | 通常只有 1-2 个管理员用户 |
+
+**实际影响评估**：
+
+对于 AdGuard Home 的典型使用场景（家庭/小型网络，1-2 个管理员），`controlLock` 串行化的性能影响**可以忽略不计**：
+- 管理员操作频率低，很少出现并发写
+- 大部分写操作（如修改配置）耗时在几十毫秒级别
+- GET 请求（页面刷新、状态查询）不受影响
+
+但如果有多个 Tab 同时自动刷新某个写操作 API（理论场景），则会出现明显的排队延迟。
 
 ### 13.4 用户上下文传递
 
