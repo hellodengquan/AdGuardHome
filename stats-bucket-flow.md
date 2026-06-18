@@ -1203,3 +1203,190 @@ Handler: web.auth.middleware().Wrap(
 18. **CoW 崩溃安全**：bbolt 写时复制 + meta 双写 + `fdatasync` 刷盘，掉电后要么整事务生效要么整体回退，不会出现半写入的结构性损坏
 19. **双层中间件注入**：Registrar 时注入 3 层（ensure+gzip+postInstall），Server 外层再包 3 层（auth+log+bodyLimit），共 7 层调用链，stats 自身不配置限流
 20. **Session 认证即门禁**：stats 端点无独立 QPS 限流，仅靠 `auth.middleware()` Session 校验控制访问，未登录直接 403
+
+---
+
+## 十一、测试覆盖与限流阈值常量溯源
+
+### 11.1 stats 模块测试文件清单
+
+| 文件 | 包 | 测试类型 | 覆盖范围 |
+|---|---|---|---|
+| `stats_internal_test.go` | `stats`（白盒） | 单元 + 竞态 | 并发读写竞态、按天聚合、月度 loadUnits |
+| `stats_test.go` | `stats_test`（黑盒） | 集成 | 数据写入/读取/Top 统计、大量数据、ShouldCount 过滤 |
+| `http_internal_test.go` | `stats`（白盒） | 单元 | handleStats 参数校验、handlePutStatsConfig 配置更新 |
+| `unit_internal_test.go` | `stats`（白盒） | 单元 | unit 反序列化、TopUpstreams 排序计算 |
+
+### 11.2 桶 ID 相关测试覆盖
+
+#### 11.2.1 固定 ID 测试（`constUnitID`）
+
+`stats_test.go:29` 使用 `constUnitID` 将桶 ID 固定为 0：
+
+```go
+func constUnitID() (id uint32) { return 0 }
+```
+
+- **TestStats** `stats_test.go:52-174`：用 `constUnitID` 测试单桶内的数据写入 → `handleStats` 读取 → 验证 TopQueried / TopBlocked / TopClients / TopUpstreams / DNSQueries 等全部字段
+- **TestLargeNumbers** `stats_test.go:176-225`：用 `atomic.Uint32` 模拟跨小时 ID 递增，12 小时 × 1000 客户端/小时 = 12000 条 Entry，验证 `NumDNSQueries` 总计
+
+#### 11.2.2 并发竞态测试（`TestStats_races`）
+
+`stats_internal_test.go:47-112` 是**唯一的并发安全测试**：
+
+```go
+func TestStats_races(t *testing.T) {
+    var r uint32
+    idGen := func() (id uint32) { return atomic.LoadUint32(&r) }
+    s := newTestStatsCtx(t, Config{UnitID: idGen, Enabled: true})
+    s.Start()
+
+    // 3 轮，每轮 10 个 writer + 5 个 reader 同时操作
+    for round := range 3 {
+        atomic.StoreUint32(&r, uint32(round))  // 模拟 ID 切换
+        // 10 个 goroutine 调用 s.Update(e)
+        // 5 个 goroutine 调用 s.getData(24)
+        startWG.Wait()
+        close(waitCh)  // 同时唤醒所有 goroutine
+        finWG.Wait()
+    }
+}
+```
+
+**覆盖的路径**：`Update()` + `getData()` 并发访问 `curr`、`confMu`、`currMu`
+**未覆盖的路径**：`flushDB()` 切桶时的并发冲突、`Close()` 与 `Update()` 的并发
+
+#### 11.2.3 按天聚合测试（`TestStatsCtx_FillCollectedStats_daily`）
+
+`stats_internal_test.go:114-171` 手工构造 10 天 × 24 小时 = 240 个 `unitDB`，使用 `curID = daysCount * 24`（即 `curHour % 24 == 0`），验证：
+- `TimeUnits == "days"`
+- `BlockedFiltering` / `ReplacedSafebrowsing` / `ReplacedParental` 按天正确累加
+- `DNSQueries` 总计正确
+
+**边界情况**：`curHour % 24 == 0` 时 `hoursInCurDay = 24`，不丢弃任何桶，这是最简单的整除边界。
+
+**未覆盖**：`curHour % 24 != 0` 时的非对齐截断（实际运行中最常见的情况）。
+
+### 11.3 HTTP 端点测试覆盖
+
+#### 11.3.1 handleStats 参数校验（`TestStatsCtx_handleStats`）
+
+`http_internal_test.go:164-241` 覆盖 5 种 recent 参数场景：
+
+| 用例 | recent 值 | 期望 HTTP 状态码 | 说明 |
+|---|---|---|---|
+| short_interval | 4 分钟 | 400 | 小于 1 小时 |
+| long_interval | 72 小时 | 400 | 超过 limit（24h） |
+| interval_is_not_multiple_of_hour | 1h+1ms | 400 | 非小时整数倍 |
+| no_interval | 未传 | 200 | 使用默认 limit |
+| valid_interval | 1h | 200 | 只返回最近 1 小时 |
+
+#### 11.3.2 handlePutStatsConfig 配置更新（`TestHandleStatsConfig`）
+
+`http_internal_test.go:26-132` 覆盖：
+
+| 用例 | 期望 | 说明 |
+|---|---|---|
+| set_ivl_1_minIvl | 200 | 最小合法间隔（1h） |
+| small_interval | 422 | 小于 1h |
+| big_interval | 422 | 大于 365 天 |
+| set_ignored_ivl_1_maxIvl | 200 | 最大合法间隔 + 忽略列表 |
+| enabled_is_null | 422 | enabled 不可为 null |
+
+### 11.4 测试覆盖盲区
+
+| 未覆盖路径 | 位置 | 影响 |
+|---|---|---|
+| `flushDB()` 事务回滚后内存桶状态 | `stats.go:446-489` | 回滚后旧桶数据丢失无测试验证 |
+| `loadUnitFromDB()` GOB 解码失败 | `unit.go:289-293` | 反序列化失败返回 nil 仅靠代码审查，无测试模拟 |
+| bbolt 文件锁冲突（双进程同 db） | `stats.go:394` | 无法在单元测试中模拟多进程 flock |
+| `countHours()` 非整除边界（`curHour%24 != 0`） | `unit.go:540-549` | 最常见的运行时场景无测试 |
+| `periodicFlush` 长时间运行稳定性 | `stats.go:496-502` | 整点切桶 + 并发 Update 无长时间运行测试 |
+| HTTP 中间件 7 层完整调用链 | home 模块 | stats 端点测试绕过中间件，直接调 handler |
+| `authRateLimiter` 对 stats 端点的效果 | home 模块 | 限流器只作用于 /login，stats 无 QPS 限制无相关测试 |
+
+### 11.5 默认限流阈值常量溯源
+
+所有影响 stats 端点访问控制的阈值常量都定义在 `internal/home/` 下，不在 stats 包内：
+
+#### 11.5.1 认证限流阈值
+
+| 常量 | 定义位置 | 默认值 | 说明 |
+|---|---|---|---|
+| `config.AuthAttempts` | `config.go:458` | `5` | 允许的最大登录失败次数 |
+| `config.AuthBlockMin` | `config.go:459` | `15` | 登录失败后封禁分钟数 |
+| `failedAuthTTL` | `authratelimiter.go:10` | `1 * time.Minute` | 失败记录在内存缓存中的 TTL |
+
+**完整配置传递链**：
+
+```
+config.go:458-459  默认值定义
+  config.AuthAttempts = 5
+  config.AuthBlockMin = 15
+        │
+        ▼
+home.go:1075-1081  初始化时读取
+  if config.AuthAttempts > 0 && config.AuthBlockMin > 0 {
+      blockDur := time.Duration(config.AuthBlockMin) * time.Minute
+      rateLimiter = newAuthRateLimiter(blockDur, config.AuthAttempts)
+  } else {
+      rateLimiter = emptyRateLimiter{}   // 两者任一为 0 则禁用限流
+  }
+        │
+        ▼
+auth.go:1084-1089  注入 authConfig
+  authConfig.rateLimiter = rateLimiter
+        │
+        ▼
+auth.go:159-190  认证中间件生效
+  仅在 /login 处理中调用 rateLimiter.check() + rateLimiter.inc()
+```
+
+**注意**：`AuthAttempts` 和 `AuthBlockMin` 通过 YAML 配置文件可覆盖（字段标签 `yaml:"auth_attempts"` / `yaml:"block_auth_min"`），用户可以改为 0 来禁用限流。
+
+#### 11.5.2 请求体大小限制
+
+| 常量 | 定义位置 | 默认值 | 说明 |
+|---|---|---|---|
+| `defaultReqBodySzLim` | `middlewares.go:29` | `64 * datasize.KB` (64KB) | 默认最大请求体 |
+| `largerReqBodySzLim` | `middlewares.go:33` | `4 * datasize.MB` (4MB) | 放宽路径的最大请求体 |
+
+**stats 端点影响**：stats 的 GET 端点不携带请求体，所以 `defaultReqBodySzLim` 对 stats 无实际影响；只有 `POST /control/stats_reset` 和 `PUT /control/stats/config/update` 可能受 64KB 限制，但这些请求体极小，不会触发。
+
+**放宽路径** `middlewares.go:48-53`：只有 `/control/access/set` 和 `/control/filtering/set_rules` 使用 `largerReqBodySzLim`，stats 端点不在其中。
+
+#### 11.5.3 Session 生命周期
+
+| 常量/配置 | 定义位置 | 默认值 | 说明 |
+|---|---|---|---|
+| `sessionsDBName` | `auth.go:21` | `"sessions.db"` | Session 存储 bbolt 文件名 |
+| `config.HTTPConfig.SessionTTL` | `config.go:196` | YAML 可配 | Session 过期时间，活跃会话每天自动续期 |
+| `glTokenTimeout` | `authglinet.go:27` | `3600 * time.Second` (1h) | GL.iNet 设备认证 token TTL |
+
+**stats 端点影响**：Session 过期 → `auth.middleware()` 校验失败 → 403 Forbidden。stats 端点的"限流"本质上就是 Session TTL 控制的访问窗口。
+
+#### 11.5.4 阈值常量与 stats 端点的关联图
+
+```
+stats HTTP 端点访问控制全链路：
+
+  浏览器 → /control/stats
+    │
+    ├─ [1] auth.middleware()  ← SessionTTL 控制 Session 有效期
+    │     ├─ Session Cookie 有效？
+    │     │   ├─ 是 → 放行
+    │     │   └─ 否 → 403（需重新登录）
+    │     │
+    │     └─ /login 请求？
+    │         └─ authRateLimiter.check()  ← AuthAttempts=5 + AuthBlockMin=15min
+    │             ├─ 未封禁 → 校验密码
+    │             │   ├─ 成功 → 移除 rateLimiter 记录
+    │             │   └─ 失败 → rateLimiter.inc() → 达到 5 次则封禁 15 分钟
+    │             └─ 已封禁 → 返回剩余封禁时间
+    │
+    ├─ [2] limitRequestBody  ← defaultReqBodySzLim=64KB（stats GET 请求不受影响）
+    │
+    └─ [3] handleStats()    ← confMu.RLock + currMu.RLock 保护
+```
+
+**结论：stats 端点没有独立的 QPS 限流，也没有请求频率控制。** 整个访问控制由 Session 认证这一个门卫完成，限流阈值（5 次失败 / 15 分钟封禁）只作用于登录接口，不影响已认证用户的 stats API 调用频率。
