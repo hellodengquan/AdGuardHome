@@ -203,6 +203,86 @@ defer func() {
 | `web.registerControlHandlers()` 切换路由 | ❌ 不回滚 | 在 `config.write()` 成功之后才执行，若 write 失败则不会走到这步 |
 | HTTP Server Shutdown（端口变更时） | ❌ 不回滚 | 在返回响应后异步执行，无法回滚 |
 
+### 1.6 Setup Wizard 中途中断后的恢复路径
+
+Setup Wizard 的中断场景可以分为 **进程内中断**（请求失败、panic 等）和 **进程级中断**（进程崩溃、机器断电、用户 Ctrl+C）两类，恢复机制完全不同。
+
+#### 场景一：请求处理过程中失败（进程仍在）
+
+触发点：`handleInstallConfigure` / `finalizeInstall` 内部某个步骤报错返回。
+
+**恢复路径**：
+
+```
+前端收到 4xx/5xx 错误响应
+    ↓
+停留在 Setup Wizard 页面（未跳转）
+    ↓
+用户修改参数后重试 POST /control/install/configure
+    ↓
+重复执行 finalizeInstall() 全部步骤
+    ↓
+最终成功 → web.conf.firstRun = false → 切换路由
+```
+
+关键点：
+- **幂等性**：虽然步骤不是严格幂等的，但重复执行是安全的
+  - `auth.addUser()`：如果用户已存在会返回错误，但由于 Setup 只有一个用户，失败只会在第一次成功之后才发生（概率极低）
+  - `startMods()`：内部 `initDNSServer` 会先检查并清理旧实例再创建新的
+  - `config.write()`：总是用当前内存状态全量覆盖写入
+  - `registerControlHandlers()`：被 `webRegistered` 等标志位保护，不会重复注册
+- **回滚仅恢复内存中的 config 字段**（见 1.5 节），不会回滚磁盘文件
+
+#### 场景二：finalizeInstall 成功但 HTTP Shutdown 异步 goroutine 中崩溃
+
+触发点：`config.write()`、`registerControlHandlers()` 已执行成功，但后续 `shutdownSrv()` 所在 goroutine panic。
+
+**恢复路径**：
+
+```
+finalizeInstall() 返回 200 OK
+    ↓
+前端跳转 Dashboard
+    ↓
+后台 goroutine 执行 shutdownSrv() 时 panic
+    ↓
+slogutil.RecoverAndLog 捕获 panic 并记录日志（不崩溃进程）
+    ↓
+HTTP Server 因 ListenAndServe 返回 ErrServerClosed 而重启 for 循环
+    ↓
+使用新 BindAddr 创建新 Server（正常恢复）
+```
+
+这个场景的保障来自 `web.start()` 的无限 for 循环（`web.go:262`）—— 只要进程不崩溃，HTTP Server 总会自动恢复。
+
+#### 场景三：进程级中断（崩溃/断电/信号）
+
+触发点：在 `config.write()` 之前或之后进程终止。
+
+**关键分界点**：`controlinstall.go:552` 的 `web.conf.firstRun = false` 以及之前的 `config.write()` 调用。
+
+| 中断时机 | 磁盘状态 | 下次启动行为 |
+|---|---|---|
+| `config.write()` 之前 | 没有 `AdGuardHome.yaml` | `detectFirstRun()` → true，重新进入 Setup Wizard |
+| `config.write()` 成功之后 | 已有 `AdGuardHome.yaml` | `detectFirstRun()` → false，正常加载配置启动 |
+| `config.write()` 写入过程中 | renameio 原子写入保证要么旧文件要么新文件，不会有中间态 | 等同于上两种之一 |
+
+#### 场景四：config.write() 成功但 firstRun=false 未持久化
+
+这是一个**潜在的不一致窗口**：
+
+```
+config.write() 成功（磁盘已有 YAML）
+    ↓ （尚未执行 web.conf.firstRun = false）
+进程崩溃
+    ↓
+下次启动：detectFirstRun() 发现 YAML 存在 → 返回 false
+    ↓
+正常启动，跳过 Setup Wizard ✅
+```
+
+结论：只要 `config.write()` 成功了，即使后续步骤中断，下次启动也会走正常加载路径。**真正不安全的只有 `config.write()` 之前的中断**——此时磁盘上没有 YAML，只能重来。
+
 ---
 
 ## 二、版本迁移（Config Migration）
@@ -574,13 +654,162 @@ func (s *Module) handleUpdateConfig(w http.ResponseWriter, r *http.Request) {
 
 典型示例：`internal/stats/http.go:227` 的 `handlePutStatsConfig()`、`internal/home/tls.go:566` 的 `handleTLSConfigure()`。
 
-### 3.7 并发控制
+### 3.7 并发配置写入的锁保护机制
 
-- `globalContext.controlLock` (`home.go:73`)：所有修改数据的 HTTP 请求（POST/PUT/DELETE）在进入业务 Handler 前会持有此互斥锁，确保同一时刻只有一个配置修改操作。见 `internal/home/control.go:251` 的 `ensure()` 中间件。
-- `configuration.RWMutex`：全局 config 对象自身的读写锁。
-- `dnsforward.Server.serverLock`：DNS 服务器重配时的写锁。
-- `tlsManager.mu`：TLS 配置互斥锁。
-- `configmgr.Manager.updMu`：下一代架构（internal/next）的配置管理器读写锁。
+AdGuard Home 的锁设计是**多层嵌套**的，从全局 HTTP 请求级别的互斥锁，到各个模块内部的细粒度读写锁，形成了一个清晰的锁层级。
+
+#### 锁层级全景
+
+```
+请求进入
+  │
+  ├─ L1: globalContext.controlLock (sync.Mutex) —— 所有 POST/PUT/DELETE 请求全局互斥
+  │     挂载点: control.go:251 ensure() 中间件
+  │
+  ├─ 业务 Handler 执行
+  │     │
+  │     ├─ L2a: tlsManager.mu (sync.Mutex) —— TLS 配置读写互斥
+  │     │     挂载点: tls.go:591 handleTLSConfigure()
+  │     │
+  │     ├─ L2b: dnsforward.Server.serverLock (sync.RWMutex) —— DNS 服务器状态
+  │     │     读锁: 所有 DNS 查询处理 (process.go:161)、读配置 (http.go:148)
+  │     │     写锁: setConfig()、Reconfigure()、Start()、Stop()
+  │     │
+  │     ├─ L2c: stats.confMu (sync.RWMutex) —— 统计配置
+  │     ├─ L2d: querylog.confMu (sync.RWMutex) —— 查询日志配置
+  │     └─ ... 其他模块 confMu
+  │
+  ├─ defer ConfigModifier.Apply() 触发配置持久化
+  │     │
+  │     └─ L3: configuration.Lock() (sync.RWMutex 写锁)
+  │           挂载点: config.go:881 configuration.write()
+  │
+  └─ 响应返回
+```
+
+#### L1：全局请求级互斥锁 controlLock
+
+`home.go:73` 定义：
+```go
+type homeContext struct {
+    ...
+    controlLock sync.Mutex
+}
+```
+
+`control.go:251` 的 `ensure()` 中间件对所有数据修改请求加锁：
+
+```go
+func (web *webAPI) ensure(method string, handler ...) (wrapped http.HandlerFunc) {
+    return func(w http.ResponseWriter, r *http.Request) {
+        // ... 方法校验、Content-Type 校验 ...
+
+        if modifiesData(m) {   // POST || PUT || DELETE
+            globalContext.controlLock.Lock()
+            defer globalContext.controlLock.Unlock()
+        }
+
+        handler(w, r)
+    }
+}
+```
+
+**影响范围**：
+- ✅ 同一时刻只能有一个 POST/PUT/DELETE 请求在执行（包括不同模块的不同 API）
+- ❌ 这是一个粗粒度锁，会阻塞并行的无关联配置修改（比如改 stats 配置和改 TLS 配置不能并发）
+- ❌ GET 请求不受影响，可以并发读
+
+**锁覆盖范围**：整个 Handler 执行期间（包括 `defer ConfigModifier.Apply()` → `config.write()`），`controlLock` 一直持有。这意味着 `L1 ⊃ L2 ⊃ L3`，外层锁总是在持有状态下获取内层锁，**不会出现死锁**（只要所有请求都通过 ensure 中间件进入）。
+
+#### L2：模块级锁（每个模块独立）
+
+| 锁 | 类型 | 保护对象 | 写锁场景 | 读锁场景 |
+|---|---|---|---|---|
+| `tlsManager.mu` | `sync.Mutex` | TLS 配置、证书状态、servePlainDNS | `handleTLSConfigure()`、`reload()`、`reconfigureDNSServer()` | 无（使用 Mutex，读写都互斥） |
+| `dnsforward.Server.serverLock` | `sync.RWMutex` | DNS 服务器整体状态、conf、isRunning | `setConfig()`、`Reconfigure()`、`Start()`、`Stop()`、`handleSetProtection()` | DNS 请求处理 (`process.go:161`)、读配置 (`getDNSConfig`)、访问控制检查 |
+| `stats.confMu` | `sync.RWMutex` | stats 的 limit/enabled/ignored 配置 | `handlePutStatsConfig()`、`handleResetConfig()` | `handleGetStatsConfig()`、数据写入时检查 enabled |
+| `querylog.confMu` | `sync.RWMutex` | querylog 的 enabled/fileEnabled/interval 等 | `handlePutConfig()`、`handlePutAnonymizeClientIP()` | `handleGetConfig()`、日志写入时检查配置 |
+| `updater.mu` | `sync.RWMutex` | 版本更新状态 | 检查更新、执行更新 | 读取更新状态 |
+
+**关键细节 —— dnsforward.serverLock 的写锁范围**：
+
+`Reconfigure()` (`dnsforward.go:848`) 写锁覆盖整个停止→等待→重建→启动过程（可能耗时数百毫秒），期间所有 DNS 查询被阻塞。
+
+```go
+func (s *Server) Reconfigure(ctx context.Context, conf *ServerConfig) error {
+    s.serverLock.Lock()          // 写锁开始
+    defer s.serverLock.Unlock()
+    s.stopLocked(ctx)            // 停 DNS
+    time.Sleep(100 * time.Millisecond)
+    s.addrProc.Close()
+    s.Prepare(ctx, conf)         // 重建 proxy
+    s.startLocked(ctx)           // 启 DNS
+}                                // 写锁释放
+```
+
+#### L3：全局配置写锁 configuration.RWMutex
+
+`config.go:167`：
+```go
+type configuration struct {
+    ...
+    sync.RWMutex `yaml:"-"`
+}
+```
+
+写锁仅在 `configuration.write()` (`config.go:881`) 中持有，时间很短（仅 YAML 序列化 + renameio 写入磁盘）。
+
+```go
+func (c *configuration) write(...) (err error) {
+    c.Lock()              // 写锁开始
+    defer c.Unlock()
+    // 从各模块拉取配置 → 序列化 YAML → 原子写入
+}
+```
+
+读锁分散在各处，例如 `handleHTTPSRedirect` (`control.go:377`)、`handleStatus` (`control.go:146`) 等。
+
+#### 锁顺序与死锁防护
+
+锁的获取顺序严格按照 **L1 → L2 → L3** 的层次：
+
+```
+controlLock (L1)  ─┬─► tlsManager.mu (L2a) ─► config.Lock (L3)
+                   ├─► serverLock (L2b)    ─► config.Lock (L3)
+                   ├─► stats.confMu (L2c)  ─► config.Lock (L3)
+                   └─► ...
+```
+
+**反向获取永远不会发生**，因为：
+1. L2 和 L3 的获取只在 HTTP Handler 内进行，而所有写请求的 Handler 都被 L1 保护
+2. `config.write()` (L3) 只被 `ConfigModifier.Apply()` 调用，后者只在 Handler 的 defer 中触发（此时 L1 已持有）
+3. DNS 请求处理路径只获取 `serverLock.RLock()` (L2b)，不会再获取 L1 或 L3
+
+唯一的潜在风险是 TLS 配置更新路径中同时持有 `tlsManager.mu` 和调用 `config.Lock()`：
+
+```go
+// tls.go:585-638 handleTLSConfigure()
+m.mu.Lock()                          // L2a 已持有
+...
+if req.ServePlainDNS != aghalg.NBNull {
+    config.Lock()                     // 获取 L3
+    defer config.Unlock()
+    config.DNS.ServePlainDNS = ...
+}
+m.reconfigureDNSServer(ctx)           // 内部获取 serverLock.Lock() (L2b)
+...
+// defer: m.confModifier.Apply() → config.write() → config.Lock() (L3)
+```
+
+这里的 `L2a → L3` 顺序与其他模块的 `L2b → L3` 顺序一致，不会导致交叉死锁。
+
+#### 锁保护之外的并发风险
+
+| 风险点 | 说明 |
+|---|---|
+| `config` 全局变量直接赋值 | 代码中存在大量 `config.DNS.Port = ...` 这种直接写全局变量的操作，如果不在锁保护下进行，存在数据竞争。实际中靠 L1 `controlLock` 间接保护（所有写请求都持 L1） |
+| `globalContext.*` 模块指针 | 这些指针在启动时初始化后不再替换，但指向的对象内部有各自的锁 |
+| `firstRun` 字段 | `web.conf.firstRun` 在 finalizeInstall 中被设置为 false，只写一次且在 L1 保护下，无并发问题 |
 
 ---
 
