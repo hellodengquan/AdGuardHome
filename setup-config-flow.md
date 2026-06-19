@@ -283,6 +283,120 @@ config.write() 成功（磁盘已有 YAML）
 
 结论：只要 `config.write()` 成功了，即使后续步骤中断，下次启动也会走正常加载路径。**真正不安全的只有 `config.write()` 之前的中断**——此时磁盘上没有 YAML，只能重来。
 
+### 1.7 多 Client 并发调 Setup API 的资源竞争路径
+
+Setup 阶段有 3 个 API 端点，它们的中介件保护和竞争风险各不相同：
+
+```
+GET  /control/install/get_addresses  → preInstallHandler（无锁）
+POST /control/install/check_config   → preInstallHandler + ensure（controlLock）
+POST /control/install/configure      → preInstallHandler + ensure（controlLock）
+```
+
+#### 竞争路径一：GET get_addresses 与 POST configure 的读写竞争
+
+`get_addresses` 是 GET 请求，**不经过 `ensure()` 中间件**，因此不持有 `controlLock`。
+
+```
+Client A: GET /install/get_addresses            （无锁，并发执行）
+Client B: POST /install/configure               （持 controlLock）
+  ├─ config.DNS.BindHosts = [req.DNS.IP]        （写全局变量）
+  ├─ config.DNS.Port = req.DNS.Port             （写全局变量）
+  ├─ config.HTTPConfig.Address = ...            （写全局变量）
+  └─ web.conf.firstRun = false
+```
+
+如果 Client A 的 `handleInstallGetAddresses` 正在读取 `web.conf.defaultWebPort`，而 Client B 的 `finalizeInstall` 正在修改 `config.DNS.Port`，理论上存在 data race。
+
+**实际风险**：极低。因为：
+1. `get_addresses` 只读 `web.conf.defaultWebPort` 和 `defaultPortDNS`，这两个值在 Setup 期间不会被 `configure` 修改
+2. Go 的 `net/http` 默认为每个请求创建独立 goroutine，但 `handleInstallGetAddresses` 中没有读共享可变状态
+
+#### 竞争路径二：两个 POST configure 的双写竞争
+
+两个浏览器标签页同时提交 Setup：
+
+```
+Client A: POST /install/configure  ──┐
+                                      ├─ controlLock 互斥，串行执行
+Client B: POST /install/configure  ──┘
+```
+
+`controlLock` 保证了串行，但问题在于 **第一个请求完成后 `firstRun` 被设为 false**，第二个请求会被 `preInstallHandler` 拦截：
+
+```go
+// control.go:340-352
+func (web *webAPI) preInstallHandler(handler http.Handler) (wrapped http.Handler) {
+    return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+        if !web.conf.firstRun {
+            http.Error(w, http.StatusText(http.StatusForbidden), http.StatusForbidden)
+            return
+        }
+        handler.ServeHTTP(w, r)
+    })
+}
+```
+
+**竞争时序分析**：
+
+| 时刻 | Client A | Client B | firstRun |
+|---|---|---|---|
+| T1 | 获取 controlLock | 等待 | true |
+| T2 | addUser(), startMods(), config.write() | 等待 | true |
+| T3 | web.conf.firstRun = false | 等待 | **false** |
+| T4 | registerControlHandlers(), 返回 200 | 获取 controlLock | false |
+| T5 | — | 进入 preInstallHandler | false |
+| T6 | — | **返回 403 Forbidden** | false |
+
+Client B 会被 **403 拒绝**，因为 `firstRun` 已经被 Client A 设为 false。
+
+**但是**：`firstRun` 的读写**没有原子操作保护**。`preInstallHandler` 在 `ensure()` 中间件 **之前** 执行，所以 Client B 在 T4 获取 `controlLock` 之前，就已经检查了 `firstRun`。极端情况下：
+
+```
+Client B: preInstallHandler 检查 firstRun == true（通过！）
+Client A: 同时执行 finalizeInstall，设置 firstRun = false
+Client B: 获取 controlLock，执行 handleInstallConfigure
+Client B: addUser() → panic!（用户已存在）
+```
+
+这是 `web.conf.firstRun` 字段 **缺少原子/锁保护** 导致的潜在 data race。实际触发概率极低（需要两个请求在微秒级窗口内交叉），但 `go race detector` 可以检测到。
+
+#### 竞争路径三：POST configure 与 GET 普通页面的路由竞争
+
+`finalizeInstall` 在 `config.write()` 成功后执行 `registerControlHandlers()`，这会向 `mux` 注册新的路由。同时 HTTP Server 还在处理其他请求。
+
+```
+Client A: POST /install/configure
+  └─ registerControlHandlers()  // 向 mux 注册 /control/status 等路由
+
+Client C: GET /control/status    // 尝试访问刚注册的路由
+```
+
+Go 的 `http.ServeMux` 不是并发安全的写入对象，但 `registerControlHandlers` 在 `controlLock` 保护下执行，而 `mux.Handle` 只在启动时和 Setup 完成时调用（各一次），所以实际不会出现并发写入 `mux` 的情况。
+
+#### 竞争路径四：addUser 的重复创建
+
+`auth.addUser()` 内部调用 `aghuser.DefaultDB.Create()`，后者用 `sync.Mutex` 保护且检查重复：
+
+```go
+// aghuser/db.go:127-148
+func (db *DefaultDB) Create(ctx context.Context, u *User) (err error) {
+    db.mu.Lock()
+    defer db.mu.Unlock()
+    // 检查 UserID 重复
+    _, ok := db.userIDToUser[u.ID]
+    if ok { return fmt.Errorf("userid: %w", errors.ErrDuplicated) }
+    // 检查 Login 重复
+    _, ok = db.loginToUserID[u.Login]
+    if ok { return fmt.Errorf("login: %w", errors.ErrDuplicated) }
+    // 插入
+    db.userIDToUser[u.ID] = u
+    db.loginToUserID[u.Login] = u.ID
+}
+```
+
+如果竞争路径二中的极端情况发生（两个 configure 同时进入 `addUser`），第二个会因 `ErrDuplicated` 而 panic（`auth.go:218` 的 `panic(err)`），导致请求 500 但不会破坏数据。
+
 ---
 
 ## 二、版本迁移（Config Migration）
@@ -434,11 +548,182 @@ func upgradeConfigSchema(diskConf yobj, upgrades ...migrateFunc) (err error) {
 
 ---
 
-## 三、运行时配置热加载
+## 三、敏感数据与配置加密存储
+
+AdGuard Home 的 YAML 配置文件中存储了两类敏感数据：**用户密码** 和 **TLS 私钥**。它们采用了不同的保护策略。
+
+### 3.1 用户密码：bcrypt 单向哈希
+
+#### 写入挂载点
+
+用户密码在两个入口被哈希后存储：
+
+**入口一：Setup Wizard 创建管理员**
+
+`auth.go:204-227` 的 `addUser()` 是 Setup 创建管理员用户时的调用点：
+
+```go
+func (a *auth) addUser(ctx context.Context, u *webUser, password string) (err error) {
+    hash, err := bcrypt.GenerateFromPassword([]byte(password), bcrypt.DefaultCost)
+    if err != nil {
+        return fmt.Errorf("generating hash: %w", err)
+    }
+    u.PasswordHash = string(hash)
+    err = a.users.Create(ctx, u.toUser())  // 存入 DefaultDB（内存）
+    // ...
+}
+```
+
+`addUser()` 只修改内存中的 `aghuser.DefaultDB`，密码哈希的磁盘持久化由后续的 `config.write()` 完成（见 3.6 节 `configuration.write()` 中 `auth.usersList()` → `config.Users` → YAML 序列化）。
+
+**入口二：配置迁移 v4 → v5（明文→哈希）**
+
+`configmigrate/v5.go:24-48` 是历史遗留的明文密码迁移：
+
+```go
+func (m *Migrator) migrateTo5(_ context.Context, diskConf yobj) (err error) {
+    // 从 auth_name + auth_pass 迁移到 users[].name + users[].password
+    pass, ok, err := fieldVal[string](diskConf, "auth_pass")
+    delete(diskConf, "auth_pass")
+    hash, err := bcrypt.GenerateFromPassword([]byte(pass), bcrypt.DefaultCost)
+    user["password"] = string(hash)  // 哈希后写入 YAML
+    diskConf["users"] = yarr{user}
+}
+```
+
+v5 迁移是**唯一读取明文密码**的地方，之后的版本中密码在 YAML 里始终以 bcrypt 哈希存储。
+
+#### 验证挂载点
+
+`aghuser/aghuser.go:52-53` 的 `DefaultPassword.Authenticate()` 是登录验证的调用点：
+
+```go
+func (p *DefaultPassword) Authenticate(ctx context.Context, passwd string) (ok bool) {
+    return bcrypt.CompareHashAndPassword([]byte(p.hash), []byte(passwd)) == nil
+}
+```
+
+调用链：`handleLogin()` → `auth.middleware()` → `DefaultPassword.Authenticate()`
+
+#### YAML 中的存储格式
+
+```yaml
+users:
+- name: admin
+  password: $2a$10$N9qo8uLOickgx2ZMRZoMyeIjZAgcfl7p92ldGxad68LJZdL17lhWy
+```
+
+`password` 字段存储的是 bcrypt 哈希值（`$2a$` 前缀），明文密码永远不会写入 YAML。
+
+### 3.2 TLS 私钥：明文存储 + 文件引用两种模式
+
+`config.go:300-363` 的 `tlsConfigSettings` 定义了两对互斥字段：
+
+```go
+type tlsConfigSettings struct {
+    // 模式一：内联存储（明文写入 YAML）
+    CertificateChain string `yaml:"certificate_chain" json:"certificate_chain"`
+    PrivateKey       string `yaml:"private_key"       json:"private_key"`
+
+    // 模式二：文件路径引用（不写入 YAML）
+    CertificatePath  string `yaml:"certificate_path"  json:"certificate_path"`
+    PrivateKeyPath   string `yaml:"private_key_path"  json:"private_key_path"`
+
+    // 运行时加载的二进制数据（yaml:"-" json:"-" 不序列化）
+    CertificateChainData []byte `yaml:"-" json:"-"`
+    PrivateKeyData       []byte `yaml:"-" json:"-"`
+}
+```
+
+#### 模式一：内联存储
+
+用户通过 API 提交证书/私钥内容（`certificate_chain` + `private_key`），数据直接以 PEM 格式明文写入 YAML：
+
+```yaml
+tls:
+  certificate_chain: |
+    -----BEGIN CERTIFICATE-----
+    MIIFazCCA1OgAwIBAgIRAIIQz7DSQONZRGPgu2OCiwAwDQYJKoZIhvcNAQEL...
+    -----END CERTIFICATE-----
+  private_key: |
+    -----BEGIN PRIVATE KEY-----
+    MIIEvgIBADANBgkqhkiG9w0BAQEFAASCBKgwggSkAgEAAQIBAQCN/Y6b...
+    -----END PRIVATE KEY-----
+```
+
+**安全隐患**：私钥以明文形式存储在 YAML 文件中，任何有文件读权限的进程都能获取。
+
+#### 模式二：文件路径引用
+
+用户指定证书和私钥的文件路径，YAML 中只存储路径：
+
+```yaml
+tls:
+  certificate_path: /path/to/cert.pem
+  private_key_path: /path/to/key.pem
+```
+
+**加载挂载点**：`tls.go:361-375` 的 `loadCertificateChainData()` 和 `loadPrivateKeyData()`：
+
+```go
+func loadCertificateChainData(extTLSConf *tlsConfigSettings) (err error) {
+    extTLSConf.CertificateChainData = []byte(extTLSConf.CertificateChain)
+    if extTLSConf.CertificatePath != "" {
+        if extTLSConf.CertificateChain != "" {
+            return errors.Error("certificate data and file can't be set together")
+        }
+        extTLSConf.CertificateChainData, err = os.ReadFile(extTLSConf.CertificatePath)
+    }
+}
+```
+
+`CertificateChainData` 和 `PrivateKeyData` 标记为 `yaml:"-" json:"-"`，确保：
+- 不会被写入 YAML 文件
+- 不会被返回给前端 API（`json:"-"`）
+
+运行时热加载也走这条路径：`handleCertFileChange()` → `reload()` → `loadTLSConfig()` → `loadCertificateChainData()`。
+
+#### 模式互斥校验
+
+`loadCertificateChainData()` (`tls.go:365`) 和 `loadPrivateKeyData()` 都校验：如果同时提供了内联数据和文件路径，直接报错。这保证了两种模式不会混淆。
+
+### 3.3 Session 存储：bbolt 加密无关 + 内存索引
+
+`aghuser/sessionstorage.go` 使用 bbolt（BoltDB）存储 session 数据：
+
+```
+sessions.db (bbolt)
+  └─ bucket "sessions-2"
+      ├─ token₁ → {userLogin, expire, userID}
+      ├─ token₂ → {userLogin, expire, userID}
+      └─ ...
+```
+
+- Session token 由 `crypto/rand` 生成（`session.go:15`），32 字节随机数
+- bbolt 文件本身**不加密**，session 数据以 gob 序列化存储
+- 内存中维护 `map[SessionToken]*Session` 索引（`sessionstorage.go:83`），由 `sync.Mutex` 保护
+- `DefaultSessionStorage.mu` 保证并发安全（`sessionstorage.go:75`）
+
+### 3.4 敏感数据保护总览
+
+| 数据类型 | 存储位置 | 保护方式 | 风险点 |
+|---|---|---|---|
+| 用户密码 | `AdGuardHome.yaml` → `users[].password` | bcrypt 哈希（`$2a$10$`） | 无 |
+| TLS 私钥（内联模式） | `AdGuardHome.yaml` → `tls.private_key` | **明文** | ⚠️ 文件读权限即可获取私钥 |
+| TLS 私钥（文件引用模式） | 外部文件 | 文件系统权限 | 依赖 OS 文件权限保护 |
+| TLS 证书/私钥运行时数据 | 内存 `CertificateChainData`/`PrivateKeyData` | `yaml:"-" json:"-"` 不暴露 | 内存 dump 可获取 |
+| Session token | `sessions.db` (bbolt) | `crypto/rand` 生成 | bbolt 文件不加密 |
+| API 认证 | Cookie / Basic Auth | Session token 或 bcrypt 验证 | 明文 HTTP 下可被嗅探 |
+
+**结论**：AdGuard Home 对用户密码使用了业界标准的 bcrypt 单向哈希保护，但对 TLS 私钥的内联存储是明文的。如果需要更高的安全性，应使用文件引用模式并配合 OS 级文件权限保护。
+
+---
+
+## 四、运行时配置热加载
 
 AdGuard Home 的热加载机制分为两层：**配置持久化**（写入 YAML 文件）和 **运行时生效**（通知各模块重配）。
 
-### 3.1 ConfigModifier 接口
+### 4.1 ConfigModifier 接口
 
 `internal/agh/agh.go:15` 定义了统一的配置修改回调接口：
 
@@ -469,7 +754,7 @@ func (cm *defaultConfigModifier) Apply(ctx context.Context) {
 }
 ```
 
-### 3.2 配置持久化：configuration.write()
+### 4.2 配置持久化：configuration.write()
 
 `internal/home/config.go:873` - 将所有模块的运行时状态汇总到全局 `config` 对象后，使用 `renameio` 原子写入磁盘：
 
@@ -499,7 +784,7 @@ func (c *configuration) write(
 }
 ```
 
-### 3.3 DNS 服务器热重载
+### 4.3 DNS 服务器热重载
 
 `internal/dnsforward/dnsforward.go:848` 的 `Server.Reconfigure()` 是 DNS 运行时重配的核心：
 
@@ -526,7 +811,7 @@ func (s *Server) Reconfigure(ctx context.Context, conf *ServerConfig) error {
 
 > **注释 TODO** (`dnsforward.go:650`)：`Some of these could probably be updated without a restart.` 代码作者也承认目前的实现比较"粗暴"，理论上很多配置可以做到真正的热更新而不需要重启整个 proxy。
 
-### 3.4 DNS 监听端口与绑定地址的运行时更改
+### 4.4 DNS 监听端口与绑定地址的运行时更改
 
 这是一个容易混淆的点：**DNS 普通端口（53）和绑定 IP 无法通过运行时 API 修改，只有 TLS 相关端口可以热更。**
 
@@ -600,7 +885,7 @@ newConf := &dnsforward.ServerConfig{
 3. **历史包袱**：DNS 端口和绑定 IP 在启动流程早期就确定了（`setupContext` 阶段就要检查端口占用），深耦合到整个启动流程
 4. **需求少**：实际使用场景中，DNS 端口一旦设好就很少改动
 
-### 3.5 TLS 证书文件自动热加载（DNS 端口热更的特殊场景）
+### 4.5 TLS 证书文件自动热加载（DNS 端口热更的特殊场景）
 
 `internal/home/tls.go:217` 的 `handleCertFileChange()` 通过文件系统事件监控证书变更：
 
@@ -629,7 +914,7 @@ func (m *tlsManager) reload(ctx context.Context) {
 }
 ```
 
-### 3.6 各模块配置更新的通用模式
+### 4.6 各模块配置更新的通用模式
 
 所有模块的配置更新 HTTP Handler 都遵循同一模式：
 
@@ -654,7 +939,7 @@ func (s *Module) handleUpdateConfig(w http.ResponseWriter, r *http.Request) {
 
 典型示例：`internal/stats/http.go:227` 的 `handlePutStatsConfig()`、`internal/home/tls.go:566` 的 `handleTLSConfigure()`。
 
-### 3.7 并发配置写入的锁保护机制
+### 4.7 并发配置写入的锁保护机制
 
 AdGuard Home 的锁设计是**多层嵌套**的，从全局 HTTP 请求级别的互斥锁，到各个模块内部的细粒度读写锁，形成了一个清晰的锁层级。
 
@@ -813,7 +1098,7 @@ m.reconfigureDNSServer(ctx)           // 内部获取 serverLock.Lock() (L2b)
 
 ---
 
-## 四、三者关系全景图
+## 五、全局关系全景图
 
 ```
 AdGuardHome 启动
@@ -860,7 +1145,7 @@ detectFirstRun() ── 配置文件存在？
 
 ---
 
-## 五、关键代码索引
+## 六、关键代码索引
 
 ### Setup 与初始化
 
@@ -884,7 +1169,23 @@ detectFirstRun() ── 配置文件存在？
 | upgradeConfigSchema() 顺序迁移 | `internal/configmigrate/migrator.go` | 108 |
 | LastSchemaVersion (v34) | `internal/configmigrate/configmigrate.go` | 5 |
 | YAML 工具函数 fieldVal/moveVal | `internal/configmigrate/yaml.go` | 17 |
+| v5 明文密码→bcrypt 迁移 | `internal/configmigrate/v5.go` | 24 |
 | v34 迁移示例 | `internal/configmigrate/v34.go` | 26 |
+
+### 敏感数据与加密存储
+
+| 功能 | 文件 | 行号 |
+|---|---|---|
+| bcrypt 密码哈希 (addUser) | `internal/home/auth.go` | 204 |
+| bcrypt 密码验证 (Authenticate) | `internal/aghuser/aghuser.go` | 52 |
+| 用户 DB (DefaultDB) 并发安全 | `internal/aghuser/db.go` | 46 |
+| DefaultDB.Create() 重复检查 | `internal/aghuser/db.go` | 127 |
+| TLS 私钥内联/文件引用模式 | `internal/home/config.go` | 335 |
+| CertificateChainData/PrivateKeyData 不序列化 | `internal/home/config.go` | 353 |
+| loadCertificateChainData() | `internal/home/tls.go` | 361 |
+| Session 存储 (bbolt) | `internal/aghuser/sessionstorage.go` | 67 |
+| Session token 生成 (crypto/rand) | `internal/aghuser/session.go` | 15 |
+| preInstallHandler (firstRun 守卫) | `internal/home/control.go` | 338 |
 
 ### 运行时热加载
 
