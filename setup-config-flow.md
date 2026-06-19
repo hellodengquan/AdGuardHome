@@ -139,6 +139,70 @@ func (web *webAPI) start(ctx context.Context) {
 
 当 `handleInstallConfigure` 检测到 Web 端口/IP 变更时，会调用 `web.httpServer.Shutdown()`，`ListenAndServe()` 返回 `http.ErrServerClosed`，外层 for 循环重新以新的 `BindAddr` 创建 Server。
 
+### 1.5 Setup 失败回滚机制
+
+`finalizeInstall()` 是整个 Setup 流程中最核心、最容易失败的环节。其回滚机制是**分层、局部**的，并非事务级全量回滚。
+
+#### 回滚层级一：配置值回滚（最外层）
+
+`controlinstall.go:484-492` - 仅回滚 DNS/Web 地址和端口：
+
+```go
+curConfig := &configuration{}
+copyInstallSettings(curConfig, config)   // 先备份当前配置
+
+defer func() {
+    if err != nil {
+        copyInstallSettings(config, curConfig)  // 失败时回滚
+    }
+}()
+
+// 之后才修改这些值
+config.DNS.BindHosts = []netip.Addr{req.DNS.IP}
+config.DNS.Port = req.DNS.Port
+config.HTTPConfig.Address = netip.AddrPortFrom(req.Web.IP, req.Web.Port)
+```
+
+`copyInstallSettings()` (`controlinstall.go:374`) 只复制 3 个字段：
+
+```go
+func copyInstallSettings(dst, src *configuration) {
+    dst.HTTPConfig = src.HTTPConfig
+    dst.DNS.BindHosts = src.DNS.BindHosts
+    dst.DNS.Port = src.DNS.Port
+}
+```
+
+> **注意**：这层回滚只能恢复 config 对象上的 HTTP/DNS 地址字段，无法回滚已经启动的服务器、已经写入磁盘的文件、已经创建的用户。
+
+#### 回滚层级二：DNS 服务器初始化失败
+
+`dns.go:159-163` - `initDNSServer()` 内部失败时关闭 DNS 服务器：
+
+```go
+globalContext.dnsServer, err = dnsforward.NewServer(...)
+defer func() {
+    if err != nil {
+        closeDNSServer(ctx)
+    }
+}()
+```
+
+`closeDNSServer()` 会清理 `globalContext.dnsServer`、`stats`、`queryLog`、`filters` 等模块。
+
+#### 回滚层级三：配置文件写入失败
+
+`config.write()` 自身使用 `renameio` 原子写入（先写临时文件，再 `rename`），所以写入过程中失败不会损坏已有配置文件。但是如果 **之前的步骤都成功了，只有最后写文件失败**，就会出现 **运行时状态已变更但磁盘未持久化** 的不一致状态 —— 进程重启后配置会丢失。
+
+#### 不回滚的操作
+
+| 操作 | 失败是否回滚 | 原因 |
+|---|---|---|
+| `web.auth.addUser()` 创建用户 | ❌ 不回滚 | 用户信息仅存在内存，`copyInstallSettings` 不包含用户 |
+| `startMods()` 启动 DNS/TLS 等模块 | ⚠️ 部分回滚 | 子模块有各自的 defer 清理，但整体无 SAGA 编排 |
+| `web.registerControlHandlers()` 切换路由 | ❌ 不回滚 | 在 `config.write()` 成功之后才执行，若 write 失败则不会走到这步 |
+| HTTP Server Shutdown（端口变更时） | ❌ 不回滚 | 在返回响应后异步执行，无法回滚 |
+
 ---
 
 ## 二、版本迁移（Config Migration）
@@ -245,7 +309,46 @@ func (m Migrator) migrateTo34(_ context.Context, diskConf yobj) (err error) {
 }
 ```
 
-### 2.5 测试保障
+### 2.5 迁移失败回滚机制
+
+迁移过程中如果某一步失败，整个迁移流程会**立即中止并返回错误**，但**不会回滚到之前的 schema_version**。这是一个值得注意的设计决策。
+
+#### 迁移执行路径
+
+`migrator.go:108` 的 `upgradeConfigSchema()` 按顺序逐个调用迁移函数：
+
+```go
+func upgradeConfigSchema(diskConf yobj, upgrades ...migrateFunc) (err error) {
+    for i, migrate := range upgrades {
+        err = migrate(diskConf)
+        if err != nil {
+            // 失败时直接返回错误，不回滚已完成的迁移
+            return fmt.Errorf("version %d: %w", i+1, err)
+        }
+    }
+    return nil
+}
+```
+
+#### 两层安全保障
+
+虽然没有显式的回滚逻辑，但有两层安全机制防止损坏数据：
+
+| 层级 | 机制 | 位置 | 作用 |
+|---|---|---|---|
+| 第一层 | **内存中操作** | `migrator.go:45` `Migrate()` | 整个迁移在 `yobj`（`map[string]any`）内存对象上进行，不修改原始 YAML 字节 |
+| 第二层 | **原子写回** | `config.go:684` `parseConfig()` | 迁移成功后才调用 `maybe.WriteFile()`（内部用 renameio），失败则不写 |
+
+#### 迁移失败的影响
+
+如果从 v10 迁到 v34 过程中 v25 的迁移函数报错：
+1. **磁盘文件不变** —— 仍是 v10 格式（原子写入未触发）
+2. **程序启动失败** —— `parseConfig()` 返回错误，程序无法继续运行
+3. **无法降级重试** —— 迁移是单向的，且没有回滚函数，只能人工修复配置文件
+
+> **设计权衡**：每个迁移函数本身是"幂等 + 小步"的，且配置文件是只读的（迁移过程中），所以即使中途失败，最坏情况是启动失败，不会破坏数据。
+
+### 2.6 测试保障
 
 `internal/configmigrate/testdata/TestMigrateConfig_Migrate/` 目录下每个版本都有 `input.yml` 和 `output.yml` 用例，通过 `configmigrate_test.go` 驱动迁移测试，确保每个版本迁移的输入输出严格符合预期。
 
@@ -339,19 +442,85 @@ func (s *Server) Reconfigure(ctx context.Context, conf *ServerConfig) error {
 }
 ```
 
-典型的调用链（以 TLS 配置更新为例）：
+`Reconfigure()` 的本质是 **停止 → 重建 → 启动** 的全量热重启，不是增量更新。虽然叫 "Reconfigure"，但内部实现是把整个 DNS proxy 销毁重建。
+
+> **注释 TODO** (`dnsforward.go:650`)：`Some of these could probably be updated without a restart.` 代码作者也承认目前的实现比较"粗暴"，理论上很多配置可以做到真正的热更新而不需要重启整个 proxy。
+
+### 3.4 DNS 监听端口与绑定地址的运行时更改
+
+这是一个容易混淆的点：**DNS 普通端口（53）和绑定 IP 无法通过运行时 API 修改，只有 TLS 相关端口可以热更。**
+
+#### 现状：两种端口，两种命运
+
+| 端口类型 | 配置字段 | 能否运行时热更 | 触发方式 |
+|---|---|---|---|
+| 普通 DNS 端口 | `dns.port` / `dns.bind_hosts` | ❌ 不能 | 只能修改 YAML 后重启进程 |
+| DoT/DoH/DoQ/DNSCrypt 端口 | `tls.port_dns_over_tls` 等 | ✅ 可以 | `POST /control/tls/configure` → `Reconfigure()` |
+
+#### 证据：jsonDNSConfig 的字段
+
+`internal/dnsforward/http.go:28` 的 `jsonDNSConfig` 结构体是 `/control/dns_config` API 的请求/响应格式，**完全没有** `bind_hosts`、`port` 字段：
+
+```go
+type jsonDNSConfig struct {
+    Upstreams               *[]string               `json:"upstream_dns"`
+    Bootstraps              *[]string               `json:"bootstrap_dns"`
+    Fallbacks               *[]string               `json:"fallback_dns"`
+    ProtectionEnabled       *bool                   `json:"protection_enabled"`
+    Ratelimit               *uint32                 `json:"ratelimit"`
+    CacheSize               *uint32                 `json:"cache_size"`
+    // ... 总共 20+ 字段
+    // 但没有 bind_hosts，没有 port
+}
+```
+
+对应的 `setConfig()` 和 `setConfigRestartable()` 函数也只修改内存中的 `s.conf` 字段，不涉及监听地址。当 `shouldRestart` 为 true 时，调用 `Reconfigure(ctx, nil)` —— **传 nil 意味着复用 s.conf 里的监听地址**，并不会改变端口。
+
+#### TLS 端口热更改挂载点
+
+TLS 相关的监听端口（DoT/DoH/DoQ/DNSCrypt）走的是另一条链路：
 
 ```
 POST /control/tls/configure
-  → tlsManager.handleTLSConfigure()  [tls.go:566]
-    ├─ m.loadTLSConfig() 加载/校验证书
-    ├─ m.setConfig() 更新 m.extTLSConf
-    ├─ m.reconfigureDNSServer()  [tls.go:292]
-    │   └─ globalContext.dnsServer.Reconfigure(ctx, newConf)
-    └─ go m.web.tlsConfigChanged() 异步重启 HTTPS Server
+  │
+  ├─ handleTLSConfigure() [tls.go:566]
+  │   ├─ m.loadTLSConfig()       读取证书文件
+  │   ├─ m.setConfig()           更新 m.extTLSConf（含各 TLS 端口）
+  │   ├─ m.reconfigureDNSServer() [tls.go:292]
+  │   │   └─ newServerConfig()   基于 config.DNS + m.extTLSConf 生成新 ServerConfig
+  │   │       ├─ 普通 DNS 端口：从 config.DNS.Port 读（不变）
+  │   │       └─ TLS 端口：从 m.extTLSConf 读（已更新）
+  │   └─ dnsServer.Reconfigure(ctx, newConf)
+  │       └─ 重建 dns proxy，监听新的 TLS 端口
+  │
+  └─ 同时重启 HTTPS Server（web 接口的 HTTPS 端口）
 ```
 
-### 3.4 TLS 证书文件自动热加载
+`newServerConfig()` (`dns.go:263`) 是关键挂载点 —— 它把普通 DNS 配置和 TLS 配置合并成 `dnsforward.ServerConfig`，其中：
+
+```go
+newConf := &dnsforward.ServerConfig{
+    UDPListenAddrs: ipsToUDPAddrs(hosts, dnsConf.Port),  // 普通 DNS 端口
+    TCPListenAddrs: ipsToTCPAddrs(hosts, dnsConf.Port),  // 普通 DNS 端口
+    TLSConf: &dnsforward.TLSConfig{
+        HTTPSListenAddrs: ipsToAddrPorts(addrs, extTLSConf.PortHTTPS),     // DoH
+        TLSListenAddrs:   ipsToTCPAddrs(addrs, extTLSConf.PortDNSOverTLS), // DoT
+        QUICListenAddrs:  ipsToUDPAddrs(addrs, extTLSConf.PortDNSOverQUIC),// DoQ
+        DNSCryptConf: ...                                                  // DNSCrypt
+    },
+}
+```
+
+#### 为什么普通 DNS 端口不支持热更？
+
+代码中没有明确解释，但可以推断几个原因：
+
+1. **安全考量**：53 端口是特权端口，启动时就要获得绑定权限，运行时改端口可能涉及权限变化
+2. **系统集成复杂**：很多操作系统（Linux systemd-resolved、macOS）会监听 53 端口，换端口需要配合系统级改动
+3. **历史包袱**：DNS 端口和绑定 IP 在启动流程早期就确定了（`setupContext` 阶段就要检查端口占用），深耦合到整个启动流程
+4. **需求少**：实际使用场景中，DNS 端口一旦设好就很少改动
+
+### 3.5 TLS 证书文件自动热加载（DNS 端口热更的特殊场景）
 
 `internal/home/tls.go:217` 的 `handleCertFileChange()` 通过文件系统事件监控证书变更：
 
@@ -380,7 +549,7 @@ func (m *tlsManager) reload(ctx context.Context) {
 }
 ```
 
-### 3.5 各模块配置更新的通用模式
+### 3.6 各模块配置更新的通用模式
 
 所有模块的配置更新 HTTP Handler 都遵循同一模式：
 
@@ -405,7 +574,7 @@ func (s *Module) handleUpdateConfig(w http.ResponseWriter, r *http.Request) {
 
 典型示例：`internal/stats/http.go:227` 的 `handlePutStatsConfig()`、`internal/home/tls.go:566` 的 `handleTLSConfigure()`。
 
-### 3.6 并发控制
+### 3.7 并发控制
 
 - `globalContext.controlLock` (`home.go:73`)：所有修改数据的 HTTP 请求（POST/PUT/DELETE）在进入业务 Handler 前会持有此互斥锁，确保同一时刻只有一个配置修改操作。见 `internal/home/control.go:251` 的 `ensure()` 中间件。
 - `configuration.RWMutex`：全局 config 对象自身的读写锁。
@@ -464,6 +633,8 @@ detectFirstRun() ── 配置文件存在？
 
 ## 五、关键代码索引
 
+### Setup 与初始化
+
 | 功能 | 文件 | 行号 |
 |---|---|---|
 | 首次运行检测 | `internal/home/home.go` | 1345 |
@@ -471,18 +642,36 @@ detectFirstRun() ── 配置文件存在？
 | setupContext() | `internal/home/home.go` | 182 |
 | Install API 注册 | `internal/home/controlinstall.go` | 644 |
 | finalizeInstall() | `internal/home/controlinstall.go` | 475 |
+| copyInstallSettings() 回滚函数 | `internal/home/controlinstall.go` | 374 |
+| initDNSServer() 中 defer 回滚 | `internal/home/dns.go` | 159 |
 | HTTP Server 地址切换循环 | `internal/home/web.go` | 262 |
+
+### 版本迁移
+
+| 功能 | 文件 | 行号 |
+|---|---|---|
 | parseConfig + 迁移触发 | `internal/home/config.go` | 684 |
-| configuration.write() | `internal/home/config.go` | 873 |
-| defaultConfigModifier | `internal/home/config.go` | 977 |
 | Migrator.Migrate() | `internal/configmigrate/migrator.go` | 45 |
-| upgradeConfigSchema() | `internal/configmigrate/migrator.go` | 108 |
-| LastSchemaVersion | `internal/configmigrate/configmigrate.go` | 5 |
-| YAML 工具函数 | `internal/configmigrate/yaml.go` | 17 |
+| upgradeConfigSchema() 顺序迁移 | `internal/configmigrate/migrator.go` | 108 |
+| LastSchemaVersion (v34) | `internal/configmigrate/configmigrate.go` | 5 |
+| YAML 工具函数 fieldVal/moveVal | `internal/configmigrate/yaml.go` | 17 |
 | v34 迁移示例 | `internal/configmigrate/v34.go` | 26 |
-| DNS Reconfigure() | `internal/dnsforward/dnsforward.go` | 848 |
-| TLS 配置 HTTP Handler | `internal/home/tls.go` | 566 |
-| TLS 证书文件自动热加载 | `internal/home/tls.go` | 217 |
+
+### 运行时热加载
+
+| 功能 | 文件 | 行号 |
+|---|---|---|
 | ConfigModifier 接口 | `internal/agh/agh.go` | 15 |
+| configuration.write() 原子持久化 | `internal/home/config.go` | 873 |
+| defaultConfigModifier | `internal/home/config.go` | 977 |
+| DNS Server.Reconfigure() | `internal/dnsforward/dnsforward.go` | 848 |
+| DNS Server.Prepare() | `internal/dnsforward/dnsforward.go` | 483 |
+| /control/dns_config 请求结构体 | `internal/dnsforward/http.go` | 28 |
+| handleSetConfig (DNS 配置更新 handler) | `internal/dnsforward/http.go` | 539 |
+| setConfigRestartable (判断是否需重启) | `internal/dnsforward/http.go` | 652 |
+| newServerConfig() 端口合并挂载点 | `internal/home/dns.go` | 263 |
+| TLS 配置更新 handler | `internal/home/tls.go` | 566 |
+| TLS reconfigureDNSServer() | `internal/home/tls.go` | 292 |
+| TLS 证书文件自动热加载 | `internal/home/tls.go` | 217 |
 | 全局并发锁 ensure() | `internal/home/control.go` | 251 |
 | Stats 配置更新示例 | `internal/stats/http.go` | 227 |
