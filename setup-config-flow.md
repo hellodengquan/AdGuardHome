@@ -397,6 +397,132 @@ func (db *DefaultDB) Create(ctx context.Context, u *User) (err error) {
 
 如果竞争路径二中的极端情况发生（两个 configure 同时进入 `addUser`），第二个会因 `ErrDuplicated` 而 panic（`auth.go:218` 的 `panic(err)`），导致请求 500 但不会破坏数据。
 
+### 1.8 Setup 完成后客户端跳转回首页的状态同步路径
+
+Setup Wizard 的最后一步（Step 5）是用户点击 "Open Dashboard" 按钮，触发全页面跳转。这个过程中涉及多个状态同步环节。
+
+#### 前端跳转链路
+
+```
+用户点击 "Open Dashboard"
+  │
+  ▼
+Controls.tsx:88  onClick={() => this.props.openDashboard(ip, port)}
+  │
+  ▼
+Setup/index.tsx:63  openDashboard(ip, port)
+  │  ┌──────────────────────────────────────────────────┐
+  │  │ const openDashboard = (ip, port) => {            │
+  │  │   let address = getWebAddress(ip, port);         │
+  │  │   if (ip === '0.0.0.0') {                       │
+  │  │     address = getWebAddress(                     │
+  │  │       window.location.hostname, port);           │
+  │  │   }                                             │
+  │  │   window.location.replace(address);              │
+  │  │ };                                              │
+  │  └──────────────────────────────────────────────────┘
+  │
+  ▼
+helpers.tsx:249  getWebAddress(ip, port)
+  │  生成 URL: http://ip:port 或 http://ip（端口 80 时省略）
+  │  IPv6 地址处理: http://[::1]:port
+  │
+  ▼
+window.location.replace(address)  ← 全页面替换跳转
+```
+
+**关键点**：`window.location.replace()` 不是 `window.location.href = ...`，它**替换**浏览器历史记录中当前条目，用户不能按"后退"回到安装向导。
+
+#### 后端状态切换与客户端请求的竞态
+
+跳转后客户端请求新 URL 时，后端可能处于以下三种状态之一：
+
+| 后端状态 | 触发条件 | 客户端看到的结果 |
+|---|---|---|
+| HTTP Server 仍在旧端口/IP 上运行 | Web 端口未变（`restartHTTP == false`） | 立即加载 Dashboard，走 `registerControlHandlers` 注册的新路由 |
+| HTTP Server 正在 Shutdown 过渡期 | Web 端口/IP 变更，Shutdown goroutine 正在执行 | 请求超时或连接拒绝（短暂窗口，< 1s） |
+| HTTP Server 已在新端口/IP 上重启 | Web 端口/IP 变更，新 Server 已在 for 循环中创建 | 正常加载 Dashboard |
+
+**端口变更时的关键时序**：
+
+```
+finalizeInstall():
+  1. aghhttp.OK(ctx, l, w)              ← 返回 200 给前端
+  2. rc.Flush()                          ← 立即刷新响应（不等 goroutine）
+  3. go shutdownSrv(web.httpServer)      ← 异步 Shutdown 旧 Server
+
+前端收到 200:
+  → Redux dispatch(setAllSettingsSuccess)
+  → dispatch(nextStep())                 ← Step 5
+  → 用户看到 "Open Dashboard" 按钮
+
+用户点击 "Open Dashboard":
+  → window.location.replace(newUrl)
+  → 浏览器发起 GET / 请求到新地址
+
+此时后端:
+  web.start() 的 for 循环检测到 ErrServerClosed
+  → 创建新 http.Server{Addr: newAddr}
+  → ListenAndServe(newAddr)
+  → 新请求到达 → Dashboard 加载
+```
+
+`rc.Flush()` (`controlinstall.go:559`) 是关键优化——它确保 200 响应立即写回客户端，不会等到 `defer` 或 goroutine 执行完毕。
+
+#### 认证状态同步
+
+Setup 阶段的 API 是**免认证**的（`isPublicResource` 列表包含所有 `/control/install/*` 路径，见 `authhttp.go:313-321`）。跳转到 Dashboard 后，前端需要重新建立认证会话：
+
+```
+浏览器跳转到 http://newIp:newPort/
+  │
+  ▼
+App.tsx useEffect → dispatch(getDnsStatus())
+  │
+  ▼
+GET /control/status  ← 需要认证
+  │
+  ├─ 无 Cookie → 403 Forbidden
+  │     │
+  │     ▼
+  │     Api.ts:26  makeRequest() 检测 403:
+  │       if (error.response.status === 403 && shouldRedirect) {
+  │         window.location.replace(loginPageUrl)  ← 重定向到 /login.html
+  │       }
+  │
+  └─ 有 Cookie（Setup 期间未设 Cookie，所以总是走 403 分支）
+```
+
+**Setup 不设 Cookie**：`handleInstallConfigure` 返回的只是 `aghhttp.OK()`，不像 `handleLogin` 那样调用 `http.SetCookie(w, cookie)`。因此跳转到 Dashboard 后，用户**必须重新登录**。
+
+完整登录流程 (`actions/login.ts:11-22`)：
+
+```
+用户在 /login.html 输入用户名密码
+  → apiClient.login(values)  → POST /control/login
+  → handleLogin() 返回 Set-Cookie: agh_session=xxx
+  → window.location.replace(dashboardUrl)  ← 再次全页面跳转到 /
+  → App.tsx 加载 → dispatch(getDnsStatus()) → GET /control/status（带 Cookie）
+  → 200 OK → Dashboard 渲染
+```
+
+#### 前端全局状态初始化
+
+Dashboard 加载时 `App.tsx:120-134` 触发初始数据拉取：
+
+```typescript
+useEffect(() => {
+    dispatch(getDnsStatus());          // GET /control/status → 填充 dashboard Redux state
+    document.addEventListener('visibilitychange', () => {
+        if (document.visibilityState === 'visible') {
+            dispatch(getTimerStatus());  // 页面可见时刷新保护计时器
+        }
+    });
+}, []);
+```
+
+`getDnsStatus()` 返回的数据填充 `dashboard` Redux slice，包括：`protectionEnabled`、`dnsAddresses`、`dnsVersion`、`isCoreRunning` 等，这些是 Dashboard 页面渲染的基础数据。
+
 ---
 
 ## 二、版本迁移（Config Migration）
@@ -1096,6 +1222,134 @@ m.reconfigureDNSServer(ctx)           // 内部获取 serverLock.Lock() (L2b)
 | `globalContext.*` 模块指针 | 这些指针在启动时初始化后不再替换，但指向的对象内部有各自的锁 |
 | `firstRun` 字段 | `web.conf.firstRun` 在 finalizeInstall 中被设置为 false，只写一次且在 L1 保护下，无并发问题 |
 
+### 4.8 配置变更通知到运行中 DNS 服务的完整代码核对
+
+运行时修改 DNS 配置有三条入口路径，每条路径触发 DNS 服务变更通知的方式不同。
+
+#### 路径一：POST /control/dns_config（DNS 通用配置）
+
+```
+POST /control/dns_config
+  │
+  ▼
+handleSetConfig()  [dnsforward/http.go:539]
+  │
+  ├─ json.NewDecoder(r.Body).Decode(req)    解析请求
+  ├─ req.validate(ctx, ...)                 校验参数
+  │
+  ├─ restart := s.setConfig(req)            修改内存配置 [http.go:588]
+  │     ├─ 修改 s.dnsFilter 的 BlockingMode / BlockedResponseTTL / ProtectionEnabled
+  │     └─ setConfigRestartable(dc)         判断是否需要重启 [http.go:652]
+  │          ├─ 修改 s.conf.UpstreamDNS / BootstrapDNS / CacheSize 等
+  │          └─ 返回 shouldRestart = true/false
+  │
+  ├─ s.conf.ConfModifier.Apply(ctx)         持久化到 YAML [http.go:576]
+  │
+  └─ if restart:
+       s.Reconfigure(ctx, nil)              重建 DNS 服务 [http.go:579]
+         ├─ s.serverLock.Lock()
+         ├─ s.stopLocked(ctx)               停止 DNS proxy
+         ├─ time.Sleep(100ms)               等 FD 释放
+         ├─ s.Prepare(ctx, &s.conf)         用当前 s.conf 重建
+         ├─ s.startLocked(ctx)              启动 DNS proxy
+         └─ s.serverLock.Unlock()
+```
+
+**通知机制**：同步函数调用，`Reconfigure` 在 HTTP Handler 内阻塞直到 DNS 服务重建完成。此期间 `serverLock` 写锁持有，所有 DNS 查询被阻塞。
+
+**setConfigRestartable 触发重启的字段** (`http.go:652-691`)：
+
+| 字段 | 修改后是否需要重启 | 原因 |
+|---|---|---|
+| `UpstreamDNS` | ✅ | 上游服务器列表变更需重建 resolver |
+| `BootstrapDNS` | ✅ | Bootstrap 变更需重建 resolver |
+| `FallbackDNS` | ✅ | Fallback 变更需重建 resolver |
+| `CacheEnabled` / `CacheSize` / `CacheMinTTL` / `CacheMaxTTL` / `CacheOptimistic` | ✅ | 缓存配置变更需重建 cache |
+| `Ratelimit` | ✅ | 限速配置变更需重建 ratelimiter |
+| `UpstreamTimeout` | ✅ | 超时配置变更需重建上游连接 |
+| `BlockingMode` / `BlockedResponseTTL` / `ProtectionEnabled` | ❌ | 这些在 `setConfig` 中直接修改 `dnsFilter`，不需要重启 |
+
+#### 路径二：POST /control/tls/configure（TLS 配置变更）
+
+```
+POST /control/tls/configure
+  │
+  ▼
+handleTLSConfigure()  [tls.go:566]
+  │
+  ├─ m.mu.Lock()
+  ├─ m.loadTLSConfig(ctx, status, req)      加载证书/私钥
+  │     ├─ loadCertificateChainData()       从文件或内联加载证书
+  │     ├─ loadPrivateKeyData()             从文件或内联加载私钥
+  │     └─ validateCertificates()           校验证书有效性
+  │
+  ├─ m.setConfig(ctx, req)                  更新 m.extTLSConf
+  │     └─ m.extTLSConf = req.clone()       深拷贝新配置
+  │
+  ├─ if req.ServePlainDNS 变更:
+  │     config.Lock()                        获取 L3 锁
+  │     config.DNS.ServePlainDNS = ...
+  │     config.Unlock()
+  │
+  ├─ m.reconfigureDNSServer(ctx)            通知 DNS 服务 [tls.go:292]
+  │     ├─ newServerConfig()                合并 DNS + TLS 配置 [dns.go:263]
+  │     │     ├─ 普通 DNS 端口: config.DNS.Port（不变）
+  │     │     ├─ DoH 端口: m.extTLSConf.PortHTTPS（已更新）
+  │     │     ├─ DoT 端口: m.extTLSConf.PortDNSOverTLS（已更新）
+  │     │     ├─ DoQ 端口: m.extTLSConf.PortDNSOverQUIC（已更新）
+  │     │     └─ DNSCrypt: m.extTLSConf.PortDNSCrypt（已更新）
+  │     └─ globalContext.dnsServer.Reconfigure(ctx, newConf)
+  │           └─ 停 → 等 → 重建 → 启动
+  │
+  ├─ go m.web.tlsConfigChanged(...)         异步重启 HTTPS Server
+  │
+  └─ m.mu.Unlock()
+```
+
+**通知机制**：`reconfigureDNSServer()` 是同步调用，在 `tlsManager.mu` 保护下执行。DNS 服务重建完成后，再异步重启 HTTPS Server。
+
+**与路径一的关键区别**：
+- 路径一传 `nil` 给 `Reconfigure`，复用当前 `s.conf`
+- 路径二传全新 `newConf`，因为 TLS 端口/证书已变更
+
+#### 路径三：TLS 证书文件自动变更（文件系统 watcher）
+
+```
+文件系统事件（证书文件被替换）
+  │
+  ▼
+handleCertFileChange()  [tls.go:217]
+  │  for range m.manager.Updates(ctx):
+  │      m.reload(ctx)
+  │
+  ▼
+m.reload(ctx)  [tls.go:247]
+  ├─ os.Stat(certPath).ModTime 对比        检查文件是否真的变了
+  │  └─ ModTime 未变 → return（跳过）
+  │
+  ├─ m.loadTLSConfig(ctx, &tlsConf, status) 重新加载证书
+  ├─ m.extTLSConf = &tlsConf               更新运行时配置
+  ├─ m.certLastMod = fi.ModTime.UTC()      记录最新 ModTime
+  ├─ m.reconfigureDNSServer(ctx)           通知 DNS 服务
+  └─ m.web.tlsConfigChanged(...)            重启 HTTPS Server
+```
+
+**通知机制**：与路径二相同，但**由文件系统事件驱动**而非 HTTP 请求驱动。此路径不经过 `controlLock`（没有 HTTP 请求），但 `tlsManager.mu` 仍然保护并发安全。
+
+#### 三条路径的对比
+
+| 维度 | 路径一（dns_config） | 路径二（tls/configure） | 路径三（文件 watcher） |
+|---|---|---|---|
+| 触发方式 | HTTP POST 请求 | HTTP POST 请求 | 文件系统事件 |
+| controlLock (L1) | ✅ 持有 | ✅ 持有 | ❌ 不经过 |
+| tlsManager.mu (L2a) | ❌ 不持有 | ✅ 持有 | ✅ 持有 |
+| serverLock (L2b) | ✅ Reconfigure 内持有 | ✅ Reconfigure 内持有 | ✅ Reconfigure 内持有 |
+| config.Lock (L3) | ✅ ConfModifier.Apply 内持有 | ✅ 修改 ServePlainDNS 时持有 | ❌ 不写 config |
+| Reconfigure 参数 | `nil`（复用 s.conf） | 新 `newConf` | 新 `newConf` |
+| 配置持久化 | ✅ ConfModifier.Apply | ✅ defer ConfModifier.Apply | ❌ 无（下次 config.write 会拉取最新状态） |
+| 影响 DNS 查询 | ✅ Reconfigure 期间阻塞 | ✅ Reconfigure 期间阻塞 | ✅ Reconfigure 期间阻塞 |
+| 影响 HTTPS Server | ❌ 不影响 | ✅ 异步重启 | ✅ 异步重启 |
+
 ---
 
 ## 五、全局关系全景图
@@ -1159,6 +1413,10 @@ detectFirstRun() ── 配置文件存在？
 | copyInstallSettings() 回滚函数 | `internal/home/controlinstall.go` | 374 |
 | initDNSServer() 中 defer 回滚 | `internal/home/dns.go` | 159 |
 | HTTP Server 地址切换循环 | `internal/home/web.go` | 262 |
+| rc.Flush() 立即刷新响应 | `internal/home/controlinstall.go` | 559 |
+| preInstallHandler firstRun 守卫 | `internal/home/control.go` | 338 |
+| isPublicResource 免认证路由列表 | `internal/home/authhttp.go` | 313 |
+| handleLogin 设置 Cookie | `internal/home/authhttp.go` | 107 |
 
 ### 版本迁移
 
@@ -1205,3 +1463,17 @@ detectFirstRun() ── 配置文件存在？
 | TLS 证书文件自动热加载 | `internal/home/tls.go` | 217 |
 | 全局并发锁 ensure() | `internal/home/control.go` | 251 |
 | Stats 配置更新示例 | `internal/stats/http.go` | 227 |
+
+### 前端状态同步
+
+| 功能 | 文件 | 行号 |
+|---|---|---|
+| openDashboard 跳转逻辑 | `client/src/install/Setup/index.tsx` | 63 |
+| getWebAddress URL 生成 | `client/src/helpers/helpers.tsx` | 249 |
+| checkRedirect 重试跳转 | `client/src/helpers/helpers.tsx` | 264 |
+| setAllSettings Redux Action | `client/src/actions/install.ts` | 27 |
+| processLogin Redux Action | `client/src/actions/login.ts` | 11 |
+| Api.makeRequest 403 拦截 | `client/src/api/Api.ts` | 24 |
+| App.tsx Dashboard 初始化 | `client/src/components/App/index.tsx` | 120 |
+| Submit 组件 (Step 5) | `client/src/install/Setup/Submit.tsx` | 13 |
+| Controls 组件 (Open Dashboard 按钮) | `client/src/install/Setup/Controls.tsx` | 82 |
