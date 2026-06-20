@@ -438,6 +438,60 @@ AdGuard Home 作为 DNS 服务器而非 CA，证书签名算法的选择权在�
 3. 主流 CA 开始签发后量子证书
 4. 浏览器普遍支持后量子 TLS 扩展
 
+#### 已签发 ECDSA 证书的重签问题：代码中不存在此概念
+
+**核心结论：AdGuard Home 不签发证书，只加载证书，因此「已签发证书是否需要重签」在代码层面没有答案。**
+
+##### 代码证据：无证书签发/重签能力
+
+全代码库搜索结果：
+- ❌ 没有 `reissue` / `rekey` / `renew` 证书重签相关逻辑
+- ❌ 没有 `rotate cert` / `cert rotation` 证书轮换概念
+- ❌ 没有 `x509.CreateCertificate()` 在非测试代码中的调用
+- ❌ 没有「双证书并存」「算法迁移期」「渐进式切换」的业务逻辑
+
+**AdGuard Home 在证书管理链路上的定位**：
+
+```
+┌──────────────┐    签发    ┌──────────────┐   部署   ┌─────────────────┐
+│   CA / ACME  │ ────────► │  证书文件     │ ──────► │  AdGuard Home   │
+│ (Let's Encrypt) │          │ (磁盘文件)   │  加载   │  (被动消费者)   │
+└──────────────┘            └──────────────┘          └─────────────────┘
+     ▲                          ▲                           │
+     │ 发起申请                 │ FSWatcher 监听             │ reload
+     │                          │                           ▼
+  certbot 等外部工具    ◄────────┘                    HTTPS 服务器
+```
+
+**迁移 ECDSA → Ed25519 的完整生命周期（全靠外部）**：
+
+| 阶段 | 责任方 | 操作 | AdGuard Home 的行为 |
+|------|--------|------|-------------------|
+| 准备期 | 外部 CA + 用户 | 用 Ed25519 算法申请新证书 | ❌ 不参与 |
+| 部署期 | 用户 | 将新证书写入文件路径 | ✅ FSWatcher 检测变更 → reload |
+| 验证期 | 用户 | 确认新证书工作正常 | ✅ 正常提供服务 |
+| 共存期 | N/A | 双证书？ | ❌ 不支持（单证书单私钥，无多证书链） |
+| 回滚期 | 用户 | 切回 ECDSA 证书文件 | ✅ FSWatcher 检测 → reload |
+
+**关于「已签发 ECDSA 证书是否需要重签」的答案**：
+- 从 AdGuard Home 的代码视角看：**这个问题不成立**。证书是外部实体，AdGuard Home 只做加载和使用
+- 从运维视角看：如果要切换算法，必须让 CA 用新算法**重新签发**一张全新的证书，AdGuard Home 侧只需替换文件即可（FSWatcher 自动热重载）
+- 从用户体验视角看：替换证书的过程是**无缝的**（热重载只断 TCP 连接，不断 session）
+
+##### 补充：多证书/算法共存的代码可能性
+
+当前 `tlsManager` 设计是**单证书模式**：
+- 只有一个 `CertificatePath` / `PrivateKeyPath` 配置项
+- 只有一个 `certLastMod` 时间戳
+- 只有一个 `httpsServer.cert` 变量
+
+不支持：
+- ❌ RSA + ECDSA 双证书并存（按客户端能力自动选择）
+- ❌ ECDSA + Ed25519 双证书并存
+- ❌ 证书算法优先级配置
+
+如果未来要支持算法迁移期的双证书共存，需要改动 `crypto/tls.Config` 的 `Certificates` 字段（支持多证书）以及相应的配置结构。
+
 ---
 
 ### 2.5 SIGHUP / systemd reload：证书重载的外部触发通道
@@ -804,6 +858,138 @@ Swarm 的 routing mesh / VIP 负载均衡是**四层负载**，不感知 HTTP se
 
 **结论**：AdGuard Home 不是为多实例设计的。如果必须在 Swarm 中部署，应使用单副本（`replicas: 1`），或自行改造 Session 存储为 Redis/PostgreSQL 等支持并发写入的共享存储。此时 SIGHUP/证书重载本身不是并发瓶颈，Session 和配置的共享存储才是。
 
+##### 扩展：Docker HEALTHCHECK 与 K8s 等价机制
+
+**核心结论：代码提供了 HTTP 和 DNS 两种健康检查端点，但 Dockerfile 未配置 HEALTHCHECK，K8s 部署需自行配置 Probe。**
+
+###### 代码中的健康检查端点
+
+AdGuard Home 提供了**两套**健康检查机制，分别服务于不同层级：
+
+**机制一：HTTP 健康检查（下一代架构 `internal/next/websvc`）**
+
+**位置**：`internal/next/websvc/route.go:13,37`
+
+```go
+PathPatternHealthCheck = "/health-check"
+// ...
+handler: httputil.HealthCheckHandler,
+```
+
+**特性**：
+- 路径：`GET /health-check`
+- 实现：`httputil.HealthCheckHandler`（golibs 通用工具，返回 200 OK + 空 body）
+- 作用：判断 HTTP 服务是否存活
+- 鉴权：无需登录（公开端点）
+- 局限：只检查 HTTP 服务是否在监听，不检查 DNS 等其他模块
+
+**机制二：DNS 健康检查（传统架构 `internal/dnsforward`）**
+
+**位置**：`internal/dnsforward/process.go:89-97`
+
+```go
+const healthcheckFQDN = "healthcheck.adguardhome.test."
+// 使用 .test TLD，符合 RFC 6761 §6.2 保留用途
+```
+
+**特性**：
+- 域名：`healthcheck.adguardhome.test.`
+- 协议：DNS 查询（A / AAAA 等）
+- 作用：判断 DNS 解析服务是否正常工作
+- 局限：需要 DNS 客户端，不便于 HTTP 监控系统使用
+
+###### Docker HEALTHCHECK 配置（代码中缺失）
+
+**当前 Dockerfile**（`docker/build.Dockerfile`）：
+```dockerfile
+FROM alpine:3.23
+# ...
+# 没有 HEALTHCHECK 指令 ❌
+ENTRYPOINT ["/opt/adguardhome/AdGuardHome"]
+```
+
+**如果要配置（非当前代码，建议配置）**：
+```dockerfile
+# 方式一：HTTP 健康检查（推荐，依赖 next 架构）
+HEALTHCHECK --interval=30s --timeout=3s --start-period=60s --retries=3 \
+  CMD wget --no-verbose --tries=1 --spider http://localhost:3000/health-check || exit 1
+
+# 方式二：DNS 健康检查（更全面，检查 DNS 服务）
+HEALTHCHECK --interval=30s --timeout=3s --start-period=60s --retries=3 \
+  CMD nslookup healthcheck.adguardhome.test. 127.0.0.1 || exit 1
+```
+
+###### K8s 等价机制：Liveness / Readiness Probe
+
+K8s 中的 Probe 与 Docker HEALTHCHECK 的对应关系：
+
+| Docker | K8s | 作用 |
+|--------|-----|------|
+| `HEALTHCHECK` | `livenessProbe` | 容器是否存活，失败则重启 |
+| - | `readinessProbe` | 容器是否就绪，失败则从 Service 摘除 |
+| `--start-period` | `startupProbe` | 启动慢的应用给更多时间 |
+
+**K8s 推荐配置（非当前代码，最佳实践）**：
+
+```yaml
+# Kubernetes Deployment 示例
+spec:
+  containers:
+  - name: adguard-home
+    image: adguard/adguardhome:latest
+    ports:
+    - name: http
+      containerPort: 3000
+    - name: dns-udp
+      containerPort: 53
+      protocol: UDP
+
+    # 存活探针：判断容器是否还活着
+    livenessProbe:
+      httpGet:
+        path: /health-check
+        port: http
+      initialDelaySeconds: 60   # 启动后等60秒再开始检查
+      periodSeconds: 30         # 每30秒检查一次
+      timeoutSeconds: 3         # 超时3秒
+      failureThreshold: 3       # 连续失败3次才重启
+
+    # 就绪探针：判断是否能对外提供服务
+    readinessProbe:
+      httpGet:
+        path: /health-check
+        port: http
+      initialDelaySeconds: 10
+      periodSeconds: 5
+      timeoutSeconds: 2
+      failureThreshold: 2
+
+    # 启动探针：给慢启动应用更多时间
+    startupProbe:
+      httpGet:
+        path: /health-check
+        port: http
+      failureThreshold: 30
+      periodSeconds: 10
+```
+
+###### 两种部署形态下健康检查与 SIGHUP 的协同
+
+| 场景 | Docker (docker exec SIGHUP) | K8s (滚动更新) |
+|------|----------------------------|---------------|
+| **证书续签** | SIGHUP 热重载，零停机 | 两种选择：① 共享存储 + SIGHUP ② 滚动重建 Pod |
+| **健康检查时机** | SIGHUP 期间 HTTPS 短暂中断，HTTP health-check 不受影响 | 滚动更新时 readiness probe 控制流量切换 |
+| **Session 影响** | SIGHUP 不影响 session（bbolt 不动） | 滚动重建不影响 session（持久化存储） |
+| **零停机保障** | 依赖热重载，有短暂连接断开 | 依赖滚动更新 + readiness probe，平滑切换 |
+
+###### 代码层面的限制
+
+1. **`/health-check` 只在 `next` 架构中**：传统 `internal/home/web.go` 架构中没有这个端点，K8s 配置时需注意
+2. **健康检查粒度粗**：只检查 HTTP 是否响应，不检查 DNS 服务、过滤规则、上游 DNS 等深层健康状态
+3. **无 readiness 语义区分**：代码中没有「存活」与「就绪」的区别，都是同一个端点
+
+---
+
 ### 3.1 三层架构模型
 
 ```
@@ -1124,6 +1310,55 @@ SET lock_key random_value NX PX 30000
 - ✅ 没有「网络分区」「节点宕机」导致的锁泄漏问题（同进程内）
 - ❌ 不支持跨进程 / 跨节点互斥
 
+##### 扩展假设：Redis 集群节点崩溃与 Redlock 算法切换
+
+**核心结论：代码中完全不存在，这是双重伪命题。**
+
+**第一层伪命题**：没有 Redis，没有分布式锁，所以「节点崩溃」和「Redlock 切换」都无从谈起。
+
+**第二层分析**：即使假设将来要加 Redis 分布式锁，针对「节点崩溃」的场景，Redlock 也不是「切换」过去的，而是从一开始就要设计的算法选型。
+
+###### Redlock 算法与单节点 SETNX 的本质区别
+
+| 特性 | 单节点 SETNX | Redlock (多节点) |
+|------|------------|-----------------|
+| **可靠性** | 单节点挂了锁就丢了 | N 个节点中大多数存活就有效 |
+| **实现复杂度** | 简单（SET NX PX + DEL） | 复杂（需同时向 N 节点获取锁，计算多数派） |
+| **性能** | 高（1 次 Redis 操作） | 低（N 次 Redis 操作） |
+| **故障模型** | 单节点故障 → 锁失效 | 少数派节点故障 → 锁仍然有效 |
+| **争议** | 无广泛争议 | Martin Kleppmann 与 antirez 的著名辩论 |
+
+###### 如果强行实现（非当前代码，纯假设），典型架构：
+
+```
+应用进程
+    │
+    ▼
+Redis Cluster (3 主节点)
+  ├─ Master A (持有锁)
+  ├─ Master B
+  └─ Master C
+
+Redlock 获取流程：
+  1. 获取当前时间戳
+  2. 依次向 3 个节点发送 SET key value NX PX <ttl>
+  3. 统计成功获取的节点数
+  4. 若 >= 2 个成功 → 锁获取成功
+  5. 若 < 2 个成功 → 向所有节点发送 DEL 回滚
+
+Redlock 释放流程：
+  向所有节点发送 DEL key（不论当初是否成功获取）
+```
+
+###### AdGuard Home 场景下的评估
+
+即使假设有集群部署需求，对 AdGuard Home 来说：
+- **证书重载**：每个实例独立 reload，不需要分布式锁
+- **Session 管理**：如果用 Redis 存 session，那是数据存储，不是分布式锁
+- **配置同步**：如果用 etcd/Consul 做配置中心，它们自带一致性保证，不需要额外 Redlock
+
+**结论**：Redlock 算法在 AdGuard Home 的当前架构和可预见的演进路线中，都没有明确的使用场景。整个「Redis 节点崩溃 → 切换到 Redlock」的命题，建立在多重不存在的前提之上。
+
 ##### 与证书重载流程的关联
 
 在证书热重载流程中，所有状态变更都受 `tlsManager.mu` 保护：
@@ -1384,7 +1619,10 @@ return &http.Cookie{
 | **OS服务管理器** | `internal/ossvc/manager_unix.go` | 20(reload), 24(pidFile), 55(proc.Signal SIGHUP) | UNIX 平台 reload 实现（发 SIGHUP） |
 | **systemd配置** | `internal/ossvc/config_linux.go` | 12(configureOSOptions), 40(systemdScript模板), 53(ExecReload条件) | systemd unit 模板生成 |
 | **服务配置入口** | `internal/ossvc/config.go` | 14(ConfigureServiceOptions) | 跨平台服务配置入口 |
-| **Docker构建** | `docker/build.Dockerfile` | 23(alpine基础镜像), 62(ENTRYPOINT), 64(CMD) | Docker 镜像配置，无 STOPSIGNAL |
+| **Docker构建** | `docker/build.Dockerfile` | 23(alpine基础镜像), 62(ENTRYPOINT), 64(CMD) | Docker 镜像配置，无 STOPSIGNAL，无 HEALTHCHECK |
+| **下一代Web服务** | `internal/next/websvc/websvc.go` | 42(Service结构体), 62(New), 154(Start) | Next 架构 HTTP 服务（含健康检查端点） |
+| **下一代路由** | `internal/next/websvc/route.go` | 13(PathPatternHealthCheck), 37(HealthCheckHandler注册) | Next 架构路由，`/health-check` 端点 |
+| **DNS健康检查** | `internal/dnsforward/process.go` | 89(healthcheckFQDN), 97(healthcheck.adguardhome.test.) | DNS 层面健康检查保留域名（RFC 6761 .test） |
 | **测试证书数据** | `internal/home/testdata/cert.pem` | - | 自签名测试证书：sha256WithRSAEncryption, 1024位RSA, 有效期27.4年 |
 | **TLS测试辅助** | `internal/home/tls_internal_test.go` | 76(证书断言), 116(newCertWithoutIP), 177(newCertAndKey) | 测试用证书生成与校验辅助函数 |
 | **启动主流程** | `internal/home/home.go` | 130(signal.Notify), 151(sigHdlr.handle goroutine), 757(run), 899(initTLS), 928(sigHdlr.addTLSManager) | 信号注册、整体初始化时序、模块装配 |
