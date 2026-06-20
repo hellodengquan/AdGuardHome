@@ -132,7 +132,21 @@ if !l.flushPending && fileIsEnabled && l.buffer.Len() >= memSize {
 ```
 当 flush 协程已启动但尚未完成 `encodeEntries` 中的 `buffer.Clear()` 时，新到达的 `Push` 仍会覆盖未刷写的旧数据。
 
-### 2.5 滚动文件策略
+### 2.5 RingBuffer 丢弃时的 Prometheus 指标——完全未实现
+
+**结论前置：整个 AdGuard Home 代码库（含 golibs 依赖）既未引入 prometheus/client_golang，也没有任何 metrics 子系统，丢弃计数不存在任何可观测性出口。**
+
+三层证据链：
+
+1. **项目级依赖缺失**：`go.mod` 中搜不到 `prometheus` / `client_golang` / `promhttp` 字样，说明官方发行版根本不提供 Prometheus 指标端点。
+
+2. **golibs RingBuffer 无计数器预留字段**：`golibs/container/ringbuffer.go` 的结构体只有 `buf`、`cur`、`full` 三个字段，`Push` 方法是纯值语义实现（void 返回、无 log、无 atomic），没有 `dropped uint64` 字段可供外部读取。
+
+3. **querylog 包零指标出口**：`internal/querylog` 包中不存在 `metrics`、`counter`、`gauge` 相关 import；`handleQueryLog` HTTP 接口仅返回配置信息和日志查询结果，没有暴露内部统计量的 API。
+
+**运维侧目前唯一可间接观测丢弃的方法**：对比同一时间段内 stats 的 `num_dns_queries` 与 querylog.json 实际行数，差值即近似丢弃量。但这种间接对账受到 §4.4 所述 6 个一致性断层影响，误差可能较大。
+
+### 2.6 滚动文件策略
 
 **日志滚动** [querylog/querylogfile.go:103-121]
 
@@ -306,6 +320,61 @@ func closeDNSServer(ctx context.Context) {
 }
 ```
 先停止请求入口，再各自持久化，保证两条路径的关闭时数据都能落盘。
+
+### 3.5 SIGKILL 强杀场景：15 分钟快照不存在，完全无补偿
+
+**结论前置：代码中不存在 15 分钟周期性快照机制，SIGKILL（`kill -9`）强杀时，当前小时内未落盘的统计数据 100% 永久丢失，没有任何补偿（WAL、补算、对账、快照）手段。**
+
+#### 3.5.1 持久化触发点盘点——只有两个
+
+stats 模块中写入 bbolt 的代码路径只有两条，均不包含"15 分钟周期 flush"：
+
+| 触发方式 | 发生时机 | 写入内容 | SIGKILL 能否命中 |
+|---------|---------|---------|----------------|
+| **Close() 优雅关闭** | 接收 SIGTERM/SIGINT 后走 `home.closeDNSServer` 显式调用 | 当前小时完整快照 | ❌ SIGKILL 不传递信号，直接终止进程，Close 不会被执行 |
+| **periodicFlush → flushDB** | 后台 goroutine 每秒循环检查 `time.Now().Unix()/3600` 是否变化（即跨小时） | 上一个完整小时的数据 | ✅ 若跨小时已发生则那个小时已落盘；但**当前小时仍在内存中** |
+
+periodicFlush 的循环实现 [stats/stats.go:496-502]：
+```go
+func (s *StatsCtx) periodicFlush() {
+    for cont, sleepFor := true, time.Duration(0); cont; time.Sleep(sleepFor) {
+        cont, sleepFor = s.flush()   // flush() 返回 sleepFor = time.Second
+    }
+}
+// flush() 内部：ptr.id == id 时 return true, time.Second，不做 DB 写入
+// 只有 ptr.id != id（跨小时）时才走 flushDB 写 bbolt
+```
+因此 periodicFlush 本质是 **1 秒粒度的"跨小时检查器"**，不是周期快照。代码库全量 grep `15.*Minute` / `quarter` / `snapshot.*flush` 无任何匹配。
+
+#### 3.5.2 SIGKILL 的信号传递盲区
+
+在 UNIX 信号模型中：
+- SIGTERM（`kill` 默认）、SIGINT（Ctrl+C）：可被 `signal.Notify` 捕获，从而触发 `service.Shutdown → closeDNSServer → stats.Close()` 优雅链路
+- **SIGKILL（`kill -9`）/ SIGSTOP**：POSIX 规定不可被捕获、不可被忽略、不可被阻塞，进程直接被内核终止，用户态清理逻辑 **零执行机会**
+
+AdGuard Home 的 `ossvc` 层只注册了 SIGTERM + SIGINT [ossvc/service_openbsd.go:298]（其他平台类似）：
+```go
+signal.Notify(sigChan, syscall.SIGTERM, os.Interrupt)
+```
+没有、也不可能注册 SIGKILL 的处理函数。
+
+#### 3.5.3 丢失窗口量化
+
+| 崩溃时刻相对小时边界 | 丢失的统计数据量 |
+|-------------------|----------------|
+| 00:00:01（刚跨小时） | 整个小时的 3599 秒聚合（最坏情况） |
+| HH:30:00（小时中点） | 半小时聚合（平均情况） |
+| HH:59:59（快跨小时） | 仅剩 1 秒聚合（最好情况） |
+
+丢失的字段：所有 `curr` 内存 unit 中的 `domains / blockedDomains / clients / nResult / nTotal / timeSum`，且因为 querylog 与 stats 是两条独立路径（§4.4），**querylog.json 即使完整也无法回灌 stats**——没有提供从查询日志事件重建统计聚合的"回放/补偿"API。
+
+#### 3.5.4 为什么没有补偿
+
+从代码设计取向看：
+1. 没有 WAL（Write-Ahead Log）：stats 直接在内存 map 聚合，未落盘的增量不存在任何持久化中间层
+2. 没有 replay 接口：`StatsCtx` 对外只暴露 `Update(entry)` 单向写入，不暴露"从 querylog.json 批量回灌"
+3. 没有对账 API：`handleStats` 返回的 `num_dns_queries` 与 querylog 行数之差没有被系统自动计算或告警
+4. 定位是"趋势展示而非计费"：Dashboard 展示的是粗略指标，容忍小时级数据缺口
 
 ## 4. 并发协同与锁避免机制
 
@@ -565,6 +634,74 @@ func (s *Server) Reconfigure(ctx, conf) {
 | 小时级滚动窗口 | 数据库写入频率低 | 数据精度限制在小时级 |
 | 两条路径完全独立 | 无锁竞争，可独立扩展 | 数据重复处理，存储成本翻倍 |
 
+### 5.3 存储路径、文件名与 bbolt Bucket 名的硬编码与可配置性
+
+**结论前置（先澄清一个常见误解）：查询日志不使用 bbolt，只有 stats 使用 bbolt。** 两者的存储介质完全不同（JSON 文本文件 vs bbolt 嵌入式 KV 数据库），因此"共用 boltdb 桶名"的假设本身不成立。以下分两个系统分别梳理硬编码点与可配置性。
+
+#### 5.3.1 查询日志：路径可配置，文件名和压缩后缀硬编码
+
+查询日志存储相关的可配置项 [home/config.go:402-427 + querylog/querylog.go:36-82]：
+
+| 配置项 | YAML 字段 | 是否可配置 | 硬编码位置 |
+|-------|----------|-----------|-----------|
+| **存储目录** | `querylog.dir_path` | ✅ 可自定义（空值时用 `getDataDir` 默认数据目录） | `home/dns.go:85-87` |
+| **文件名** | 无 | ❌ 硬编码 `querylog.json` | `querylog/qlog.go:23 const queryLogFileName` |
+| **滚动后缀** | 无 | ❌ 硬编码 `.1` | `querylog/querylogfile.go:103-121 renameTo + filename + ".1"` |
+| **压缩后缀** | 无 | ❌ 硬编码 `.gz`（注释中提及） | `querylog/qlog.go:21-22` 注释 |
+| **MemSize** | `querylog.size_memory` | ✅ 可自定义（0 时自动降级为 1） | `querylog/querylog.go:69-71` |
+| **RotationIvl** | `querylog.interval` | ✅ 可自定义 | `querylog/querylog.go:64-67` |
+
+目录拼接在 `home/dns.go` 中完成 [home/dns.go:85-87]：
+```go
+querylogDir := config.QueryLog.DirPath
+if querylogDir == "" {
+    querylogDir = globalContext.getDataDir()
+}
+qlConf.BaseDir = querylogDir
+```
+文件名在 `querylog.newQueryLog` 中通过 `filepath.Join(conf.BaseDir, queryLogFileName)` 拼接，**运维侧无法通过 YAML 把文件名改成如 `queries.log`**。
+
+#### 5.3.2 Stats：DB 目录可配置，文件名 `stats.db` 硬编码，Bucket 名由小时 ID 序列化生成
+
+Stats 存储相关的可配置项 [home/config.go:429-446 + stats/stats.go:48-95]：
+
+| 配置项 | YAML 字段 | 是否可配置 | 硬编码/生成位置 |
+|-------|----------|-----------|----------------|
+| **DB 存储目录** | `statistics.dir_path` | ✅ 可自定义（空值时用默认数据目录） | `home/dns.go:55-57` |
+| **DB 文件名** | 无 | ❌ 硬编码 `stats.db` | `home/dns.go:59` 的 `filepath.Join(statsDir, "stats.db")` + `stats_internal_test.go:30` |
+| **保留期限 Limit** | `statistics.interval` | ✅ 可自定义（1/7/30/90 天） | `stats/stats.go:198-205` |
+| **Bucket 命名规则** | 无 | ❌ 由 `idToUnitName(id)` 固定算法生成，不可自定义 | `stats/unit.go:206-212` |
+
+**Bucket 名生成算法** [stats/unit.go:200-223]：
+
+```go
+const bucketNameLen = 8   // 8 字节 = uint64 的长度
+
+func idToUnitName(id uint32) (name []byte) {
+    n := [bucketNameLen]byte{}
+    binary.BigEndian.PutUint64(n[:], uint64(id))
+    return n[:]
+}
+```
+
+Bucket 名本质是**小时 ID 的 8 字节大端二进制编码**。例如：
+- 小时 ID `123456` → Bucket 名为字节序列 `\x00\x00\x00\x00\x00\x01\xe2@`
+- 运维侧无法通过 YAML 把 bucket 前缀改成带命名空间的字符串（如 `stats:unit:123456`），因为 `CreateBucketIfNotExists(idToUnitName(id))` 直接用二进制字节定位
+
+**运维侧能做的调整边界**：
+1. 改 `dir_path` → 把 `stats.db` / `querylog.json` 挪到不同磁盘分区（可行）
+2. 改 `interval` → 调整保留期限（可行）
+3. 改文件名 / 改 bucket 名 / 加命名空间前缀 → 必须修改源码重新编译（不可通过配置实现）
+
+#### 5.3.3 为什么 Bucket 名用二进制而非字符串
+
+设计上的三个理由：
+1. **排序效率**：bbolt 的 bucket 和 key 按字节序排序，大端编码的 uint64 字节序与数值序一致，遍历最旧 → 最新 bucket 时 `ForEach` 天然按时间升序
+2. **空间紧凑**：8 字节固定长度，比字符串 `"1840972"` 少 1 字节，百万级 bucket 累积节省可观
+3. **编码一致性**：与 `sessionstorage`、`filtering` 等其他 bbolt 使用方保持同一种 ID 编码风格
+
+代价是运维用 `bbolt stats.db list` 调试时看到的 bucket 名是不可读的二进制字节，需要 `unitNameToID` 逆向解码。
+
 ## 6. 关键代码索引
 
 ### 6.1 查询日志写盘路径
@@ -576,8 +713,11 @@ func (s *Server) Reconfigure(ctx, conf) {
 | 查询日志缓冲区编码 | [querylog/querylogfile.go:36-77] |
 | 查询日志文件写入 | [querylog/querylogfile.go:80-101] |
 | 查询日志滚动（文件改名） | [querylog/querylogfile.go:103-121] |
+| 查询日志滚动 ticker（1 小时周期） | [querylog/querylogfile.go:150-163] |
 | **RingBuffer Push（丢弃覆盖实现）** | **golibs/container/ringbuffer.go:19-29** |
-| **RingBuffer 数据结构（cur + full）** | **golibs/container/ringbuffer.go:4-8** |
+| **RingBuffer 数据结构（cur + full，无 dropped 字段）** | **golibs/container/ringbuffer.go:4-8** |
+| **querylog.json 文件名常量硬编码** | **[querylog/qlog.go:21-23]** |
+| **YAML querylog 配置结构（含 dir_path/size_memory/interval）** | **[home/config.go:402-427]** |
 
 ### 6.2 统计聚合路径
 
@@ -590,6 +730,11 @@ func (s *Server) Reconfigure(ctx, conf) {
 | **启动时快照恢复（New → loadUnitFromDB）** | **[stats/stats.go:155-213]** |
 | **序列化/反序列化（timeSum 精度点）** | **[stats/unit.go:258-315]** |
 | **优雅关闭 flush（Close）** | **[stats/stats.go:246-274]** |
+| **idToUnitName（Bucket 名生成，8 字节大端编码）** | **[stats/unit.go:200-213]** |
+| **unitNameToID（Bucket 名逆向解码）** | **[stats/unit.go:215-223]** |
+| **periodicFlush 的 1 秒 sleep 粒度（非 15 分钟快照）** | **[stats/stats.go:420-439, 496-502]** |
+| **YAML statistics 配置结构（含 dir_path/interval）** | **[home/config.go:429-446]** |
+| **stats.db 文件名在 home/dns.go 中硬编码拼接** | **[home/dns.go:55-60]** |
 
 ### 6.3 协同、调用边界与关闭顺序
 
@@ -602,3 +747,6 @@ func (s *Server) Reconfigure(ctx, conf) {
 | **全局启动顺序（filters→stats→querylog→dns）** | **[home/dns.go:469-500]** |
 | **全局关闭顺序（dns→stats→querylog）** | **[home/dns.go:522-547]** |
 | home.initDNS 双系统配置构造（两个 IgnoreEngine 独立） | [home/dns.go:57-101] |
+| **OSSVC 信号注册（仅 SIGTERM/SIGINT，未注册 SIGKILL）** | **[ossvc/service_openbsd.go:294-300]（其他平台同模式）** |
+| **go.mod 依赖列表（无 prometheus/client_golang）** | **[go.mod]** |
+
