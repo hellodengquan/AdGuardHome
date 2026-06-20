@@ -309,6 +309,137 @@ caTmpl := &x509.Certificate{
 // 有效期仅 2 小时，用于测试过期场景
 ```
 
+### 2.4.1 ECDSA P-256 与 Ed25519 签名算法：现状与迁移路线
+
+#### 代码支持的私钥类型矩阵
+
+**位置**：`internal/home/tls.go:1020-1058` `parsePrivateKey`
+
+```go
+const (
+    keyTypeRSA     = "RSA"
+    keyTypeECDSA   = "ECDSA"
+    keyTypeED25519 = "ED25519"
+)
+
+func parsePrivateKey(der []byte) (crypto.Signer, string, error) {
+    // 尝试 PKCS#8 格式
+    if key, err := x509.ParsePKCS8PrivateKey(der); err == nil {
+        switch key := key.(type) {
+        case *rsa.PrivateKey:
+            return key, keyTypeRSA, nil
+        case *ecdsa.PrivateKey:       // ✅ 支持
+            return key, keyTypeECDSA, nil
+        case ed25519.PrivateKey:       // ✅ 能解析
+            return key, keyTypeED25519, nil
+        default:
+            return nil, "", fmt.Errorf(...)
+        }
+    }
+    // 回退尝试 PKCS#1 (RSA)、SEC1 (ECDSA) 格式
+}
+```
+
+**支持的三种密钥类型**：
+| 算法 | 解析支持 | 实际使用 | 备注 |
+|------|---------|---------|------|
+| RSA | ✅ | ✅ | 主流，兼容所有浏览器 |
+| ECDSA (P-256/P-384/P-521) | ✅ | ✅ | 椭圆曲线，依赖浏览器支持 |
+| Ed25519 | ✅ | ❌ 被显式拒绝 | 见下文 |
+
+#### Ed25519 被显式拒绝：浏览器兼容性原因
+
+**位置**：`internal/home/tls.go:923-928` `validatePKey`
+
+```go
+if keyType == keyTypeED25519 {
+    return "", errors.Error(
+        "ED25519 keys are not supported by browsers; " +
+            "did you mean to use X25519 for key exchange?",
+    )
+}
+```
+
+**关键解读**：
+- ❌ **证书签名用 Ed25519 直接被拒绝**，原因是「浏览器不支持」
+- 💡 错误信息提示用户可能混淆了 `Ed25519`（签名算法）和 `X25519`（密钥交换算法）
+- **X25519 是支持的**：作为 TLS 密钥交换（ECDHE 的 Curve25519 版本），Go 的 `crypto/tls` 默认支持并优先使用
+- **Ed25519 不支持**：作为证书签名算法，由于浏览器历史兼容性问题被禁用
+
+#### ECDSA 曲线类型：代码不限制，由 Go 运行时决定
+
+代码中**没有**任何地方限制使用哪条 ECDSA 曲线（P-256 / P-384 / P-521）。整个代码库搜不到：
+- ❌ `elliptic.P256()` / `elliptic.P384()` 调用
+- ❌ `CurveP256` 常量
+- ❌ `secp256r1` / `prime256v1` 字符串
+
+**实际行为**：
+- 证书中的 ECDSA 曲线由**签发 CA 决定**（通常 Let's Encrypt 默认用 P-256）
+- Go 的 `crypto/ecdsa` 和 `crypto/tls` 支持 P-224、P-256、P-384、P-521 四条 NIST 曲线
+- 只要证书是合法 ECDSA 证书，不管哪条曲线都能加载
+
+#### 密钥交换曲线优先级：X25519 优先，无需配置
+
+Go 的 `crypto/tls` 默认密钥交换曲线优先级（TLS 1.3）：
+```
+X25519 > P-256 > P-384 > P-521
+```
+
+TLS 1.2 中 ECDHE 曲线优先级类似。这意味着：
+- ✅ **密钥交换层面已经在用 Curve25519**（抗量子性更好的 ECDH 变种）
+- ❌ **证书签名层面还是 RSA 或 ECDSA**（取决于用户上传的证书）
+
+#### 抗量子威胁：当前状态与迁移路线
+
+**抗量子密码学的两个维度**：
+
+| 维度 | 当前状态 | 抗量子方案 | 代码中是否存在 |
+|------|---------|-----------|--------------|
+| **密钥交换** | X25519 (ECDH) | Kyber / ML-KEM (NIST PQC 标准) | ❌ 无相关代码 |
+| **证书签名** | RSA / ECDSA | CRYSTALS-Dilithium / SPHINCS+ | ❌ 无相关代码 |
+
+**代码层面完全没有抗量子迁移的迹象**：
+- ❌ 没有 `kyber` / `mlkem` / `dilithium` / `sphincs` 等后量子算法引用
+- ❌ 没有 `hybrid` / `pqc` / `post-quantum` 相关配置项
+- ❌ 没有 TLS 1.3 混合密钥交换（X25519 + Kyber）的实现
+- ❌ 没有「算法迁移」「算法轮换」的业务逻辑
+
+**Ed25519 的抗量子意义**：
+Ed25519 本质上还是**椭圆曲线密码**（基于离散对数难题），并非抗量子算法。量子计算机的 Shor 算法可以多项式时间攻破 ECDSA 和 Ed25519。因此「从 ECDSA P-256 迁移到 Ed25519」**不构成抗量子迁移路线**，只是椭圆曲线的横向迁移。
+
+#### 迁移路线图：代码中不存在，需外部驱动
+
+AdGuard Home 作为 DNS 服务器而非 CA，证书签名算法的选择权在用户和 CA 手中：
+
+```
+用户 ──► 选择证书类型 (RSA/ECDSA/Ed25519)
+            │
+            ▼
+         外部 CA 签发 (Let's Encrypt 等)
+            │
+            ▼
+      证书文件写入磁盘
+            │
+            ▼
+   AdGuard Home 加载证书
+       ├─ RSA: ✅ 正常使用
+       ├─ ECDSA (任意曲线): ✅ 正常使用
+       └─ Ed25519: ❌ 拒绝加载（浏览器兼容性原因）
+```
+
+**未来 Ed25519 支持的前提条件**（代码修改点）：
+1. 移除 `validatePKey()` 中对 Ed25519 的显式拒绝检查（`tls.go:923-928`）
+2. 确认 TLS 握手环节无需额外适配（Go 1.13+ 已原生支持）
+3. 更新前端 UI 的证书类型展示（当前 `status.KeyType` 字段已支持返回 `"ED25519"`）
+
+**抗量子迁移的前提条件**（远未到代码阶段）：
+1. NIST 后量子算法标准（ML-KEM / ML-DSA）在 TLS 生态中普及
+2. Go 标准库 `crypto/tls` 支持后量子密钥交换和签名
+3. 主流 CA 开始签发后量子证书
+4. 浏览器普遍支持后量子 TLS 扩展
+
+---
+
 ### 2.5 SIGHUP / systemd reload：证书重载的外部触发通道
 
 除了文件系统自动监听，AdGuard Home 还提供了**信号触发**的证书重载路径，用于 systemd / init 系统集成。
@@ -579,6 +710,100 @@ default:
 - ❌ **SIGTERM / SIGINT / SIGQUIT** → 优雅退出，需重新启动，所有状态丢失
 - ❌ **Docker 重启** → 进程冷启动，session 仍保留（因为持久化到 bbolt），但所有连接中断时间更长
 
+##### 扩展场景：Docker Swarm 多副本部署下的 SIGHUP 并发安全
+
+**核心结论：Docker Swarm 不是 AdGuard Home 的设计目标，代码中没有任何 Swarm 相关逻辑。若强行部署多副本，SIGHUP 触发存在并发安全隐患。**
+
+#### 代码证据：无 Swarm / 多副本支持
+
+全代码库搜索结果：
+- ❌ 没有 `swarm` / `docker-swarm` / `swarmkit` 关键词
+- ❌ 没有 `replicas` / `replica set` / `task.Slot` / `service.replicas` 概念
+- ❌ 没有节点发现、服务发现、负载均衡集成
+- ❌ 没有「多实例协调」相关代码
+
+#### 若强行 Docker Swarm 部署的问题分析
+
+**场景**：Swarm service 部署 `replicas: 3`，三个副本共享一个数据卷（证书文件 + bbolt DB）。
+
+##### 问题 1：证书热重载的并发竞争
+
+```
+   Swarm Manager
+         │
+         ▼  用户触发证书更新（证书文件被修改）
+    [共享存储卷]
+         │
+         ├──► 副本 A: FSWatcher 检测到变更 → reload()
+         ├──► 副本 B: FSWatcher 检测到变更 → reload()
+         └──► 副本 C: FSWatcher 检测到变更 → reload()
+                        三个进程同时执行：
+                        - loadTLSConfig()   读证书文件 ✅ 只读，安全
+                        - tlsConfigChanged() 重启 HTTPS 服务器
+                        - 替换 httpsServer.server 变量 ⚠️ 各自进程内变量，互不干扰
+```
+
+**结果**：TLS 证书重载本身在**多进程场景下是安全的**，因为每个进程有自己独立的内存空间和 HTTPS 服务器对象，互不影响。证书文件是只读读取，无写冲突。
+
+##### 问题 2：Session 存储的并发竞争（真正的问题）
+
+**真正的并发安全风险在 Session 存储（bbolt）**：
+
+bbolt 是**单写多读**的嵌入式数据库，其关键特性：
+- ✅ 支持多进程只读打开
+- ❌ **不支持多进程同时写入**（只允许一个写事务）
+- ❌ 多进程并发写入可能导致数据损坏或 panic
+
+**位置**：`internal/aghuser/sessionstorage.go:97-105` `NewDefaultSessionStorage`
+
+```go
+// 单进程内使用 bbolt 是安全的（有 mu 互斥锁保护）
+// 但多进程并发写入 bbolt 文件是未定义行为
+func NewDefaultSessionStorage(...) (s *DefaultSessionStorage, err error) {
+    s = &DefaultSessionStorage{
+        db:         db,     // bbolt 数据库句柄
+        mu:         &sync.Mutex{},  // 进程内互斥锁
+        sessions:   make(map[SessionToken]*Session),
+    }
+    // ...
+}
+```
+
+**并发写入场景**：
+- 用户登录 → 两个副本同时创建 Session → 同时写入 `sessions.db` → 可能损坏数据库
+- 用户登出 → 两个副本同时删除 Session → 同上
+
+##### 问题 3：SIGHUP 触发方式在 Swarm 下的不确定性
+
+在 Swarm 中触发所有副本 reload 的几种方式及其问题：
+
+| 方式 | 可行性 | 问题 |
+|------|--------|------|
+| `docker exec` 逐个容器发 SIGHUP | ✅ 可行 | 需遍历所有 task，操作繁琐 |
+| 修改证书文件依赖 FSWatcher | ✅ 可行 | 各副本检测到变更的时间点有差异（ms 级），期间新旧证书并存 |
+| `docker service update --force` | ❌ 不可行 | 强制滚动更新，等于冷重启，所有连接断开 |
+| Swarm 的 `--update-order start-first` | ❌ 不可行 | 依然是滚动重建，不是热重载 |
+
+##### 问题 4：负载均衡与会话粘性
+
+Swarm 的 routing mesh / VIP 负载均衡是**四层负载**，不感知 HTTP session：
+- 用户可能这次请求到副本 A，下次到副本 B
+- 如果 Session 存储不共享（每个副本独立的 bbolt），用户会频繁掉线
+- 如果 Session 存储共享（挂载同一个数据文件），有多进程写入风险
+
+##### 总结：Swarm 多副本 SIGHUP 并发安全评估
+
+| 维度 | 并发安全性 | 备注 |
+|------|-----------|------|
+| **证书热重载本身** | ✅ 安全 | 每个进程独立，只读操作 |
+| **FSWatcher 同时触发** | ✅ 安全 | 各进程独立 reload，无共享状态 |
+| **HTTPS 服务器重启** | ✅ 安全 | 各进程独立的 server 对象 |
+| **Session 存储 (bbolt)** | ❌ 不安全 | 多进程写入 bbolt 可能损坏 |
+| **配置文件写入** | ❌ 不安全 | 多进程同时写 YAML 会冲突 |
+| **统计数据** | ❌ 不一致 | 各副本独立统计，无法聚合 |
+
+**结论**：AdGuard Home 不是为多实例设计的。如果必须在 Swarm 中部署，应使用单副本（`replicas: 1`），或自行改造 Session 存储为 Redis/PostgreSQL 等支持并发写入的共享存储。此时 SIGHUP/证书重载本身不是并发瓶颈，Session 和配置的共享存储才是。
+
 ### 3.1 三层架构模型
 
 ```
@@ -843,14 +1068,96 @@ func (c *dhcpConn) broadcast(respData []byte, peer *net.UDPAddr) (n int, err err
 | 多实例部署需要同步 | ❌ 不支持集群 | 不适用 |
 | 分布式锁保护临界区 | ❌ 无共享资源 | 不适用 |
 
+#### 扩展分析：Redis SETNX 分布式锁 — 代码中完全不存在
+
+**核心结论：整个代码库没有任何 Redis 相关代码，更没有 SETNX 分布式锁的实现。**
+
+##### 代码证据
+
+全代码库搜索结果：
+- ❌ 没有 `redis` / `go-redis` / `redigo` 等 Redis 客户端库引用
+- ❌ 没有 `SETNX` / `setnx` / `SET NX` 命令调用
+- ❌ 没有 `redlock` / `redsync` 等分布式锁算法实现
+- ❌ 没有 `lock` / `mutex` / `lease` / `TTL` 等分布式锁概念
+- ❌ 没有「锁释放失败」「重试」「告警」相关的业务逻辑
+
+唯一的锁机制是**进程内互斥锁**（`sync.Mutex` / `sync.RWMutex`）：
+
+```go
+// internal/aghuser/sessionstorage.go:68
+type DefaultSessionStorage struct {
+    mu *sync.Mutex   // 进程内互斥锁，保护 sessions map 和 bbolt 事务
+    // ...
+}
+
+// internal/home/tls.go:41
+type tlsManager struct {
+    mu *sync.Mutex    // 保护 status, certLastMod, extTLSConf 等状态
+    // ...
+}
+```
+
+这些都是**单进程内的线程安全机制**，与分布式锁完全无关。
+
+##### 关于「SETNX 释放失败兜底机制」：伪命题的完整拆解
+
+| 维度 | 真实情况 |
+|------|---------|
+| **是否有 Redis 依赖** | ❌ 无 |
+| **是否有分布式锁** | ❌ 无（只有进程内 Mutex） |
+| **是否有锁释放失败重试** | ❌ 无（sync.Mutex 不会释放失败） |
+| **是否有锁超时告警** | ❌ 无 |
+| **是否有死锁检测** | ❌ 无 |
+
+**如果强行假设需要 Redis 分布式锁**（非官方支持的集群改造），典型的实现模式会是：
+
+```
+SET lock_key random_value NX PX 30000
+     │
+     ├─ 成功 → 执行业务 → DEL lock_key (释放)
+     │           └─ 释放失败？ → 依赖 TTL 自动过期兜底
+     └─ 失败 → 重试 / 等待
+```
+
+但 AdGuard Home 当前代码中**完全没有这整套机制**。所有并发控制都是进程内的 `sync.Mutex`，而 `sync.Mutex` 的特性是：
+- ✅ `Unlock()` 不会「失败」（未加锁时 Unlock 会 panic，但正常逻辑不会触发）
+- ✅ 没有「网络分区」「节点宕机」导致的锁泄漏问题（同进程内）
+- ❌ 不支持跨进程 / 跨节点互斥
+
+##### 与证书重载流程的关联
+
+在证书热重载流程中，所有状态变更都受 `tlsManager.mu` 保护：
+
+```
+handleCertFileChange() goroutine
+     │
+     ▼  reload()
+     │   ├─ m.mu.Lock()
+     │   ├─ ... 修改 status / certLastMod / extTLSConf
+     │   ├─ m.web.tlsConfigChanged()  ← 通知 web 层
+     │   └─ m.mu.Unlock()
+```
+
+这是**单进程内的同步**，不需要分布式锁。即使有多实例，每个实例也是独立 reload，互不干扰，不需要锁协调。
+
+##### 总结：三个伪命题的依赖关系
+
+```
+命题 A：EventBus broadcast secret 旋转
+    └─ 前提：有 secret key → ❌ 不成立（查表法 token）
+    └─ 前提：有 EventBus → ❌ 不成立（单实例架构）
+        └─ 推论：需要分布式锁同步 → ❌ 更不成立
+            └─ 推论：需要 SETNX 释放失败兜底 → ❌ 完全不成立
+```
+
+整个推理链条的每一层前提都不成立，因此「Redis SETNX 分布式锁释放失败的重试与告警」在当前代码中是一个**不存在的问题**。
+
 **如果强行做集群部署（非官方支持）**，需要解决的问题：
 1. **Session 共享**：需将 bbolt 替换为 Redis / PostgreSQL 等共享存储
 2. **配置同步**：需引入配置中心（etcd / Consul）
 3. **证书热重载协调**：所有实例都要监听证书文件变更或接收 reload 信号
 4. **统计数据聚合**：多个实例的查询统计需要集中汇总
 5. **DNS 缓存一致性**：不同实例的缓存可能不一致
-
-这些都需要**大量代码改造**，超出了当前架构的设计范围。
 
 #### 与 TLS 证书在集群场景下的类比
 
@@ -1068,7 +1375,8 @@ return &http.Cookie{
 
 | 模块 | 核心文件 | 关键行号 | 职责 |
 |------|---------|---------|------|
-| **证书管理器** | `internal/home/tls.go` | 35(tlsManager), 110(newTLSManager), 217(handleCertFileChange), 238(reload), 566(handleTLSConfigure), 983(validateCertificate) | TLS 配置管理、证书重载、API、证书校验 |
+| **证书管理器** | `internal/home/tls.go` | 35(tlsManager), 110(newTLSManager), 217(handleCertFileChange), 238(reload), 566(handleTLSConfigure), 923(validatePKey-拒绝Ed25519), 983(validateCertificate), 1020(parsePrivateKey+keyType常量) | TLS 配置管理、证书重载、API、证书校验、密钥类型解析 |
+| **TLS工具包** | `internal/aghtls/aghtls.go` | 20(Init), 35(ParseCiphers), 55(SaferCipherSuites), 79(CertificateHasIP) | 密码套件解析、安全过滤、证书IP检查 |
 | **文件监控层** | `internal/aghtls/manager.go` | 24(Manager接口), 64(Updates通道) | 证书文件监控抽象 |
 | **文件监控实现** | `internal/aghtls/defaultmanager.go` | 52(Set), 102(Refresh), 117(Start), 147(handleEvents) | fsnotify 集成、信号分发、手动刷新 |
 | **信号处理** | `internal/home/signal.go` | 20(signalHandler), 75(handle), 93(SIGHUP case), 117(reloadConfig) | SIGHUP 信号处理、触发证书刷新 |
@@ -1083,7 +1391,7 @@ return &http.Cookie{
 | **认证主模块** | `internal/home/auth.go` | 89(auth), 124(newAuth), 159(middleware) | 认证模块初始化、用户DB |
 | **认证HTTP层** | `internal/home/authhttp.go` | 29(cookieTTL), 108(handleLogin), 202(newCookie), 375(authMiddlewareDefault), 404(Wrap), 495(userFromRequest), 538(sessionTokenFromHex) | 登录登出、Cookie 处理、鉴权中间件 |
 | **Session结构** | `internal/aghuser/session.go` | 9(Token长度16字节), 17(NewSessionToken), 24(Session) | 会话对象与随机 token 生成（查表法，无签名） |
-| **Session存储** | `internal/aghuser/sessionstorage.go` | 66(DefaultSessionStorage), 97(NewDefaultSessionStorage), 325(New), 380(FindByToken) | 会话持久化 + 内存缓存 |
+| **Session存储** | `internal/aghuser/sessionstorage.go` | 66(DefaultSessionStorage+mu), 97(NewDefaultSessionStorage), 325(New), 380(FindByToken) | 会话持久化 + 内存缓存 + 进程内互斥锁 |
 | **用户DB** | `internal/aghuser/db.go` | 20(DB接口), 46(DefaultDB), 63(NewDefaultDB) | 用户数据内存存储 |
 | **DHCP广播(非EventBus)** | `internal/dhcpd/broadcast_*.go` | 9(broadcast函数) | 网络层UDP广播，非进程间消息总线 |
 | **Web服务器** | `internal/home/web.go` | 117(httpsServer), 213(tlsConfigChanged), 253(start), 334(tlsServerLoop), 398(waitForTLSReady) | HTTP/HTTPS 服务生命周期 |
