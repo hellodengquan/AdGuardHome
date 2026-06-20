@@ -160,6 +160,219 @@ tlsMgr.start(ctx) 执行序列（非首次运行时）：
   3. go m.handleCertFileChange(ctx)  ⭐ 启动文件变更监听 goroutine
 ```
 
+### 2.4 ACME 与 Fallback 证书：无内置自动签发，仅被动文件监听
+
+#### 核心结论：AdGuard Home **不内置** ACME 客户端 / 自动证书签发能力
+
+代码库中完全不存在以下组件：
+- ❌ 没有 `autocert` / `certmagic` / `lego` 等 ACME 库的引用
+- ❌ 没有 `http-01` / `dns-01` / `tls-alpn-01` challenge 处理逻辑
+- ❌ 没有 Let's Encrypt 相关配置项（无 `acme_server` / `email` / `agree_tos` 等字段）
+- ❌ 没有预生成的自签名 fallback 证书机制
+
+#### TLS 配置仅支持两种证书提供方式
+
+**位置**：`internal/home/config.go:303-363` `tlsConfigSettings`
+
+```go
+type tlsConfigSettings struct {
+    // 方式一：内联 PEM 字符串（通过 Web UI 粘贴）
+    CertificateChain string   // yaml: certificate_chain
+    PrivateKey       string   // yaml: private_key
+
+    // 方式二：文件路径（配合外部续签工具 + FSWatcher）
+    CertificatePath  string   // yaml: certificate_path
+    PrivateKeyPath   string   // yaml: private_key_path
+    // ...
+}
+```
+
+**两种方式互斥**：配置时二选一，同时设置以 `CertificatePath` / `PrivateKeyPath` 为优先（从 `loadCertificateChainData` 和 `loadPrivateKeyData` 的加载逻辑来看）。
+
+#### 自签名证书的特殊处理：校验放宽但不自动生成
+
+**位置**：`internal/home/tls.go:983-1019` `validateCertificate()`
+
+```go
+func (m *tlsManager) validateCertificate(ctx, status, certChain, serverName) (ok bool, err error) {
+    certs, status.ValidCert, parseErr = m.parseCertChain(ctx, certChain)
+    if !status.ValidCert { return false, parseErr }
+
+    err = m.validateCertChain(ctx, certs, serverName)
+    if err != nil {
+        // ⭐ 关键：自签名证书链验证失败不算错误
+        // 只把错误信息放进 WarningValidation，不返回失败
+        return true, err
+    }
+
+    status.ValidChain = true   // CA 签发的证书才会标记 ValidChain=true
+    return true, parseErr
+}
+```
+
+**行为解读**：
+- `ValidCert`: 证书本身格式是否合法（能被 x509.ParseCertificate 解析）
+- `ValidChain`: 证书链是否能通过系统根 CA 验证（**自签名证书此处为 false**）
+- 自签名证书虽然 `ValidChain=false`，但**不影响使用** —— HTTPS 服务器照样加载，TLS 握手照样完成
+- 仅前端 `WarningValidation` 字段会显示警告信息
+
+#### 实际部署中的 ACME 工作模式（需外部工具配合）
+
+```
+┌──────────────────────────────────────────────────────────────┐
+│  外部 ACME 客户端 (certbot / acme.sh / lego CLI)            │
+│    ├─ 执行 ACME challenge (http-01 / dns-01)                │
+│    ├─ 申请/续签证书                                          │
+│    └─ 写入证书文件到指定路径                                  │
+│                              │                               │
+│                              ▼  文件系统写操作               │
+│  AdGuard Home 进程                                          │
+│    └─ FSWatcher (fsnotify) 监听文件变更                      │
+│       └→ aghtlsMgr.handleEvents()                           │
+│          └→ tlsManager.reload()                             │
+│             └→ 重新加载证书 + 重启 HTTPS/DNS 服务器         │
+└──────────────────────────────────────────────────────────────┘
+```
+
+**设计取舍**：
+- **优点**：职责分离，AdGuard Home 专注于 DNS/过滤，证书管理交给专业工具；避免在核心进程中引入复杂的 ACME 状态机
+- **缺点**：首次部署需要额外配置 certbot deploy hook 或依赖文件系统监听，链路较长
+- **无 fallback 风险**：如果证书文件完全失效（过期 + 续签失败），HTTPS 服务器会启动失败，但 HTTP 管理后台仍然可用（前提是没开 ForceHTTPS）
+
+### 2.5 SIGHUP / systemd reload：证书重载的外部触发通道
+
+除了文件系统自动监听，AdGuard Home 还提供了**信号触发**的证书重载路径，用于 systemd / init 系统集成。
+
+#### 信号处理入口
+
+**位置**：`internal/home/signal.go:20-131`
+
+```go
+type signalHandler struct {
+    logger        *slog.Logger
+    mu            *sync.Mutex
+    clientStorage *client.Storage
+    tlsManager    aghtls.Manager   // ⭐ 注意：是 aghtls.Manager 接口
+                                   // 不是 home.tlsManager！
+    signals       <-chan os.Signal
+    cleanup       func(ctx context.Context)
+}
+
+func (h *signalHandler) handle(ctx context.Context) {
+    for {
+        sig := <-h.signals
+        switch sig {
+        case syscall.SIGHUP:
+            h.reloadConfig(ctx)   // SIGHUP → 重载配置
+        default:
+            h.shutdown(ctx)       // 其他信号 → 优雅退出
+        }
+    }
+}
+
+func (h *signalHandler) reloadConfig(ctx context.Context) {
+    h.mu.Lock()
+    defer h.mu.Unlock()
+
+    if h.clientStorage != nil {
+        h.clientStorage.ReloadARP(ctx)
+    }
+
+    if h.tlsManager != nil {
+        // ⭐ SIGHUP 触发证书 Refresh
+        err := h.tlsManager.Refresh(ctx)
+        // ...
+    }
+}
+```
+
+#### 信号 → 证书重载的完整链路
+
+```
+  外部触发源
+    (systemctl reload / kill -HUP / AdGuardHome -s reload)
+         │
+         ▼
+①  向 AdGuard Home 进程发送 SIGHUP 信号
+         │
+         ▼
+②  signalHandler.handle() 收到信号
+    位置：internal/home/signal.go:89-99
+         │
+         ▼  调用 reloadConfig()
+③  h.tlsManager.Refresh(ctx)
+    注意：此处 tlsManager 是 aghtls.Manager 接口类型
+    实际对象：aghtls.DefaultManager
+         │
+         ▼  non-blocking send to updates channel
+④  aghtls.DefaultManager.Refresh() → updates <- UpdateSignal{}
+    位置：internal/aghtls/defaultmanager.go:102-114
+         │
+         ▼  监听 goroutine 收到信号
+⑤  tlsManager.handleCertFileChange() 收到 <-updates
+    位置：internal/home/tls.go:217-232
+         │
+         ▼  调用 reload()
+⑥  tlsManager.reload()
+    ├─ os.Stat() 对比文件修改时间 ⭐ 关键判定
+    │   └─ 若 certLastMod 未变化 → 记录日志 + 直接返回
+    │      （防抖动，与 FSWatcher 触发行为完全一致）
+    └─ 若文件已变更 → loadTLSConfig + 重启 HTTPS/DNS
+```
+
+**重要特性**：SIGHUP 触发的 `Refresh()` 与 FSWatcher 触发走的是**同一条下游链路**，且都经过 `certLastMod` 时间戳防抖动检查。即使 SIGHUP 和文件变更同时到达，也不会重复加载。
+
+#### systemd 服务集成路径
+
+**位置**：`internal/ossvc/manager_unix.go:20-61` + `internal/ossvc/config_linux.go:40-67`
+
+##### 路径 A：CLI 命令 `AdGuardHome -s reload`
+
+```
+$ AdGuardHome -s reload
+     │
+     ▼  handleServiceControlAction()
+     │  位置：internal/home/service.go:150-211
+     ▼  handleServiceReloadCmd()
+     │  位置：internal/home/service.go:272-288
+     ▼  ossvc.Manager.Reload()
+     │
+     ▼  查找 PID（二选一）：
+     │   1. 读 /var/run/AdGuardHome.pid
+     │   2. PIDByCommand() 按进程名查找
+     │
+     ▼  proc.Signal(syscall.SIGHUP)
+        位置：internal/ossvc/manager_unix.go:55
+```
+
+##### 路径 B：systemd unit 的 ExecReload（部分可用）
+
+systemd 模板中有条件性的 `ExecReload`：
+
+```ini
+{{if .ReloadSignal}}ExecReload=/bin/kill -{{.ReloadSignal}} "$MAINPID"{{end}}
+```
+
+**但是**：`ConfigureServiceOptions()` (`internal/ossvc/config.go:14-22`) 中**没有设置** `conf.Option["ReloadSignal"]`，因此生成的 systemd unit 文件**不包含** `ExecReload` 指令。
+
+**实际效果**：
+- ✅ `AdGuardHome -s reload` 命令可用（直接发 SIGHUP）
+- ❌ `systemctl reload AdGuardHome` 默认不可用（缺少 ExecReload）
+- ✅ `kill -HUP <pid>` 始终可用
+- ✅ certbot 的 `--deploy-hook "systemctl reload AdGuardHome"` 模式需要额外配置 ExecReload 才能工作
+
+##### 路径 C：certbot deploy-hook 直接调用
+
+推荐的集成方式（绕过 systemd 限制）：
+
+```bash
+# /etc/letsencrypt/renewal-hooks/deploy/adguardhome.sh
+#!/bin/bash
+kill -HUP $(cat /var/run/AdGuardHome.pid)
+# 或
+AdGuardHome -s reload
+```
+
 ---
 
 ## 三、管理后台安全鉴权：Cookie Session 体系
@@ -303,6 +516,75 @@ FindByToken() 命中内存缓存后：
     → 是 → deleteByToken() 同步删除内存+磁盘 → 返回 nil
     → 否 → 返回 Session 供使用
 ```
+
+### 3.6 Session Token 机制：纯随机不签名，无 Secret Key 旋转概念
+
+#### 核心结论：Session Token 是**服务端存储的随机不透明令牌**，不是 HMAC 签名 Token
+
+#### Token 生成方式
+
+**位置**：`internal/aghuser/session.go:8-21`
+
+```go
+const SessionTokenLength = 16        // 16 字节 = 128 位熵
+type SessionToken [SessionTokenLength]byte
+
+func NewSessionToken() (t SessionToken) {
+    _, _ = rand.Read(t[:])          // crypto/rand 密码学安全随机数
+    return t
+}
+```
+
+**关键特性**：
+- ✅ 使用 `crypto/rand` 密码学安全随机数生成
+- ✅ 128 位熵，暴力破解不可行
+- ❌ **不是** JWT / PASETO 等自包含令牌
+- ❌ **没有** secret key 用于签名 / 验证
+- ❌ **没有** 过期时间编码在 token 本身中
+
+#### 认证方式：查表法 vs 验签法
+
+| 特性 | AdGuard Home（查表法） | JWT/HMAC（验签法） |
+|------|------------------------|-------------------|
+| Token 内容 | 纯随机字节（不透明） | 包含 payload + 签名 |
+| 验证方式 | 查内存 map / bbolt | 用 secret key 验签 |
+| 服务端存储 | 需要存储所有有效 token | 无需存储（无状态） |
+| 立即吊销 | ✅ 直接删除 token 记录 | ❌ 需黑名单 / 等待过期 |
+| Secret Key 旋转 | ❌ 无此概念（没有 secret key） | ✅ 旋转 key 可批量失效 |
+
+#### 「旋转 Secret Key 会失效所有 Session」的答案：**不适用**
+
+由于 Session Token 是查表模式而非验签模式，不存在「旋转一个 secret key 就能让所有 session 失效」的机制。
+
+**要批量失效所有 Session，需要：**
+
+1. **直接清空存储**：目前没有公开 API 或配置项支持「一键登出所有用户」
+2. **修改 sessionTTL 配置**：只影响新创建的 session 和过期检查，不立即失效
+3. **删除 bbolt 数据库文件**：极端手段，会同时丢失其他持久化数据
+4. **重启进程**：如果 session 只在内存中 —— 但 AdGuard Home 会持久化到 bbolt，重启不失效
+
+**代码证据**：`DefaultSessionStorage` 中**没有**任何与「secret key」「signing key」「hmac key」相关的字段或方法。整个 `aghuser` 包中找不到 `hmac`、`sha256`、`sign`、`verify` 等关键词。
+
+#### 安全影响分析
+
+**优点**：
+- 完全服务端控制，可随时精确吊销单个 session
+- Token 不泄露用户信息（无 payload）
+- 无需管理 key 轮换策略
+
+**缺点**：
+- 无法通过「旋转密钥」快速批量失效所有 session
+- 每次请求都需要查存储（内存缓存缓解了性能问题）
+- 若 bbolt 数据库泄露，所有有效 session token 都可能被冒用
+
+#### 与 TLS 证书过期的类比
+
+| 维度 | TLS 证书 | Session Token |
+|------|---------|---------------|
+| 过期检查 | 连接握手时验证 NotAfter | 每次请求时检查 Expire |
+| 过期后行为 | 握手失败，直接拒绝 | 返回 401，需重新登录 |
+| 续签/续期 | 外部工具续签 + FSWatcher 热重载 | 不自动续期，过期后重新登录生成新 token |
+| 批量失效 | 更换证书 → 所有连接需重新握手 | 无快捷方式，需遍历删除所有 session |
 
 ---
 
@@ -511,13 +793,19 @@ return &http.Cookie{
 
 | 模块 | 核心文件 | 关键行号 | 职责 |
 |------|---------|---------|------|
-| **证书管理器** | `internal/home/tls.go` | 35(tlsManager), 110(newTLSManager), 217(handleCertFileChange), 238(reload), 566(handleTLSConfigure) | TLS 配置管理、证书重载、API |
+| **证书管理器** | `internal/home/tls.go` | 35(tlsManager), 110(newTLSManager), 217(handleCertFileChange), 238(reload), 566(handleTLSConfigure), 983(validateCertificate) | TLS 配置管理、证书重载、API、证书校验 |
 | **文件监控层** | `internal/aghtls/manager.go` | 24(Manager接口), 64(Updates通道) | 证书文件监控抽象 |
-| **文件监控实现** | `internal/aghtls/defaultmanager.go` | 52(Set), 117(Start), 147(handleEvents) | fsnotify 集成、信号分发 |
+| **文件监控实现** | `internal/aghtls/defaultmanager.go` | 52(Set), 102(Refresh), 117(Start), 147(handleEvents) | fsnotify 集成、信号分发、手动刷新 |
+| **信号处理** | `internal/home/signal.go` | 20(signalHandler), 75(handle), 93(SIGHUP case), 117(reloadConfig) | SIGHUP 信号处理、触发证书刷新 |
+| **服务管理** | `internal/home/service.go` | 118(restartService), 150(handleServiceControlAction), 272(handleServiceReloadCmd) | service CLI 命令、reload 命令入口 |
+| **OS服务管理器** | `internal/ossvc/manager_unix.go` | 20(reload), 24(pidFile), 55(proc.Signal SIGHUP) | UNIX 平台 reload 实现（发 SIGHUP） |
+| **systemd配置** | `internal/ossvc/config_linux.go` | 12(configureOSOptions), 40(systemdScript模板), 53(ExecReload条件) | systemd unit 模板生成 |
+| **服务配置入口** | `internal/ossvc/config.go` | 14(ConfigureServiceOptions) | 跨平台服务配置入口 |
 | **认证主模块** | `internal/home/auth.go` | 89(auth), 124(newAuth), 159(middleware) | 认证模块初始化、用户DB |
-| **认证HTTP层** | `internal/home/authhttp.go` | 29(cookieTTL), 108(handleLogin), 202(newCookie), 375(authMiddlewareDefault), 404(Wrap), 495(userFromRequest) | 登录登出、Cookie 处理、鉴权中间件 |
-| **Session结构** | `internal/aghuser/session.go` | 9(Token长度), 24(Session) | 会话对象定义 |
+| **认证HTTP层** | `internal/home/authhttp.go` | 29(cookieTTL), 108(handleLogin), 202(newCookie), 375(authMiddlewareDefault), 404(Wrap), 495(userFromRequest), 538(sessionTokenFromHex) | 登录登出、Cookie 处理、鉴权中间件 |
+| **Session结构** | `internal/aghuser/session.go` | 9(Token长度16字节), 17(NewSessionToken), 24(Session) | 会话对象与随机 token 生成 |
 | **Session存储** | `internal/aghuser/sessionstorage.go` | 66(DefaultSessionStorage), 97(NewDefaultSessionStorage), 325(New), 380(FindByToken) | 会话持久化 + 内存缓存 |
+| **用户DB** | `internal/aghuser/db.go` | 20(DB接口), 46(DefaultDB), 63(NewDefaultDB) | 用户数据内存存储 |
 | **Web服务器** | `internal/home/web.go` | 117(httpsServer), 213(tlsConfigChanged), 253(start), 334(tlsServerLoop), 398(waitForTLSReady) | HTTP/HTTPS 服务生命周期 |
-| **配置结构** | `internal/home/config.go` | 180(httpConfig), 196(SessionTTL), 462(SessionTTL默认值) | http.session_ttl 配置项 |
-| **启动流程** | `internal/home/home.go` | 757(run), 899(initTLS), 1066(initUsers) | 整体初始化时序 |
+| **配置结构** | `internal/home/config.go` | 180(httpConfig), 196(SessionTTL), 303(tlsConfigSettings), 462(SessionTTL默认值) | http.session_ttl + tls 配置项 |
+| **启动流程** | `internal/home/home.go` | 757(run), 899(initTLS), 928(sigHdlr.addTLSManager), 1066(initUsers) | 整体初始化时序、模块装配 |
