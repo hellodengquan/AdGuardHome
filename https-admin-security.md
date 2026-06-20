@@ -239,6 +239,76 @@ func (m *tlsManager) validateCertificate(ctx, status, certChain, serverName) (ok
 - **缺点**：首次部署需要额外配置 certbot deploy hook 或依赖文件系统监听，链路较长
 - **无 fallback 风险**：如果证书文件完全失效（过期 + 续签失败），HTTPS 服务器会启动失败，但 HTTP 管理后台仍然可用（前提是没开 ForceHTTPS）
 
+#### 补充：测试用自签名证书的技术参数（非运行时 fallback）
+
+**文件位置**：`internal/home/testdata/cert.pem`
+
+通过 `openssl x509 -text` 解析出的完整参数：
+
+| 参数 | 值 |
+|------|----|
+| **签名算法** | `sha256WithRSAEncryption` |
+| **公钥算法** | RSA 1024 位（测试用，生产不推荐） |
+| **公钥指数** | 65537 (0x10001) |
+| **序列号** | `c4:fd:90:f5:49:74:ce:cb` |
+| **Subject** | `O=AdGuard Ltd, CN=AdGuard Home` |
+| **Issuer** | `O=AdGuard Ltd, CN=AdGuard Home`（自签名） |
+| **Not Before** | Feb 27 09:24:23 2019 GMT |
+| **Not After** | Jul 14 09:24:23 2046 GMT |
+| **有效期时长** | **约 27.4 年** |
+| **X509v3 扩展** | Subject Key Identifier, Authority Key Identifier (CA 标志), Basic Constraints: CA:TRUE |
+| **验证结果** | `ValidCert=true`, `ValidChain=false`（自签名，系统根 CA 不认可） |
+
+**测试用例中的验证断言** (`tls_internal_test.go:76-87`)：
+
+```go
+notBefore := time.Date(2019, 2, 27, 9, 24, 23, 0, time.UTC)
+notAfter := time.Date(2046, 7, 14, 9, 24, 23, 0, time.UTC)
+
+assert.Equal(t, "RSA", status.KeyType)
+assert.Equal(t, "CN=AdGuard Home,O=AdGuard Ltd", status.Subject)
+assert.Equal(t, "CN=AdGuard Home,O=AdGuard Ltd", status.Issuer)
+assert.Equal(t, notBefore, status.NotBefore)
+assert.Equal(t, notAfter, status.NotAfter)
+assert.True(t, status.ValidPair)
+assert.True(t, status.ValidCert)
+assert.False(t, status.ValidChain)  // 自签名证书链验证失败是预期的
+```
+
+**重要澄清**：
+- ❌ **这不是运行时自动生成的 fallback 证书**，仅用于单元测试
+- ❌ 代码中**没有**在运行时调用 `x509.CreateCertificate()` 生成自签名证书的逻辑
+- ❌ **没有**所谓「ACME 失败时自动切到自签名 fallback」的代码路径
+- ✅ 如果启用了 TLS 但证书文件无效，唯一的结果是 HTTPS 服务器启动失败
+- ✅ HTTP 管理后台不受影响（除非配置了 `ForceHTTPS=true`）
+
+**测试中动态生成证书的代码**（仅用于测试）：
+
+`newCertAndKey()` (`tls_internal_test.go:177-191`)：
+```go
+func newCertAndKey(tb testing.TB, n int64) (certDER []byte, key *rsa.PrivateKey) {
+    key, _ = rsa.GenerateKey(rand.Reader, 2048)
+    certTmpl := &x509.Certificate{
+        SerialNumber: big.NewInt(n),
+        // 注意：NotBefore / NotAfter 未设置！
+        // 这意味着证书默认有效期：Now → Now+10年（x509 包默认行为）
+    }
+    certDER, _ = x509.CreateCertificate(rand.Reader, certTmpl, certTmpl, &key.PublicKey, key)
+    return certDER, key
+}
+```
+
+`newCertWithoutIP()` (`tls_internal_test.go:116-174`)：
+```go
+caTmpl := &x509.Certificate{
+    NotBefore: now.Add(-time.Hour),   // 1小时前
+    NotAfter:  now.Add(time.Hour),    // 1小时后
+    IsCA:      true,
+    KeyUsage:  x509.KeyUsageCertSign | x509.KeyUsageCRLSign,
+}
+// 有效期仅 2 小时，用于测试过期场景
+```
+
 ### 2.5 SIGHUP / systemd reload：证书重载的外部触发通道
 
 除了文件系统自动监听，AdGuard Home 还提供了**信号触发**的证书重载路径，用于 systemd / init 系统集成。
@@ -373,9 +443,141 @@ kill -HUP $(cat /var/run/AdGuardHome.pid)
 AdGuardHome -s reload
 ```
 
----
+#### SIGHUP 在 systemd-managed 与 Docker container 部署下的行为差异
 
-## 三、管理后台安全鉴权：Cookie Session 体系
+##### 信号注册入口（统一逻辑）
+
+**位置**：`internal/home/home.go:130-151`
+
+```go
+signals := make(chan os.Signal, 1)
+signal.Notify(signals,
+    syscall.SIGINT,   // Ctrl+C
+    syscall.SIGTERM,  // systemd/docker stop
+    syscall.SIGHUP,   // reload  ← 我们关注的
+    syscall.SIGQUIT,  // core dump
+)
+
+sigHdlr := newSignalHandler(..., signals, ...)
+go sigHdlr.handle(ctx)   // 启动独立 goroutine 监听信号
+```
+
+**信号分发逻辑**（`signal.go:89-98`）：
+```go
+for {
+    sig := <-h.signals
+    switch sig {
+    case syscall.SIGHUP:
+        h.reloadConfig(ctx)      // 仅重载证书 + ARP 表
+    default:
+        h.shutdown(ctx)          // 其他信号 → 优雅退出
+    }
+}
+```
+
+##### 部署形态 A：systemd-managed
+
+| 维度 | 行为 |
+|------|------|
+| **PID 1** | systemd 是 PID 1，AdGuard Home 是子进程 |
+| **信号发送者** | systemd 通过 cgroup 跟踪进程，`systemctl kill -s HUP` 直接发信号 |
+| **reload 命令** | `AdGuardHome -s reload` → 读 pid 文件 → `kill -HUP <pid>` |
+| **ExecReload** | 默认缺失（`ConfigureServiceOptions` 未设置 `ReloadSignal`），需手动配置 |
+| **systemd 配置** | `ExecReload=/bin/kill -HUP $MAINPID` |
+| **优点** | 信号可靠，cgroup 隔离，journald 日志 |
+| **注意** | `ExecReload` 是**同步**的，执行完成前 systemctl 会阻塞 |
+
+**systemd 集成完整链路**：
+```
+systemctl reload AdGuardHome
+     │
+     ▼  systemd 执行 ExecReload=
+     │  /bin/kill -HUP $MAINPID
+     ▼
+AdGuardHome 收到 SIGHUP
+     │
+     ▼  signalHandler.handle()
+     ▼  reloadConfig()
+     ├─ clientStorage.ReloadARP()
+     └─ aghtls.Manager.Refresh() → updates 通道发信号
+     │
+     ▼  tlsManager.handleCertFileChange()
+     ▼  reload() → 检查 certLastMod → 重载证书
+     │
+     ▼  systemd 认为 ExecReload 执行完成（无需等待实际重载完成）
+```
+
+##### 部署形态 B：Docker container
+
+| 维度 | 行为 |
+|------|------|
+| **PID 1** | `/opt/adguardhome/AdGuardHome` 是容器内 PID 1 |
+| **STOPSIGNAL** | Dockerfile 中**未设置** `STOPSIGNAL`，默认 `SIGTERM` |
+| **`docker stop`** | 发送 `SIGTERM`（不是 SIGHUP）→ 触发 `shutdown()` 退出 |
+| **`docker restart`** | 先 SIGTERM 等 10s，再 SIGKILL → 进程完全重启 |
+| **`kill -HUP 1`** | 需要 `docker exec <container> kill -HUP 1` 才能触发热重载 |
+| **`docker exec`** | 可执行，但需要容器内有 `kill` 命令（Alpine 镜像默认有） |
+| **信号隔离** | 宿主的信号不会透传给容器（除非 `--pid=host`） |
+| **注意** | 容器内 PID 1 对信号有特殊处理（SIGINT/SIGTERM 默认忽略，除非进程显式处理） |
+
+**Dockerfile 配置**（`docker/build.Dockerfile`）：
+```dockerfile
+FROM alpine:3.23
+
+# 没有 STOPSIGNAL 指令 → 默认 SIGTERM
+# 没有 HEALTHCHECK 指令
+
+ENTRYPOINT ["/opt/adguardhome/AdGuardHome"]
+CMD [ "--no-check-update",
+      "-c", "/opt/adguardhome/conf/AdGuardHome.yaml",
+      "-w", "/opt/adguardhome/work" ]
+```
+
+**Docker 下触发证书热重载的两种方式**：
+
+**方式 1 — 通过 docker exec**（推荐）：
+```bash
+# certbot deploy-hook 中执行
+docker exec adguardhome kill -HUP 1
+
+# 或
+docker exec adguardhome /opt/adguardhome/AdGuardHome -s reload
+```
+
+**方式 2 — 通过共享 pid namespace**（不推荐）：
+```bash
+docker run --pid=host ...
+# 然后宿主上直接 kill -HUP <host_pid>
+```
+
+##### 两种部署形态的关键差异对照表
+
+| 特性 | systemd | Docker |
+|------|---------|--------|
+| **SIGHUP 触发热重载** | ✅ 原生支持 | ✅ 需 `docker exec` 间接触发 |
+| **`stop` 命令信号** | `SIGTERM` | `SIGTERM`（默认，可改 `STOPSIGNAL`） |
+| **`reload` 命令** | ✅ `systemctl reload` | ❌ `docker reload` 不存在 |
+| **PID 文件** | `/var/run/AdGuardHome.pid` | 容器内 `/var/run/...`（宿主不可见） |
+| **进程重启** | `systemctl restart` | `docker restart`（冷重启，session 丢失） |
+| **证书热重载对现有连接的影响** | 传输层断开，session 保留 | 同左（热重载时）；冷重启则 session 也丢 |
+| **证书文件共享** | 直接读宿主文件系统 | 需 `-v` 挂载 volume 或 bind mount |
+
+##### 代码证据：不同信号的语义差异
+
+从 `signal.go:92-97` 可以清晰看出：
+```go
+switch sig {
+case syscall.SIGHUP:
+    h.reloadConfig(ctx)   // 只重载配置，进程不退出
+default:
+    h.shutdown(ctx)       // 所有其他信号 → 退出进程
+}
+```
+
+这意味着：
+- ✅ **SIGHUP** → 真正的热重载，零停机（仅传输层重连，session 保留）
+- ❌ **SIGTERM / SIGINT / SIGQUIT** → 优雅退出，需重新启动，所有状态丢失
+- ❌ **Docker 重启** → 进程冷启动，session 仍保留（因为持久化到 bbolt），但所有连接中断时间更长
 
 ### 3.1 三层架构模型
 
@@ -585,6 +787,79 @@ func NewSessionToken() (t SessionToken) {
 | 过期后行为 | 握手失败，直接拒绝 | 返回 401，需重新登录 |
 | 续签/续期 | 外部工具续签 + FSWatcher 热重载 | 不自动续期，过期后重新登录生成新 token |
 | 批量失效 | 更换证书 → 所有连接需重新握手 | 无快捷方式，需遍历删除所有 session |
+
+### 3.7 EventBus 与多实例集群：架构不支持，分布式锁无必要
+
+#### 核心结论：AdGuard Home 是**单实例单体架构**，没有 EventBus、没有集群同步、没有分布式锁需求。
+
+#### 代码证据一：没有 EventBus / 消息总线组件
+
+全代码库搜索结果：
+- ❌ 没有 `EventBus` / `eventbus` 类型定义
+- ❌ 没有 `Publish` / `Subscribe` / `Broadcast` 等消息原语
+- ❌ 没有 `pubsub` / `message queue` 相关引用
+- ❌ 没有 MQTT / NATS / Redis Pub/Sub 等集成
+
+唯一与「broadcast」相关的代码在 **DHCP 模块**（`internal/dhcpd/broadcast_*.go`）：
+```go
+// broadcast sends resp to the broadcast address specific for network interface.
+func (c *dhcpConn) broadcast(respData []byte, peer *net.UDPAddr) (n int, err error) {
+    // 这是网络层的 UDP 广播，不是进程间/实例间的消息广播
+}
+```
+
+#### 代码证据二：没有集群 / 多实例部署支持
+
+全代码库搜索结果：
+- ❌ 没有 `cluster` / `replicate` / `multi-instance` 关键词
+- ❌ 没有 `leader` / `election` / `raft` / `consensus` 共识算法
+- ❌ 没有 `etcd` / `consul` / `redis` 分布式协调组件
+- ❌ 没有 `peer` / `node` / `member` 节点概念
+- ❌ 没有配置同步、状态复制、冲突解决机制
+
+所有状态都是**进程内**的：
+- Session：内存 map + 本地 bbolt 数据库（`sessions.db`）
+- 配置：本地 YAML 文件 + 内存缓存
+- 统计数据：本地 SQLite / bbolt 数据库
+- DNS 缓存：进程内内存
+
+#### 代码证据三：没有 Secret Key 旋转的分布式同步需求
+
+由于 Session Token 是**查表法**而非**验签法**，不存在「多个实例共享一个 signing key」的场景，因此：
+- ❌ 不需要「旋转 secret key 后广播到所有实例」
+- ❌ 不需要分布式锁保护 secret key 的并发读写
+- ❌ 不需要跨实例的 session 失效同步
+
+**单实例架构下的 Session 失效方式**：
+1. **过期自动失效**：每次 `FindByToken()` 时懒检查 + 启动时批量清理
+2. **修改密码后失效**：当前代码**不会**自动失效该用户的其他 session（`ByLogin` 查用户后只验证密码，不校验 session 与密码修改时间）
+3. **手动全量失效**：删除 `sessions.db` 文件后重启进程
+
+#### 关于「secret 旋转需要分布式锁」的命题：伪命题
+
+| 前提 | 是否成立 | 结论 |
+|------|---------|------|
+| 有 secret key 需要旋转 | ❌ 无 secret key | 不适用 |
+| 多实例部署需要同步 | ❌ 不支持集群 | 不适用 |
+| 分布式锁保护临界区 | ❌ 无共享资源 | 不适用 |
+
+**如果强行做集群部署（非官方支持）**，需要解决的问题：
+1. **Session 共享**：需将 bbolt 替换为 Redis / PostgreSQL 等共享存储
+2. **配置同步**：需引入配置中心（etcd / Consul）
+3. **证书热重载协调**：所有实例都要监听证书文件变更或接收 reload 信号
+4. **统计数据聚合**：多个实例的查询统计需要集中汇总
+5. **DNS 缓存一致性**：不同实例的缓存可能不一致
+
+这些都需要**大量代码改造**，超出了当前架构的设计范围。
+
+#### 与 TLS 证书在集群场景下的类比
+
+| 维度 | TLS 证书 | Session Token |
+|------|---------|---------------|
+| 单实例 | FSWatcher + SIGHUP 热重载 | 内存 map + bbolt 本地存储 |
+| 多实例（非官方） | 所有实例监听同一证书文件 / 共享存储 | 需改造成共享存储（Redis） |
+| 过期检查 | 每个实例独立检查 | 每个实例独立检查（共享存储则一致） |
+| 批量失效 | 所有实例同时重载证书 | 共享存储下删除即全局失效 |
 
 ---
 
@@ -801,11 +1076,15 @@ return &http.Cookie{
 | **OS服务管理器** | `internal/ossvc/manager_unix.go` | 20(reload), 24(pidFile), 55(proc.Signal SIGHUP) | UNIX 平台 reload 实现（发 SIGHUP） |
 | **systemd配置** | `internal/ossvc/config_linux.go` | 12(configureOSOptions), 40(systemdScript模板), 53(ExecReload条件) | systemd unit 模板生成 |
 | **服务配置入口** | `internal/ossvc/config.go` | 14(ConfigureServiceOptions) | 跨平台服务配置入口 |
+| **Docker构建** | `docker/build.Dockerfile` | 23(alpine基础镜像), 62(ENTRYPOINT), 64(CMD) | Docker 镜像配置，无 STOPSIGNAL |
+| **测试证书数据** | `internal/home/testdata/cert.pem` | - | 自签名测试证书：sha256WithRSAEncryption, 1024位RSA, 有效期27.4年 |
+| **TLS测试辅助** | `internal/home/tls_internal_test.go` | 76(证书断言), 116(newCertWithoutIP), 177(newCertAndKey) | 测试用证书生成与校验辅助函数 |
+| **启动主流程** | `internal/home/home.go` | 130(signal.Notify), 151(sigHdlr.handle goroutine), 757(run), 899(initTLS), 928(sigHdlr.addTLSManager) | 信号注册、整体初始化时序、模块装配 |
 | **认证主模块** | `internal/home/auth.go` | 89(auth), 124(newAuth), 159(middleware) | 认证模块初始化、用户DB |
 | **认证HTTP层** | `internal/home/authhttp.go` | 29(cookieTTL), 108(handleLogin), 202(newCookie), 375(authMiddlewareDefault), 404(Wrap), 495(userFromRequest), 538(sessionTokenFromHex) | 登录登出、Cookie 处理、鉴权中间件 |
-| **Session结构** | `internal/aghuser/session.go` | 9(Token长度16字节), 17(NewSessionToken), 24(Session) | 会话对象与随机 token 生成 |
+| **Session结构** | `internal/aghuser/session.go` | 9(Token长度16字节), 17(NewSessionToken), 24(Session) | 会话对象与随机 token 生成（查表法，无签名） |
 | **Session存储** | `internal/aghuser/sessionstorage.go` | 66(DefaultSessionStorage), 97(NewDefaultSessionStorage), 325(New), 380(FindByToken) | 会话持久化 + 内存缓存 |
 | **用户DB** | `internal/aghuser/db.go` | 20(DB接口), 46(DefaultDB), 63(NewDefaultDB) | 用户数据内存存储 |
+| **DHCP广播(非EventBus)** | `internal/dhcpd/broadcast_*.go` | 9(broadcast函数) | 网络层UDP广播，非进程间消息总线 |
 | **Web服务器** | `internal/home/web.go` | 117(httpsServer), 213(tlsConfigChanged), 253(start), 334(tlsServerLoop), 398(waitForTLSReady) | HTTP/HTTPS 服务生命周期 |
 | **配置结构** | `internal/home/config.go` | 180(httpConfig), 196(SessionTTL), 303(tlsConfigSettings), 462(SessionTTL默认值) | http.session_ttl + tls 配置项 |
-| **启动流程** | `internal/home/home.go` | 757(run), 899(initTLS), 928(sigHdlr.addTLSManager), 1066(initUsers) | 整体初始化时序、模块装配 |
