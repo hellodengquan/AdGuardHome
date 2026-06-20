@@ -146,6 +146,30 @@ if !l.flushPending && fileIsEnabled && l.buffer.Len() >= memSize {
 
 **运维侧目前唯一可间接观测丢弃的方法**：对比同一时间段内 stats 的 `num_dns_queries` 与 querylog.json 实际行数，差值即近似丢弃量。但这种间接对账受到 §4.4 所述 6 个一致性断层影响，误差可能较大。
 
+#### 2.5.1 querylog_drop_total 告警规则模板——零提供
+
+**结论：`querylog_drop_total` 指标在代码中不存在，因此不可能有配套的告警规则模板。**
+
+全量搜索四层证据：
+
+| 搜索目标 | 搜索范围 | 结果 |
+|---------|---------|------|
+| `querylog_drop` / `drop_total` 关键词 | 整个代码库 `**/*.go` | 0 匹配 |
+| `alerting` / `alert_rules` / `recording_rules` / `prometheus_rules` 关键词 | 整个代码库 `**/*.{go,yml,yaml,json,tmpl,tpl,conf,cfg}` | 0 匹配 |
+| `serviceMonitor` / `PodMonitor`（K8s Prometheus Operator CRD） | 整个代码库 `**/*.{go,yml,yaml,json}` | 0 匹配 |
+| `prometheus` / `client_golang` / `promhttp` | `go.mod` | 0 匹配 |
+
+此外：
+- 项目根目录无 `deploy/` / `kubernetes/` / `charts/` / `monitoring/` / `examples/` 等子目录存放 Prometheus 告警模板
+- GitHub 仓库的 Releases 附件中也不含独立的 `*.rules.yml` 文件
+- `Dockerfile` 中无暴露 `/metrics` 端口的指令（默认 HTTP 端口 3000 仅提供 Web UI + API）
+
+**如果运维需要自建告警，可行路径**：
+1. 在 AdGuard Home 前置一个 metrics exporter（社区项目如 `adguardhome-exporter`），通过 `/control/stats` API 轮询 `num_dns_queries`
+2. 在 querylog 侧旁路日志分析工具（如 Filebeat → Logstash → Elasticsearch），统计实际写入行数
+3. 在两者之间配置 PromQL 告警：`stats_num_dns_queries - querylog_actual_lines > threshold`
+4. 但这种方案本质上仍是"外挂式"，无法感知 RingBuffer 内部的静默覆盖事件
+
 ### 2.6 滚动文件策略
 
 **日志滚动** [querylog/querylogfile.go:103-121]
@@ -375,6 +399,121 @@ signal.Notify(sigChan, syscall.SIGTERM, os.Interrupt)
 2. 没有 replay 接口：`StatsCtx` 对外只暴露 `Update(entry)` 单向写入，不暴露"从 querylog.json 批量回灌"
 3. 没有对账 API：`handleStats` 返回的 `num_dns_queries` 与 querylog 行数之差没有被系统自动计算或告警
 4. 定位是"趋势展示而非计费"：Dashboard 展示的是粗略指标，容忍小时级数据缺口
+
+### 3.6 bbolt Journal 损坏场景的 Fallback 路径
+
+**结论前置：stats.db 的 bbolt 打开使用 `nil` Options（即全默认值），无任何自定义日志恢复配置。Journal 损坏时唯一的二级 fallback 是 `clear()` → 删库重建（全部历史数据归零）。**
+
+#### 3.6.1 bbolt.Open 的 Options 实际值
+
+`openDB` 调用链 [stats/stats.go:389-418]：
+
+```go
+func (s *StatsCtx) openDB() (err error) {
+    db, err = bbolt.Open(s.filename, aghos.DefaultPermFile, nil)
+    //                                                            ^^^
+    //                                              第三个参数 Options = nil
+    ...
+}
+```
+
+`nil` Options 意味着 bbolt 使用全默认 `Options{}`，关键字段：
+
+| Options 字段 | 默认值 | 含义 |
+|-------------|--------|------|
+| `Timeout` | 0 | 打开数据库时不等待排他锁（若另一个进程占用则立即返回错误） |
+| `NoGrowSync` | false | 文件增长时执行 fsync（安全但慢） |
+| `FreelistType` | `FreelistArrayType` | 使用数组管理空闲页（简单但不适合超大数据文件） |
+| `NoSync` | false | **每次 Commit 都执行 fsync**（最安全，性能最低） |
+| `NoFreelistSync` | false | **freelist 变更时也同步到磁盘**（避免 freelist 损坏） |
+| `PageSize` | 0（= OS 页大小） | 使用操作系统默认页大小 |
+
+**安全特性**：`NoSync=false` + `NoFreelistSync=false`，意味着每次 `tx.Commit()` 都会 `fdatasync`，freelist 也同步刷盘。这是最安全的模式，也是性能最慢的模式。
+
+**没有自定义的 `StrictSync`**：bbolt v1.3.x 新增了 `StrictSync` 选项（确保 mmap 写入前先 sync），但 AdGuard Home 的 `go.mod` 中引用的 bbolt 版本未使用此选项。
+
+#### 3.6.2 bbolt Journal 自身损坏的三种场景与代码处理
+
+| 损坏场景 | 触发原因 | `bbolt.Open` 行为 | 代码处理 |
+|---------|---------|-------------------|---------|
+| **1. Journal 文件不完整**（mmap 的 meta page 写到一半断电） | SIGKILL / 内核 panic / 硬件掉电 | bbolt 内部自动选择两个 meta page 中较新的那个（写时双缓冲） | **透明恢复**，代码无感知 |
+| **2. 两个 meta page 都损坏**（磁盘坏块 / 文件系统损坏） | 磁盘硬件故障 | `bbolt.Open` 返回 `ErrInvalid` 或类似错误 | `openDB` 返回 error → `New()` 失败 → **进程启动失败** |
+| **3. Freelist 损坏**（freelist 页写了一半断电，`NoFreelistSync=false` 时概率极低） | 极端情况下写入中断 | `bbolt.Open` 可能成功但后续 `Begin(true)` 返回 `freelist: corrupted` 错误 | `flushDB` / `Close` 中 `db.Begin(true)` 返回 error → **仅日志告警，periodicFlush 继续 sleep 1 秒重试** |
+
+**场景 2 的处理——启动时 `openDB` 失败**：
+
+`openDB` 返回的错误会被 `New()` 直接 return：
+```go
+// stats/stats.go:187-189
+err = s.openDB()
+if err != nil {
+    return nil, fmt.Errorf("opening database: %w", err)
+}
+```
+此时 `StatsCtx` 未创建，stats 功能完全不可用。进程不会崩溃但 stats 相关 API 全部失效。
+
+唯一的非代码人工恢复手段：手动 `rm stats.db`，重启进程让 `openDB` 创建空数据库。
+
+**场景 3 的处理——运行时 `Begin(true)` 失败**：
+
+在 `flushDB` 中 [stats/stats.go:452-458]：
+```go
+tx, err := db.Begin(true)
+if err != nil {
+    s.logger.Error("opening transaction", slogutil.KeyError, err)
+    return true, 0   // ← 返回 cont=true, sleepFor=0
+}
+```
+`periodicFlush` 继续循环，下次 `flush()` 仍会尝试 `db.Begin(true)`。如果 DB 持续损坏，日志每秒刷一条 Error，但进程不会退出、不会自愈。
+
+**场景 3 的唯一自动 fallback——`clear()` 方法** [stats/stats.go:524-569]：
+
+```go
+func (s *StatsCtx) clear() (err error) {
+    db := s.db.Swap(nil)        // 原子交换，后续操作使用 nil DB
+    if db != nil {
+        tx, err = db.Begin(true)
+        finishTxn(tx, false)    // 回滚事务
+        db.Close()              // 关闭旧 DB
+    }
+    os.Remove(s.filename)       // ← 删除损坏的 stats.db 文件
+    s.openDB()                  // ← 重建空数据库
+    s.curr = newUnit(s.unitIDGen())  // ← 重置内存 unit
+    return nil
+}
+```
+
+`clear()` 的触发路径**只有一条**：用户主动调用 `POST /control/stats_reset` API → `handleStatsReset` → `s.clear()`。
+
+**代码中没有自动检测 bbolt 损坏后触发 clear() 的逻辑**。即：
+- `flushDB` 中 `Begin(true)` 失败只打日志，不自动 clear
+- `loadUnitFromDB` 中 gob 解码失败只打日志，不自动 clear
+- `finishTxn` 中 `Commit()` 失败只打日志，不自动 clear
+
+#### 3.6.3 二级 Fallback 总结
+
+```
+bbolt journal 损坏
+        │
+        ├── 场景1: 单 meta page 损坏
+        │     └── bbolt 自动恢复（双 meta page 冗余）
+        │         ✅ 对应用层透明
+        │
+        ├── 场景2: 双 meta page 都损坏
+        │     └── bbolt.Open() 失败
+        │         └── New() 返回 error → 进程启动失败
+        │             ❌ 需人工 rm stats.db + 重启
+        │
+        └── 场景3: Freelist/数据页损坏
+              └── bbolt.Open() 可能成功
+                  └── Begin(true) 返回 error
+                      └── periodicFlush 持续打 Error 日志
+                          └── 不自动 clear，不自动退出
+                              ❌ 需人工调 POST /stats_reset
+                              ❌ 全部历史统计归零
+```
+
+没有"仅丢弃损坏 bucket 而保留其他 bucket"的局部恢复逻辑。一旦 `clear()` 被执行，所有历史统计数据永久丢失。
 
 ## 4. 并发协同与锁避免机制
 
@@ -702,6 +841,81 @@ Bucket 名本质是**小时 ID 的 8 字节大端二进制编码**。例如：
 
 代价是运维用 `bbolt stats.db list` 调试时看到的 bucket 名是不可读的二进制字节，需要 `unitNameToID` 逆向解码。
 
+#### 5.3.4 配置项的热更新支持矩阵——存储路径不可热改，运行参数可热改
+
+**结论前置：`dir_path`（存储目录）、`Filename`（DB 文件名）、`queryLogFileName`（日志文件名）在 `New()` 构造时固定，不支持运行时热更新。`enabled`/`ignored`/`interval`/`limit` 可通过 HTTP API 运行时热改，不要求重启进程。**
+
+##### 运行时可热更新的配置项
+
+两个子系统都通过 `ConfigModifier.Apply` 回调链实现配置热更新，完整调用链如下：
+
+```
+HTTP API 请求（PUT /control/stats/config/update）
+    │
+    ├── 修改内存字段（confMu.Lock 保护）
+    │     ├── s.ignored = engine    ← 运行时切换忽略引擎
+    │     ├── s.limit = ivl         ← 运行时修改保留期限
+    │     └── s.enabled = bool      ← 运行时开关
+    │
+    ├── defer s.configModifier.Apply(ctx)
+    │     └── defaultConfigModifier.Apply → config.write()
+    │         ├── WriteDiskConfig: 从内存读当前配置
+    │         │     ├── stats: limit/ignored/enabled
+    │         │     └── querylog: rotationIvl/ignored/enabled/anonymizeIP
+    │         └── YAML 序列化写回 AdGuardHome.yaml
+    │
+    └── 无需重启进程，新配置立即生效
+```
+
+| 配置项 | 热更新 API | 是否立即生效 | 是否写回 YAML |
+|-------|-----------|------------|-------------|
+| **stats.enabled** | `PUT /control/stats/config/update` | ✅ | ✅ |
+| **stats.limit (interval)** | `PUT /control/stats/config/update` | ✅ | ✅ |
+| **stats.ignored** | `PUT /control/stats/config/update` | ✅ | ✅ |
+| **querylog.enabled** | `PUT /control/querylog/config/update` | ✅ | ✅ |
+| **querylog.rotationIvl** | `PUT /control/querylog/config/update` | ✅ | ✅ |
+| **querylog.ignored** | `PUT /control/querylog/config/update` | ✅ | ✅ |
+| **querylog.anonymizeClientIP** | `PUT /control/querylog/config/update` | ✅ | ✅ |
+
+##### 运行时不可热更新的配置项——必须重启进程
+
+| 配置项 | 原因 | 热改后果 |
+|-------|------|---------|
+| **querylog.dir_path** | `logFile` 在 `newQueryLog()` 中通过 `filepath.Join(conf.BaseDir, queryLogFileName)` 固定写入 `l.logFile` 字段，后续所有 flush 操作引用此字段 | HTTP API 不暴露 `dir_path` 修改入口；修改 YAML 后重启生效 |
+| **stats.dir_path** | `Filename` 在 `StatsCtx.New()` 时固定到 `s.filename` 字段，`openDB()` 使用此字段打开 DB | HTTP API 不暴露 `dir_path` 修改入口；修改 YAML 后重启生效 |
+| **stats.Filename (stats.db)** | 同上，硬编码在 `home/dns.go:59` 的 `filepath.Join(statsDir, "stats.db")` | 修改源码重新编译 |
+| **querylog.queryLogFileName** | 硬编码 `const queryLogFileName = "querylog.json"` | 修改源码重新编译 |
+| **querylog.memSize** | `buffer = NewRingBuffer[*logEntry](memSize)` 在构造时创建，运行时不变更 RingBuffer 容量 | 修改 YAML 后重启生效 |
+| **bucket 命名规则** | `idToUnitName()` 是纯函数，无状态可改 | 修改源码重新编译 |
+
+**关键区分**：`ConfigModifier.Apply` 只负责"内存 → YAML 文件"的单向同步，不负责"YAML → 内存"的反向加载。运行时配置变更完全通过 HTTP API 触发，`config.yaml` 文件只是持久化手段而非热加载源。
+
+**热更新验证链路**（以 stats.interval 为例）：
+
+```
+1. PUT /control/stats/config/update  {"interval": 86400000, "enabled": true}
+2. handlePutStatsConfig:
+   ├── validateIvl(ivl)                    ← 校验
+   ├── s.confMu.Lock()
+   ├── s.limit = ivl                       ← 内存生效
+   ├── s.confMu.Unlock()
+   └── defer s.configModifier.Apply(ctx)
+3. defaultConfigModifier.Apply:
+   └── config.write()                      ← 写回 YAML
+4. periodicFlush 下次循环:
+   └── limit := uint32(s.limit.Hours())    ← 使用新值
+```
+
+无需重启 DNS Server，无需调用 `dnsServer.Reconfigure`。
+
+##### DNS 配置的热更新分界线
+
+DNS 相关的配置变更分两档：
+- **非重启型**（如 `ProtectionEnabled`、`DNSSECEnabled`、`DisableIPv6`）：`setConfig` 返回 `shouldRestart=false`，内存立即生效
+- **重启型**（如 `Upstreams`、`BootstrapDNS`、`ListenAddr`）：`setConfig` 返回 `shouldRestart=true`，触发 `dnsServer.Reconfigure`（停止代理 → 重新 Prepare → 启动）
+
+但 `querylog.dir_path` 和 `stats.dir_path` 属于"DNS 配置之外"的存储层参数，即使 `Reconfigure` 也不会重新初始化 stats/querylog 实例。
+
 ## 6. 关键代码索引
 
 ### 6.1 查询日志写盘路径
@@ -718,6 +932,8 @@ Bucket 名本质是**小时 ID 的 8 字节大端二进制编码**。例如：
 | **RingBuffer 数据结构（cur + full，无 dropped 字段）** | **golibs/container/ringbuffer.go:4-8** |
 | **querylog.json 文件名常量硬编码** | **[querylog/qlog.go:21-23]** |
 | **YAML querylog 配置结构（含 dir_path/size_memory/interval）** | **[home/config.go:402-427]** |
+| **querylog 热更新 HTTP API（handlePutQueryLogConfig）** | **[querylog/http.go:221-277]** |
+| **querylog 热更新应用（applyQueryLogConfig + ConfigModifier.Apply）** | **[querylog/http.go:309-337]** |
 
 ### 6.2 统计聚合路径
 
@@ -735,6 +951,10 @@ Bucket 名本质是**小时 ID 的 8 字节大端二进制编码**。例如：
 | **periodicFlush 的 1 秒 sleep 粒度（非 15 分钟快照）** | **[stats/stats.go:420-439, 496-502]** |
 | **YAML statistics 配置结构（含 dir_path/interval）** | **[home/config.go:429-446]** |
 | **stats.db 文件名在 home/dns.go 中硬编码拼接** | **[home/dns.go:55-60]** |
+| **openDB（bbolt.Open 使用 nil Options，全默认安全模式）** | **[stats/stats.go:387-418]** |
+| **clear（删库重建 fallback，POST /stats_reset 触发）** | **[stats/stats.go:524-569]** |
+| **flushDB 中 Begin(true) 失败处理（仅日志告警不自动 clear）** | **[stats/stats.go:452-458]** |
+| **stats 热更新 HTTP API（handlePutStatsConfig）** | **[stats/http.go:225-282]** |
 
 ### 6.3 协同、调用边界与关闭顺序
 
@@ -744,9 +964,13 @@ Bucket 名本质是**小时 ID 的 8 字节大端二进制编码**。例如：
 | processQueryLogsAndStats（双路径串行调用） | [dnsforward/stats.go:19-76] |
 | shouldLog / shouldCountStat 准入过滤差异 | [dnsforward/stats.go:80-96] |
 | dnsServer Reconfigure（重配置不重建指针） | [dnsforward/dnsforward.go:848-884] |
+| DNS setConfig/setConfigRestartable（重启/非重启分界线） | [dnsforward/http.go:586-652] |
 | **全局启动顺序（filters→stats→querylog→dns）** | **[home/dns.go:469-500]** |
 | **全局关闭顺序（dns→stats→querylog）** | **[home/dns.go:522-547]** |
 | home.initDNS 双系统配置构造（两个 IgnoreEngine 独立） | [home/dns.go:57-101] |
 | **OSSVC 信号注册（仅 SIGTERM/SIGINT，未注册 SIGKILL）** | **[ossvc/service_openbsd.go:294-300]（其他平台同模式）** |
 | **go.mod 依赖列表（无 prometheus/client_golang）** | **[go.mod]** |
+| **ConfigModifier 接口定义（Apply 方法：内存→YAML 单向同步）** | **[agh/agh.go:14-18]** |
+| **defaultConfigModifier.Apply（实际写 YAML 回调）** | **[home/config.go:1007-1014]** |
+| **config.write + WriteDiskConfig（运行时配置序列化回 YAML）** | **[home/config.go:890-942]**
 
