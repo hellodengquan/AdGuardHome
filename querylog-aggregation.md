@@ -170,6 +170,44 @@ if !l.flushPending && fileIsEnabled && l.buffer.Len() >= memSize {
 3. 在两者之间配置 PromQL 告警：`stats_num_dns_queries - querylog_actual_lines > threshold`
 4. 但这种方案本质上仍是"外挂式"，无法感知 RingBuffer 内部的静默覆盖事件
 
+#### 2.5.2 statspersist_lag 类滞后指标的缺位
+
+**结论：stats 持久化滞后（lag）类指标完全不存在，既没有内部时间戳记录，也不对外暴露。**
+
+三层缺位证据：
+
+| 层面 | 缺失内容 | 搜索结果 |
+|-----|---------|---------|
+| **指标暴露层** | `statspersist_lag_seconds` / `flush_lag` / `last_flush_time` / `stale_*` 等 Prometheus 指标 | 0 匹配（项目无 prometheus 依赖） |
+| **内部状态层** | `lastFlushTime` / `flushDuration` / `lastPersistAt` 等结构体字段，用于记录上次落盘时间/耗时 | `StatsCtx` 结构体中 0 个时间戳字段 |
+| **日志告警层** | `flush took too long` / `persistent lag detected` 等 Warn 级别日志 | 0 匹配 |
+
+`StatsCtx` 结构体关键字段 [stats/stats.go:51-95]：
+```go
+type StatsCtx struct {
+    db          *atomic.Pointer[bbolt.DB]   // DB 指针（原子交换）
+    curr        *unit                       // 当前小时 unit（内存）
+    confMu      *sync.RWMutex               // 配置读写锁
+    currMu      *sync.Mutex                 // curr 指针互斥锁
+    limit       time.Duration               // 保留期限
+    unitIDGen   UnitIDGenFunc               // 小时 ID 生成器
+    filename    string                      // DB 文件名
+    logger      *slog.Logger                // 日志
+    enabled     bool                        // 是否启用
+    ignored     *filtering.HashEngine       // 忽略域名
+    configModifier agh.ConfigModifier       // 配置修改回调
+}
+```
+没有 `lastFlushAt` / `lastFlushDuration` / `flushCount` 等任何与"持久化时序"相关的字段。
+
+**滞后检测手段完全依赖外部观测**：
+- periodicFlush 的 sleep 粒度是 1 秒，但这是检查间隔不是滞后指标
+- 跨小时后多久完成 flushDB，内部没有记录、没有日志、没有告警
+- `flushUnitToDB` + `deleteOldUnits` 的总耗时，内部没有统计
+- 如果 DB 写入很慢（如磁盘 IO 拥堵），`periodicFlush` 仍继续每秒 `time.Sleep` 循环，不会触发任何"滞后告警"阈值
+
+**运维侧近似度量 lag 的唯一方法**：通过 bbolt 工具 `bbolt stats.db buckets | grep <最新小时ID>`，对比系统当前时间与最新 bucket 的 ID（小时级精度），但这是小时级的粗粒度检测，无法检测秒级滞后。
+
 ### 2.6 滚动文件策略
 
 **日志滚动** [querylog/querylogfile.go:103-121]
@@ -514,6 +552,68 @@ bbolt journal 损坏
 ```
 
 没有"仅丢弃损坏 bucket 而保留其他 bucket"的局部恢复逻辑。一旦 `clear()` 被执行，所有历史统计数据永久丢失。
+
+#### 3.6.4 fsck 级严重损坏——最后一个窗口数据必然丢失
+
+**结论：代码中没有调用任何 bbolt fsck / check / repair 接口，fsck 级严重损坏（双 meta page 都损坏、freelist 完全不可读、数据页大面积损坏）下，最后一个统计窗口 + 全部历史数据 100% 丢失。**
+
+##### fsck 工具完全缺位
+
+三个层面的证据：
+
+1. **代码库内部**：全量 grep `fsck` / `check.*db` / `repair.*db` / `Integrity` / `verify.*bucket` / `consistency.*check` → 0 匹配，没有任何 DB 完整性校验代码
+
+2. **bbolt Go API 层面**：`bbolt.DB` 对外暴露的方法中只有 `Stats()` 元信息、`View()` / `Update()` 事务、`Sync()` 强制刷盘，**没有 `Check()` / `Fsck()` / `Repair()` 方法**。bbolt 作为嵌入式 KV 数据库，设计取向是"轻量快速"而非"企业级可靠性"，不提供一致性检查和修复 API
+
+3. **运维工具层面**：bbolt 官方提供了 `bbolt` CLI 工具（`go install go.etcd.io/bbolt/cmd/bbolt@latest`），其中包含 `bbolt check` 和 `bbolt info` 子命令，但这是**独立的外部工具**，不是代码库依赖，AdGuard Home 不会自动调用
+
+##### 最后一个窗口数据在严重损坏时的命运
+
+按损坏程度从浅到深排列：
+
+| 损坏等级 | 场景 | 最后一个已提交窗口数据 | 当前内存中未提交窗口 | 历史数据 | 恢复手段 |
+|---------|------|----------------------|-------------------|---------|---------|
+| **1. 轻度** | 单 meta page 损坏 | ✅ 完整 | ✅ 内存中不受影响 | ✅ 完整 | bbolt 自动恢复 |
+| **2. 中度** | freelist 损坏但 bucket 可遍历 | ⚠️ 可能完整但无法再写入 | ✅ 内存中不受影响 | ⚠️ 部分 bucket 可能不可读 | 人工 dump 可读 bucket + 重建（需外部工具） |
+| **3. 重度** | 双 meta page 都损坏 | ❌ 完全丢失 | ❌ 若进程还在则内存中仍有，但重启即丢 | ❌ 完全丢失 | 无（bbolt 无法打开 DB） |
+| **4. 毁灭性** | 磁盘坏块 / 文件系统损坏 | ❌ 完全丢失 | ❌ 完全丢失 | ❌ 完全丢失 | 无（需从备份恢复） |
+
+**关键观察**：等级 3（双 meta page 损坏）时，如果进程尚未崩溃（即损坏发生在运行中、不是启动时），`curr` 内存 unit 中的**当前小时数据仍然完整**，因为内存数据与 DB 是两套独立存储。但：
+- 这些内存数据无法持久化（`Begin(true)` 失败）
+- 一旦进程重启，内存数据归零
+- 没有"把内存 unit 直接 dump 到新 DB"的降级逻辑
+
+**代码中没有任何自动检测到损坏后尝试"抢救性落盘"的逻辑**——既不尝试用 `bbolt check` 做一致性校验，也不尝试在检测到损坏时将内存 `curr` 数据 dump 到一个新的临时 DB 或 JSON 文件。
+
+##### 与 querylog 的交叉对比
+
+querylog 路径在文件写入失败时也没有 fsck 级修复，但因为 JSON 是文本追加模式，有一个天然优势：
+- 文件尾的损坏只影响最后几条记录
+- 文本文件可用 `tail` / `jq` 等工具部分恢复
+
+而 bbolt 是页式结构，元数据（meta page / freelist）一旦损坏，**可能导致整库不可读**，即使大部分数据页实际上完好无损。
+
+#### 3.6.5 二级 Fallback 全景总结
+
+```
+bbolt 损坏
+    │
+    ├── 轻度：单 meta page 损坏 → bbolt 自动恢复 ✅ 透明
+    │
+    ├── 中度：freelist/数据页局部损坏
+    │     ├── periodicFlush 每秒打 Error 日志
+    │     ├── 不自动 clear，不自动退出
+    │     └── 内存 curr 数据完好但无法落盘
+    │         ❌ 无抢救性 dump
+    │         ❌ 需人工调 /stats_reset → 全部归零
+    │
+    └── 重度：双 meta page 都损坏
+          ├── 启动时：bbolt.Open 失败 → New() 返回 error → stats 不可用
+          └── 运行中：Begin(true) 持续失败 + 内存数据无法落盘
+              ❌ 无 fsck / check / repair API
+              ❌ 最后一个已提交窗口 + 全部历史数据 100% 丢失
+              ❌ 仅有人工 rm stats.db + 重启 一条路
+```
 
 ## 4. 并发协同与锁避免机制
 
@@ -916,6 +1016,67 @@ DNS 相关的配置变更分两档：
 
 但 `querylog.dir_path` 和 `stats.dir_path` 属于"DNS 配置之外"的存储层参数，即使 `Reconfigure` 也不会重新初始化 stats/querylog 实例。
 
+#### 5.3.5 fsnotify 热更新机制与 bucket rename 数据迁移
+
+**结论前置：fsnotify（文件系统事件监听）在项目中仅用于 hosts 文件和 TLS 证书热加载，**完全不用于** stats / querylog 配置热更新。bucket 名由 `idToUnitName` 算法生成不是配置项，不存在"桶名 rename"的配置变更场景，自然也没有 bucket 级数据迁移代码。**
+
+##### fsnotify 的使用范围——仅两个场景
+
+全项目 `fsnotify.NewWatcher()` 调用点只有一处：`aghos/fswatcher.go` 中的 `NewOSWatcher()`。实际使用 `OSWatcher` 的业务模块只有两个：
+
+| 使用场景 | 模块 | 监视目标 | 触发动作 |
+|---------|------|---------|---------|
+| **hosts 文件热加载** | `home/home.go:281-319` → `aghnet.HostsContainer` | `/etc/hosts` 等系统 hosts 文件 | 文件变更时重新解析 hosts 条目 |
+| **TLS 证书热加载** | `home/home.go:910-928` → `aghtls.DefaultManager` | TLS 证书文件 / 私钥文件 | 证书更新时自动重新加载（无需重启 HTTPS/DNS-over-TLS 服务） |
+
+**stats 和 querylog 完全不使用 fsnotify**。它们的配置变更通过 HTTP API + `ConfigModifier.Apply` 实现（内存 → YAML 单向同步），不走"文件变更 → 重新加载"的反向路径。
+
+##### 为什么 stats / querylog 不走 fsnotify 热更新
+
+设计上的三个原因：
+1. **写入方向相反**：stats/querylog 配置是"HTTP API 修改内存 → 写回 YAML"，写入方是 AdGuard Home 自身；而 hosts / TLS 证书是"外部工具修改文件 → AdGuard Home 感知"，写入方是外部运维工具
+2. **一致性要求不同**：hosts 是纯只读配置，证书是只读文件，重新加载安全无副作用；stats/querylog 配置变更涉及内存状态转换（如 enabled 从 true→false 时要 flush 当前 buffer），需要有状态机控制，fsnotify 回调里直接做太复杂
+3. **变更频率不同**：hosts 和证书可能由外部系统（如 certbot）高频自动更新；stats/querylog 配置是运维低频手工调整
+
+##### bucket rename 场景不存在——因为 bucket 名不是配置项
+
+stats 的 bucket 命名规则是 `idToUnitName(id)` 纯函数，输入是**小时 ID**（`uint32`），输出是 8 字节大端二进制。这个命名规则：
+- 不读配置
+- 不读环境变量
+- 不读命令行参数
+- 完全由编译期常量和算法决定
+
+因此 **不存在"通过配置改 bucket 名"的可能性**，自然也不存在"bucket rename 时数据迁移"的代码路径。
+
+假设未来有人想加 `bucket_prefix` 配置项，需要迁移的数据量 = 保留期内所有小时 bucket 总数。例如保留 30 天 = 720 个 bucket。迁移方案在代码中**完全没有预留**：
+
+| 迁移能力 | 现状 |
+|---------|------|
+| `RenameBucket()` API 调用 | ❌ 代码中 0 处 `RenameBucket` |
+| bucket 遍历 + 逐条复制 | ❌ 没有 `migrateBuckets` / `renameUnitBuckets` 函数 |
+| 迁移期间的读写并发保护 | ❌ 没有迁移状态机 / 迁移锁 |
+| 迁移失败回滚 | ❌ 没有迁移事务 / 快照回滚 |
+| 大库分批迁移 | ❌ 没有分页 / 限流 / 进度跟踪 |
+
+##### 如果真的要做 bucket rename，可行的迁移路径（代码外方案）
+
+由于代码内没有迁移工具，运维侧如果需要迁移 bucket 命名空间，只能走外部工具方案：
+1. 停止 AdGuard Home 进程
+2. 用 `bbolt` CLI + 自定义脚本遍历所有 bucket，逐个 `CreateBucket` + `ForEach` 复制 key-value
+3. 删除旧 bucket
+4. 重启进程
+
+**或者更简单的方案**：直接删库重建，接受历史统计数据丢失——这也是当前代码中 `clear()` 方法的思路。
+
+#### 5.3.6 热更新机制全景对比
+
+| 热更新机制 | 触发源 | 适用配置 | 是否需要重启 | 代码位置 |
+|-----------|--------|---------|-------------|---------|
+| **HTTP API + ConfigModifier** | 运维调用 PUT 接口 | stats.enabled / limit / ignored、querylog.enabled / rotationIvl / ignored | 否 | [stats/http.go] [querylog/http.go] |
+| **dnsServer.Reconfigure** | HTTP API 触发 setConfig | DNS 上游地址 / 监听端口 / DNSSEC 等 | 是（重启 DNS 代理） | [dnsforward/dnsforward.go:848-884] |
+| **fsnotify 文件监听** | 外部修改文件 | hosts 条目、TLS 证书 | 否 | [aghos/fswatcher.go] |
+| **dir_path / Filename 变更** | （不支持） | 存储目录 / DB 文件名 | —（必须重启进程，无热更新） | — |
+
 ## 6. 关键代码索引
 
 ### 6.1 查询日志写盘路径
@@ -934,6 +1095,7 @@ DNS 相关的配置变更分两档：
 | **YAML querylog 配置结构（含 dir_path/size_memory/interval）** | **[home/config.go:402-427]** |
 | **querylog 热更新 HTTP API（handlePutQueryLogConfig）** | **[querylog/http.go:221-277]** |
 | **querylog 热更新应用（applyQueryLogConfig + ConfigModifier.Apply）** | **[querylog/http.go:309-337]** |
+| **StatsCtx 结构体（无 lastFlushAt/flushDuration 等 lag 相关字段）** | **[stats/stats.go:51-95]** |
 
 ### 6.2 统计聚合路径
 
@@ -955,8 +1117,10 @@ DNS 相关的配置变更分两档：
 | **clear（删库重建 fallback，POST /stats_reset 触发）** | **[stats/stats.go:524-569]** |
 | **flushDB 中 Begin(true) 失败处理（仅日志告警不自动 clear）** | **[stats/stats.go:452-458]** |
 | **stats 热更新 HTTP API（handlePutStatsConfig）** | **[stats/http.go:225-282]** |
+| **finishTxn（事务提交/回滚辅助函数）** | **[stats/stats.go:359-385]** |
+| **deleteOldUnits（过期 bucket 删除）** | **[stats/stats.go:216-244]** |
 
-### 6.3 协同、调用边界与关闭顺序
+### 6.3 协同、调用边界、热更新与关闭顺序
 
 | 功能 | 文件位置 |
 |------|---------|
@@ -972,5 +1136,8 @@ DNS 相关的配置变更分两档：
 | **go.mod 依赖列表（无 prometheus/client_golang）** | **[go.mod]** |
 | **ConfigModifier 接口定义（Apply 方法：内存→YAML 单向同步）** | **[agh/agh.go:14-18]** |
 | **defaultConfigModifier.Apply（实际写 YAML 回调）** | **[home/config.go:1007-1014]** |
-| **config.write + WriteDiskConfig（运行时配置序列化回 YAML）** | **[home/config.go:890-942]**
+| **config.write + WriteDiskConfig（运行时配置序列化回 YAML）** | **[home/config.go:890-942]** |
+| **fsnotify 封装（OSWatcher，仅用于 hosts + TLS 证书）** | **[aghos/fswatcher.go]** |
+| **hosts 文件 fsnotify 热加载（setupHostsContainer）** | **[home/home.go:276-320]** |
+| **TLS 证书 fsnotify 热加载（setupTLSManager）** | **[home/home.go:906-928]** |
 
