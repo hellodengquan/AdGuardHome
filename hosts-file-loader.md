@@ -416,3 +416,291 @@ filterDNSRequest → DNSFilter.CheckHost()
 | `internal/dnsforward/filter.go` | `filterDNSRequest()` - 过滤结果分发 |
 | `internal/dnsforward/upstreams.go:27` | `newBootstrap()` - etcHosts 参与 bootstrap |
 | `internal/dnsforward/dnsforward.go:238` | etcHosts 包装为 `upstream.Resolver` |
+
+---
+
+## 八、域名冲突时的优先级日志行为
+
+### 8.1 冲突处理机制：先匹配先返回，静默覆盖
+
+当自定义 hosts（Legacy Rewrites / $dnsrewrite 规则）与系统 `/etc/hosts` 中同一域名出现冲突时，**代码层面没有任何显式的冲突检测或告警日志**。
+
+其核心原因是 `DNSFilter.CheckHost()` 的设计：**短路求值 + 顺序优先**（`internal/filtering/filtering.go:505`）：
+
+```go
+// [1] Legacy Rewrites —— 最先检查，匹配即返回
+if setts.FilteringEnabled {
+    res = d.processRewrites(host, qtype)
+    if res.Reason == Rewritten {
+        return res, nil  // 命中后，系统 hosts 和 $dnsrewrite 根本不会执行
+    }
+}
+
+// [2] hostCheckers 顺序遍历
+for _, hc := range d.hostCheckers {
+    res, err = hc.check(host, qtype, setts)
+    // ...
+    if res.Reason.Matched() {
+        return res, nil  // 命中即返回，后续检查器不再执行
+    }
+}
+```
+
+这种模式下：
+- 如果 Legacy Rewrites 命中 → 系统 hosts 匹配逻辑 **不会被调用**
+- 如果系统 hosts 命中 → `$dnsrewrite` 规则匹配逻辑 **不会被调用**
+- 不存在"两条来源都匹配然后比较优先级"的分支，因此**没有冲突检测点**
+
+### 8.2 现有日志记录情况
+
+全代码库搜索 `conflict`、`duplicate`、`overwrite`、`warn.*host` 等关键字，仅发现以下与 hosts 无关的结果：
+
+| 位置 | 内容 | 与 hosts 冲突的关系 |
+|-----|------|-------------------|
+| `internal/filtering/rewrite/storage.go:203` | `// TODO(d.kolyshev): Handle duplicate items.` | **唯一相关 TODO**：表示 $dnsrewrite 规则重复项处理是未实现的功能 |
+| `internal/filtering/idgenerator.go:69` | `"filter has duplicate id; reassigning"` | 过滤列表 ID 去重，与 hosts 无关 |
+| `internal/filtering/filtering.go:1051` | `deduplicateFilters()` | 过滤列表去重，与 hosts 规则无关 |
+
+### 8.3 Query Log 中的 Reason 标识
+
+虽然没有冲突告警，但**每次匹配都会在 Query Log 中记录 `Reason` 字段**，可以间接推断命中了哪一条来源（`internal/querylog/entry.go` 通过 `dctx.result.Reason` 写入）：
+
+| Reason 枚举值 | Query Log 字符串 | 对应来源 |
+|--------------|-----------------|---------|
+| `Rewritten` | `"Rewrite"` | Legacy DNS Rewrites |
+| `RewrittenAutoHosts` | `"RewriteEtcHosts"` | 系统 `/etc/hosts` |
+| `RewrittenRule` | `"RewriteRule"` | `$dnsrewrite` 过滤规则 |
+
+在 `internal/filtering/reason.go:75`：
+```go
+Reason.String() map:
+    Rewritten:          "Rewrite"
+    RewrittenAutoHosts: "RewriteEtcHosts"
+    RewrittenRule:      "RewriteRule"
+```
+
+**结论**：
+- ✅ 没有优先级冲突的 warning/error 日志
+- ✅ 冲突解决完全依赖匹配顺序（先匹配先返回）
+- ✅ 通过 Query Log 中的 `Rewrite` / `RewriteEtcHosts` / `RewriteRule` 标识可事后追溯命中来源
+- ✅ $dnsrewrite 存储层有 TODO 注释标注 duplicate 处理未实现
+
+---
+
+## 九、Hosts 文件热更新（fsnotify）解析失败的回滚行为
+
+### 9.1 refresh() 的错误处理分析
+
+`HostsContainer.refresh()` 函数（`internal/aghnet/hostscontainer.go:234`）是热更新的核心实现：
+
+```go
+func (hc *HostsContainer) refresh(ctx context.Context) (err error) {
+    hc.logger.DebugContext(ctx, "refreshing")
+
+    // 1. 创建全新的空 Storage（与旧版本完全独立）
+    strg, _ := hostsfile.NewDefaultStorage(ctx, &hostsfile.DefaultStorageConfig{
+        Logger: hc.logger,
+    })
+
+    // 2. 遍历所有匹配文件并解析，错误直接向上返回
+    _, err = aghos.FileWalker(func(r io.Reader) (patterns []string, cont bool, err error) {
+        return nil, true, hostsfile.Parse(ctx, strg, r, nil)
+    }).Walk(hc.fsys, hc.patterns...)
+    if err != nil {
+        // Don't wrap the error since it's informative enough as is.
+        return err  // ← 关键点：直接 return，不执行 Store
+    }
+
+    // 3. 对比新旧数据——只有解析成功才会走到这里
+    if !hc.current.Load().Equal(strg) {
+        hc.current.Store(strg)         // 原子替换
+        hc.sendUpd(ctx, strg)
+    }
+
+    return nil
+}
+```
+
+### 9.2 aghos.FileWalker.Walk 的错误传播路径
+
+`internal/aghos/filewalker.go:87`：
+
+```go
+func (fw FileWalker) Walk(fsys fs.FS, initial ...string) (ok bool, err error) {
+    // ...
+    for i := 0; i < len(src); i++ {
+        patterns, cont, err = checkFile(fsys, fw, src[i])
+        if err != nil {
+            return false, err  // ← 任何一个文件解析失败即终止整个 Walk 并返回 error
+        }
+        // ...
+    }
+    return false, nil
+}
+```
+
+### 9.3 handleEvents() 中的错误日志记录
+
+`internal/aghnet/hostscontainer.go:183`：
+
+```go
+func (hc *HostsContainer) handleEvents(ctx context.Context) {
+    for {
+        select {
+        case _, ok := <-hc.watcher.Events():
+            if !ok {
+                hc.logger.DebugContext(ctx, "watcher events channel closed")
+                return
+            }
+            if err := hc.refresh(ctx); err != nil {
+                // ← 关键点：只记录 ERROR 日志，不做额外处理
+                hc.logger.ErrorContext(ctx, "refreshing", slogutil.KeyError, err)
+            }
+        case <-ctx.Done():
+            return
+        }
+    }
+}
+```
+
+### 9.4 回滚结论
+
+**新版 hosts 文件解析失败时，自动保留旧版本生效。** 这是由以下代码特性共同保证的：
+
+1. **新版本存储对象完全独立构建**：`hostsfile.NewDefaultStorage()` 创建全新 `strg`，与 `hc.current.Load()` 指向的旧对象互不干扰
+2. **错误提前返回**：`FileWalker.Walk()` 返回 error → `refresh()` 提前 `return err` → **不会执行** `hc.current.Store(strg)`
+3. **原子指针替换**：即使走到 Store，`atomic.Pointer.Store()` 也是原子操作，不存在"半更新"状态
+4. **调用方只记日志不干预**：`handleEvents()` 捕获 error 后只写 `ErrorContext` 日志，不尝试恢复或清除
+
+**行为总结表**：
+
+| 场景 | `hc.current` 状态 | 日志 |
+|-----|-------------------|------|
+| 文件正常且内容有变化 | 原子替换为新版本 | Debug "refreshing" |
+| 文件正常但内容无变化 | 保持旧版本（Equal 跳过） | Debug "refreshing" |
+| 第 N 个文件解析失败 | **保持旧版本完全不变** | Error "refreshing" + 具体 err |
+| 文件被删除（fs.ErrNotExist） | 保持旧版本（checkFile 中特殊处理为 nil, true, nil） | 无错误日志 |
+
+注意：**部分成功不存在**——FileWalker 遇到任何一个文件的任何一行解析错误就整体终止，已解析入 `strg` 的部分条目会被直接丢弃。
+
+---
+
+## 十、Hosts 文件超大规模（1M 条目以上）的内存占用与查询性能
+
+### 10.1 数据结构：双向 Map 索引
+
+系统 hosts 的底层存储是 `hostsfile.DefaultStorage`（来自 `github.com/AdguardTeam/golibs/hostsfile`），从 AdGuard Home 调用方式可以反推其内部结构：
+
+```go
+// ByAddr 通过 IP 反查主机名
+func (hc *HostsContainer) ByAddr(addr netip.Addr) (names []string) {
+    return hc.current.Load().ByAddr(addr)
+}
+
+// ByName 通过主机名查 IP
+func (hc *HostsContainer) ByName(name string) (addrs []netip.Addr) {
+    return hc.current.Load().ByName(name)
+}
+
+// Equal 比较两个 Storage 是否内容相同
+hc.current.Load().Equal(strg)
+
+// Parse 流式解析并写入 Storage
+hostsfile.Parse(ctx, strg, r, nil)
+```
+
+因此内部至少维护了两张哈希表：
+- `map[string][]netip.Addr` —— 主机名 → IP 列表（正向索引）
+- `map[netip.Addr][]string` —— IP → 主机名列表（反向索引，用于 PTR 查询）
+
+### 10.2 单条记录的内存开销估算
+
+以标准 hosts 行 `127.0.0.1 localhost` 为例：
+
+| 数据成员 | 类型 | 估算大小 |
+|---------|------|---------|
+| 主机名 `localhost` | Go `string` (16 字节 header + 实际字符) | ~16 + 9 = 25 B |
+| IPv4 地址 | `netip.Addr` (24 字节结构体) | 24 B |
+| map bucket 开销 | Go `map` 每个 entry 约 48 B overhead | ~48 B |
+| slice header（多值时）| `[]netip.Addr` / `[]string` (24 B) | 24 B |
+| Record 结构体（Source 等元数据） | hostsfile.Record 中额外存储 Source 文件名等 | ~32 B |
+
+**每一条 hosts 记录双向索引的综合内存开销：约 150–250 字节。**
+
+### 10.3 1M 条目的内存估算
+
+```
+1,000,000 条目 × 200 B/条目 ≈ 200 MB 原始数据
++ Go map 扩容预留空间（通常装载因子 65%）→ ~300 MB
++ hostsfile.Record 对象本身 → 额外 +100~200 MB
+总计：约 400–600 MB 内存占用
+```
+
+### 10.4 查询性能特征
+
+#### 10.4.1 系统 hosts 查询路径（`matchSysHosts`）
+
+`internal/filtering/hosts.go:93`：
+```go
+addrs := hs.ByName(host)  // map[string][]netip.Addr 哈希查找
+```
+
+- **算法复杂度**：O(1) 平均哈希表查找
+- **典型耗时**：< 1µs（纯内存哈希查找，无 IO）
+- **并发安全**：`atomic.Pointer` 读无锁，仅替换时有一次原子写
+- **无缓存层**：每次查询直接走 map，依赖 CPU L1/L2 Cache 命中
+
+#### 10.4.2 Legacy Rewrites 查询路径（`processRewrites`）
+
+`internal/filtering/filtering.go:558`：
+```go
+rewrites, matched := findRewrites(d.conf.Rewrites, host, qtype)
+```
+
+`findRewrites` 内部是**线性扫描** `[]*LegacyRewrite`（支持通配符展开）：
+- **算法复杂度**：O(N)，N 为 Legacy Rewrites 数量
+- **典型场景**：用户自定义 Rewrites 数量通常 < 1000，因此 < 100µs
+- **1M 条目的问题**：如果把 1M 条塞进 Legacy Rewrites，**每次查询都是 O(1M) 的线性扫描，会导致严重的性能退化**——这也是 Legacy Rewrites 仅用于小规模用户配置、不适合大规模 hosts 列表的根本原因
+
+#### 10.4.3 $dnsrewrite 规则查询路径（`matchHost` → `filteringEngine.MatchRequest`）
+
+使用 `github.com/AdguardTeam/urlfilter` 引擎，内部是优化过的规则索引结构：
+- 支持 `$dnsrewrite` 修饰符的规则被单独归类到 DNS 重写规则集
+- 典型查询性能参考 Benchmark（同项目 `safesearch` 基准为 **~1.6µs**，`rulelist.Parser.Parse` 为 **~54ns/条**）
+- 1M 条 $dnsrewrite 规则的内存开销比 hostsfile.DefaultStorage **更高**，因为 urlfilter 的 NetworkRule 结构包含大量修饰符字段
+
+### 10.5 热更新期间的性能表现
+
+`refresh()` 执行时：
+
+```go
+// 全量重新解析所有文件
+_, err = aghos.FileWalker(func(r io.Reader) (patterns []string, cont bool, err error) {
+    return nil, true, hostsfile.Parse(ctx, strg, r, nil)
+}).Walk(hc.fsys, hc.patterns...)
+```
+
+- **解析方式**：流式 `io.Reader` + `bufio.Scanner` 逐行解析（注释中提到"Prefer using bufio.Scanner to read the r since the input is not limited"）
+- **1M 行解析耗时**：预估 100–500ms（取决于 CPU，纯字符串处理无 IO 阻塞）
+- **对查询的影响**：解析期间 `hc.current` 仍指向旧 Storage，**查询完全不受影响**；只有最后一步 `atomic.Pointer.Store()` 是一次原子写，暂停时间 < 100ns
+- **GC 压力**：旧 Storage 被替换后成为垃圾，1M 条目约 500MB 对象触发一次较大的 GC 周期
+
+### 10.6 性能对比总结表
+
+| 维度 | 系统 hosts (DefaultStorage) | Legacy Rewrites | $dnsrewrite 规则 |
+|-----|---------------------------|----------------|-----------------|
+| 索引结构 | `map[string][]netip.Addr` + `map[netip.Addr][]string` | `[]*LegacyRewrite` 切片线性扫描 | urlfilter 规则引擎（多索引） |
+| 查询复杂度 | O(1) 平均 | O(N) | O(1)~O(log N) 取决于规则类型 |
+| 1M 条内存 | ~400–600 MB | 极高（且查询不可用） | ~600–1000 MB |
+| 单次查询 | < 1µs | N=1M 时秒级不可用 | ~2–10 µs |
+| 并发读写 | `atomic.Pointer` 无锁读 | `confMu.RLock()` 读写锁 | `confMu.RLock()` 读写锁 |
+| 适用场景 | 操作系统级 hosts（通常 < 100 条） | 用户小规模重写（< 1000 条） | 订阅过滤列表（百万级规则） |
+| 热更新方式 | 全量重新解析 + 原子指针替换 | 全量重新加载配置 | 过滤列表刷新 |
+
+### 10.7 代码中的相关 TODO 与已知限制
+
+| 位置 | 内容 | 含义 |
+|-----|------|------|
+| `internal/aghnet/hostscontainer.go:233` | `TODO(e.burkov): Accept a parameter to specify the files to refresh.` | 目前刷新是全量所有文件，不支持单文件增量刷新，1M 条时每次都要全部重新解析 |
+| `internal/aghnet/hostscontainer.go:250` | `TODO(e.burkov): Serialize updates using [time.Time].` | 更新通知没有时间戳，无法判断新旧顺序 |
+| `internal/filtering/rewrite/storage.go:203` | `TODO(d.kolyshev): Handle duplicate items.` | $dnsrewrite 重复项未处理 |
