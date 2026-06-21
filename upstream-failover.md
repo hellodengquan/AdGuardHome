@@ -342,7 +342,395 @@ if dns64Ups := p.performDNS64(req, resp, wrapped); dns64Ups != nil {
 
 ---
 
-## 8 代码索引
+## 8 补充细节一：上游切换时的连接清理与连接池复用
+
+不同协议的上游对连接池的处理方式不同，直接影响上游切换（失败换下一上游 / Fallback 换上游）时的性能表现。以下按协议拆解。
+
+### 8.1 Plain DNS（UDP/TCP）：无连接池，每次新建
+
+**代码位置**：`dnsproxy/upstream/plain.go:89-131` — `plainDNS.dialExchange()`
+
+```go
+func (p *plainDNS) dialExchange(
+    network network,
+    dial bootstrap.DialHandler,
+    req *dns.Msg,
+) (resp *dns.Msg, err error) {
+    client := &dns.Client{Timeout: p.timeout}
+    conn := &dns.Conn{}
+
+    conn.Conn, err = dial(ctx, network, "")
+    if err != nil {
+        return nil, fmt.Errorf("dialing %s over %s: %w", p.addr.Host, network, err)
+    }
+    defer func(c net.Conn) { err = errors.WithDeferred(err, c.Close()) }(conn.Conn)
+
+    resp, _, err = client.ExchangeWithConn(upstreamReq, conn)
+    // ...
+}
+```
+
+- **每次 Exchange 都新建连接**，`defer c.Close()` 保证用完立即关闭。
+- UDP 无连接的语义下开销可接受，TCP 每次建连的三次握手在高并发下成本较高。
+- 切换上游时不存在旧连接残留问题——每个请求独立。
+
+### 8.2 DNS-over-TLS（DoT）：自维护 FILO 连接池
+
+**代码位置**：`dnsproxy/upstream/dot.go:26-52`
+
+```go
+type dnsOverTLS struct {
+    connsMu *sync.Mutex
+    conns   []net.Conn  // 可复用连接池，FILO 顺序
+    // ...
+}
+```
+
+**取连接**（`dot.go:154-185` — `conn()`）：
+
+```go
+func (p *dnsOverTLS) conn(h bootstrap.DialHandler) (conn net.Conn, err error) {
+    defer func() {
+        if conn == nil {
+            conn, err = tlsDial(h, p.tlsConf.Clone())  // 池空则新建 TLS 连接
+        }
+    }()
+
+    p.connsMu.Lock()
+    defer p.connsMu.Unlock()
+
+    l := len(p.conns)
+    if l == 0 {
+        return nil, nil
+    }
+
+    p.conns, conn = p.conns[:l-1], p.conns[l-1]  // FILO，取最后一个
+
+    err = conn.SetDeadline(time.Now().Add(dialTimeout))
+    if err != nil {
+        // SetDeadline 失败 → 连接已被服务端关闭，放弃并新建
+        return nil, nil
+    }
+    return conn, nil
+}
+```
+
+**还连接**（`dot.go:187-192` — `putBack()`）：
+
+```go
+func (p *dnsOverTLS) putBack(conn net.Conn) {
+    p.connsMu.Lock()
+    defer p.connsMu.Unlock()
+    p.conns = append(p.conns, conn)
+}
+```
+
+**失败时的连接处理**（`dot.go:92-132` — `Exchange()`）：
+
+```go
+reply, err = p.exchangeWithConn(conn, req)
+if err != nil {
+    // 池中的坏连接：立即关闭，不还回池
+    err = errors.WithDeferred(err, conn.Close())
+    // 重新 dial 一条新连接再试一次
+    conn, err = tlsDial(h, p.tlsConf.Clone())
+    reply, err = p.exchangeWithConn(conn, req)
+    if err != nil {
+        return reply, errors.WithDeferred(err, conn.Close())
+    }
+}
+p.putBack(conn)  // 成功 → 连接放回池中复用
+```
+
+> **关键行为**：连接池是**每个上游独立**的。当上游 A 失败切换到上游 B 时，A 的连接池中的连接不会被清理（仍保留在 A 的池里）。只有对该上游的后续请求才会遇到坏连接并触发"SetDeadline 失败 → 建新连接"的自愈逻辑。关闭整个 `dnsOverTLS` 时（`Close()`），才会遍历 `conns` 全量关闭。
+
+### 8.3 DNS-over-HTTPS（DoH）：Go http.Client 的 Transport 连接池
+
+**代码位置**：`dnsproxy/upstream/doh.go:50-88`
+
+```go
+type dnsOverHTTPS struct {
+    client    *http.Client    // 内部持 http.Transport，自带连接池
+    clientMu  *sync.Mutex
+    // ...
+}
+```
+
+**连接池配置**（`doh.go:469-493` — `createTransport()`）：
+
+```go
+transport := &http.Transport{
+    TLSClientConfig:    tlsConf,
+    IdleConnTimeout:    transportDefaultIdleConnTimeout,   // 5 分钟
+    MaxConnsPerHost:    dohMaxConnsPerHost,                // 每个 host 最多 2 条
+    MaxIdleConns:       dohMaxIdleConns,                   // 最多 2 条空闲
+    ForceAttemptHTTP2:  true,
+}
+```
+
+**失败时的连接重置**（`doh.go:154-202` — `Exchange()`）：
+
+```go
+resp, err = p.exchangeHTTPS(client, req)
+
+// 如果是缓存的 client 出现超时 / QUIC 重试错误 → 最多重置 client 两次
+for i := 0; isCached && p.shouldRetry(err) && i < 2; i++ {
+    client, err = p.resetClient(err)  // 关闭旧 client，重建
+    resp, err = p.exchangeHTTPS(client, req)
+}
+
+if err != nil {
+    _, resErr := p.resetClient(err)   // 最终失败也确保 client 被重置
+    return nil, errors.WithDeferred(err, resErr)
+}
+```
+
+`resetClient()`（`doh.go:350-371`）会关闭旧 client 的底层 transport：
+
+```go
+func (p *dnsOverHTTPS) resetClient(resetErr error) (client *http.Client, err error) {
+    if errors.Is(resetErr, quic.Err0RTTRejected) {
+        p.resetQUICConfig()  // 清除 0-RTT TokenStore
+    }
+    oldClient := p.client
+    if oldClient != nil {
+        closeErr := p.closeClient(oldClient)  // HTTP/3 直接 Close，HTTP/2 关闭空闲连接
+    }
+    p.client, err = p.createClient()
+    return p.client, err
+}
+```
+
+> **上游切换与连接池的关系**：每个 DoH 上游有自己独立的 `http.Client`。上游 A 失败 → 其 client 可能被 reset（连池被清空重建）→ 切换到上游 B 时使用 B 自己的 client（连接池独立）。两上游之间互不干扰。
+
+### 8.4 DNS-over-QUIC（DoQ）：单连接缓存 + 流复用
+
+**代码位置**：`dnsproxy/upstream/doq.go:60-99`
+
+```go
+type dnsOverQUIC struct {
+    conn    *quic.Conn       // 单条 QUIC 连接缓存
+    connMu  *sync.Mutex
+    // ...
+}
+```
+
+**连接使用**（`doq.go:170-223` — `Exchange()`）：
+
+```go
+conn, cached, err := p.getConnection()  // 有缓存 conn 则复用
+
+resp, err = p.exchangeQUIC(req, conn)   // 复用 conn，在上面开新 stream
+
+if cached && err != nil {
+    // 缓存的 conn 坏了 → 关闭并重建
+    p.closeConnWithError(conn, err)
+    conn, _, err = p.getConnection()    // 会走 openConnection() 新建
+    resp, err = p.exchangeQUIC(req, conn)
+}
+
+if err != nil {
+    p.closeConnWithError(conn, err)     // 最终失败也关闭
+}
+```
+
+`getConnection()`（`doq.go:301-318`）只缓存一条 conn：
+
+```go
+func (p *dnsOverQUIC) getConnection() (conn *quic.Conn, cached bool, err error) {
+    p.connMu.Lock()
+    defer p.connMu.Unlock()
+
+    conn = p.conn
+    if conn != nil {
+        return conn, true, nil
+    }
+    conn, err = p.openConnection()
+    p.conn = conn
+    return conn, false, nil
+}
+```
+
+`closeConnWithError()`（`doq.go:394-417`）重置缓存：
+
+```go
+func (p *dnsOverQUIC) closeConnWithError(conn *quic.Conn, err error) {
+    p.connMu.Lock()
+    defer p.connMu.Unlock()
+
+    if p.conn == conn {
+        p.conn = nil  // 只在关闭缓存 conn 时才清空
+    }
+    _ = conn.CloseWithError(code, "")
+}
+```
+
+> **关键区别**：DoQ 是**单连接 + 多 Stream 复用**模型。同一上游的所有并发查询共享一条 QUIC 连接，通过 Stream 隔离。连接失效时所有并发请求都会失败并触发重建。上游切换时（A→B），A 的 QUIC 连接不会被主动关闭，只是不再被后续请求选中。
+
+### 8.5 小结：四种协议的连接模型对比
+
+| 协议 | 连接池模型 | 切换上游时旧连接处理 | 坏连接自愈 |
+|------|-----------|---------------------|-----------|
+| Plain UDP/TCP | 无，每次新建 | N/A | 每次都新建，无"坏连接"概念 |
+| DoT | 每个上游独立 FILO 切片池 | 不处理，保留在原上游池里 | SetDeadline 失败时放弃旧连接，建新连接 |
+| DoH | `http.Transport` 内部 LRU 池 | 不处理，各上游 client 独立 | 超时/QUIC 错误时 resetClient，重建整个 client |
+| DoQ | 每个上游单条 QUIC 连接 | 不主动关闭，缓存保留 | 失败时 closeConnWithError 置 nil，下次请求新建 |
+
+---
+
+## 9 补充细节二：DNSSEC 验证失败与上游回退优先级判断
+
+dnsproxy 本身**不做 DNSSEC 签名验证**，它的角色是**透明转发 DO/AD/CD 位**，并在缓存和响应过滤层面处理 DNSSEC 相关记录。理解这一点很关键——"DNSSEC 验证失败"在 dnsproxy 的语义里不等于"上游查询失败"。
+
+### 9.1 DO 位与 DNSSEC 请求
+
+**代码位置**：`dnsproxy/proxy/proxy.go:671-688` — `Proxy.addDO()`
+
+```go
+func (p *Proxy) addDO(msg *dns.Msg) {
+    if !p.DNSSECEnabled {
+        return  // DNSSEC 全局开关关闭 → 什么也不做
+    }
+    if o := msg.IsEdns0(); o != nil {
+        if !o.Do() {
+            o.SetDo()  // 已有 EDNS0 OPT → 设置 DO 位为 1
+        }
+        return
+    }
+    msg.SetEdns0(defaultUDPBufSize, true)  // 无 OPT → 新增，DO=1
+}
+```
+
+在 `Proxy.Resolve()`（`proxy.go:695-755`）中，`addDO` 的调用时机：
+
+```go
+// proxy.go:702-731
+cacheWorks := p.cacheWorks(dctx)
+if cacheWorks {
+    p.addDO(dctx.Req)  // 缓存启用时，向所有上游请求追加 DO=1，以便缓存 DNSSEC RR
+    // ...
+}
+```
+
+> **规则**：如果 `DNSSECEnabled=true` 且缓存启用，所有上游查询都会被强制加上 DO 位（DNSSEC OK），这样上游会把 RRSIG/DNSKEY/NSEC 等 DNSSEC 资源记录一并返回，便于后续缓存。
+
+### 9.2 AD 位的透传与过滤
+
+**代码位置**：`dnsproxy/proxy/cache.go:641-658` — `filterMsg()`
+
+```go
+func filterMsg(dst, m *dns.Msg, ad, do bool, ttl uint32) {
+    // RFC 6840：只有请求中 DO=1 或 AD=1 时，响应才保留 AD=1
+    dst.AuthenticatedData = dst.AuthenticatedData && (ad || do)
+
+    // DO=0 时，过滤掉所有 DNSSEC RR（NSEC/NSEC3/DS/RRSIG/DNSKEY 等）
+    dst.Answer = filterRRSlice(m.Answer, do, ttl, m.Question[0].Qtype)
+    dst.Ns     = filterRRSlice(m.Ns, do, ttl, dns.TypeNone)
+    dst.Extra  = filterRRSlice(m.Extra, do, ttl, dns.TypeNone)
+}
+```
+
+`filterRRSlice()`（`cache.go:617-639`）的过滤逻辑：
+
+```go
+for _, r := range rrs {
+    if (!do && isDNSSEC(r) && r.Header().Rrtype != except) || r.Header().Rrtype == dns.TypeOPT {
+        continue  // DO=0 时丢弃 DNSSEC 记录，OPT 始终丢弃
+    }
+    // ...
+}
+```
+
+在 `Resolve()` 末尾（`proxy.go:748-750` 和 `cache.go:147-158`），无论响应来自缓存还是上游，都会调用 `filterMsg`：
+
+```go
+// proxy.go:748-750
+if dctx.Res != nil {
+    filterMsg(dctx.Res, dctx.Res, dctx.adBit, dctx.doBit, 0)
+}
+```
+
+其中：
+- `dctx.adBit` = 客户端原始请求的 AD 位
+- `dctx.doBit` = 客户端原始请求的 DO 位（来自 EDNS0 OPT）
+
+### 9.3 CD 位（Checking Disabled）：跳过上游回退判断的关键
+
+**代码位置**：`dnsproxy/proxy/proxy.go:741-744` — 缓存写入条件
+
+```go
+if cacheWorks && ok && !dctx.Res.CheckingDisabled {
+    // 仅当响应没有 CD 位时才缓存
+    p.cacheResp(dctx)
+}
+```
+
+以及缓存读取条件（`proxy.go:805-816` — `cacheWorks()`）：
+
+```go
+case dctx.Req.CheckingDisabled:
+    // 客户端请求带 CD=1 → 不查缓存
+    reason = "dnssec check disabled"
+```
+
+> **含义**：`CheckingDisabled` 是 DNS 头部的 CD 位，表示"客户端希望上游不要做 DNSSEC 验证"。当客户端请求 CD=1 时，dnsproxy 直接跳过缓存，每次都查上游；且响应的 CD 位为 1 时也不会被写入缓存。CD 位本身不影响上游选择和回退逻辑。
+
+### 9.4 DNSSEC"验证失败"在上游回退中的真实表现
+
+dnsproxy 不做签名验证，那么什么情况下会出现"DNSSEC 相关的失败"？
+
+| 场景 | dnsproxy 看到的结果 | 是否触发回退 |
+|------|---------------------|-------------|
+| 上游返回 `SERVFAIL` 且原因是 DNSSEC 验证失败 | `resp != nil, err == nil, resp.Rcode = SERVFAIL` | **不触发** |
+| 上游网络超时（真实的超时，不是 DNSSEC SERVFAIL） | `resp == nil, err != nil` | **触发**，按普通网络错误处理 |
+| BogusNXDomain 命中含伪答案 IP 的响应 | 主上游成功 → BogusNXDomain 改写为 NXDOMAIN | **不触发** |
+| 上游返回合法响应但 AD=0（未验证或验证失败） | `resp != nil, err == nil`，按 `filterMsg` 规则处理 | **不触发** |
+| 上游返回 RRSIG 但签名已过期 | dnsproxy 不检查，原样返回给客户端 | **不触发** |
+
+> **关键结论**：dnsproxy 不具备判断"DNSSEC 验证失败"的能力——它既不验证签名，也不解析 SERVFAIL 的子原因码（EDNS Extended RCODE）。因此**DNSSEC 验证失败永远不会触发上游回退**。唯一的例外是当 DNSSEC 验证逻辑导致上游本身网络超时或崩溃时，这会被当作普通网络错误处理，但 dnsproxy 并不知道这与 DNSSEC 有关。
+
+### 9.5 DNSSEC 相关决策与回退优先级的顺序
+
+把所有逻辑按 `Resolve()` 内的执行顺序排列：
+
+```
+Proxy.Resolve(dctx)
+  │
+  ├─ ① processECS              // 添加 ECS（如有）
+  ├─ ② calcFlagsAndSize        // 提取 adBit / doBit / hasEDNS0
+  │
+  ├─ ③ cacheWorks() 判断
+  │     ├─ DNSSECEnabled=true  → 后续 addDO 会生效
+  │     ├─ Req.CheckingDisabled → cacheWorks=false（跳过缓存）
+  │     └─ ...
+  │
+  ├─ 缓存命中?
+  │     ├─ 是 → filterMsg(adBit, doBit) 过滤 DNSSEC RR + AD 位 → 返回
+  │     └─ 否 → addDO(dctx.Req)         // 若 DNSSECEnabled，请求上游时强制 DO=1
+  │
+  ├─ ④ replyFromUpstream()      // ← 正常的上游选择/回退逻辑
+  │     │                          这里不感知 DNSSEC，只看 err 是否为 nil
+  │     ├─ selectUpstreams()
+  │     ├─ exchangeUpstreams()
+  │     ├─ Fallbacks（仅当 err != nil）
+  │     └─ handleExchangeResult()
+  │
+  ├─ ⑤ cacheResp() 条件
+  │     └─ !Res.CheckingDisabled → 才写入缓存
+  │
+  └─ ⑥ filterMsg(adBit, doBit)  // 最终响应：根据客户端 DO/AD 决定是否保留 DNSSEC RR
+```
+
+DNSSEC 在整个链路中只影响**三件事**：
+1. 是否在上游请求中加 DO 位（影响上游返回什么 RR）
+2. 响应/请求的 CD 位是否跳缓存
+3. 返回给客户端时是否过滤掉 DNSSEC RR 和 AD 位
+
+**DNSSEC 不参与上游回退判断**。上游回退的唯一条件是 `err != nil`（Go 层面的网络错误），这与 DNS 响应内容（包括 SERVFAIL RCODE、AD 位、是否包含有效 RRSIG）完全正交。
+
+---
+
+## 10 代码索引
 
 | 模块 | 文件 | 行号 | 函数/类型 | 说明 |
 |------|------|------|----------|------|
@@ -364,3 +752,18 @@ if dns64Ups := p.performDNS64(req, resp, wrapped); dns64Ups != nil {
 | AH 配置 | `internal/dnsforward/upstreams.go` | 60 | `newUpstreamConfig()` | 组装主上游配置 |
 | AH 配置 | `internal/dnsforward/dnsforward.go` | 679 | `Server.setupFallbackDNS()` | 组装回退上游配置 |
 | AH 配置 | `internal/dnsforward/upstreams.go` | 143 | `setProxyUpstreamMode()` | 设置上游交换模式 |
+| 连接池-Plain | `dnsproxy/upstream/plain.go` | 89-131 | `plainDNS.dialExchange()` | 每次新建连接，用完即关 |
+| 连接池-DoT | `dnsproxy/upstream/dot.go` | 26-52 | `dnsOverTLS` 结构体 | FILO 连接池定义 |
+| 连接池-DoT | `dnsproxy/upstream/dot.go` | 154-185 | `dnsOverTLS.conn()` | 从池取连接，SetDeadline 自检坏连接 |
+| 连接池-DoT | `dnsproxy/upstream/dot.go` | 92-132 | `dnsOverTLS.Exchange()` | 失败时关闭坏连接并新建重试 |
+| 连接池-DoH | `dnsproxy/upstream/doh.go` | 469-493 | `dnsOverHTTPS.createTransport()` | `http.Transport` 连接池参数 |
+| 连接池-DoH | `dnsproxy/upstream/doh.go` | 350-371 | `dnsOverHTTPS.resetClient()` | 失败时关闭旧 client 并重建 |
+| 连接池-DoQ | `dnsproxy/upstream/doq.go` | 60-99 | `dnsOverQUIC` 结构体 | 单连接缓存 + Stream 复用 |
+| 连接池-DoQ | `dnsproxy/upstream/doq.go` | 170-223 | `dnsOverQUIC.Exchange()` | 复用连接，失败时重建 |
+| 连接池-DoQ | `dnsproxy/upstream/doq.go` | 394-417 | `dnsOverQUIC.closeConnWithError()` | 关闭连接并清空缓存 |
+| DNSSEC | `dnsproxy/proxy/proxy.go` | 671-688 | `Proxy.addDO()` | 请求上游时设置 DO 位 |
+| DNSSEC | `dnsproxy/proxy/cache.go` | 641-658 | `filterMsg()` | 根据客户端 DO/AD 过滤 DNSSEC RR 和 AD 位 |
+| DNSSEC | `dnsproxy/proxy/cache.go` | 617-639 | `filterRRSlice()` | 具体的 RR 过滤逻辑 |
+| DNSSEC | `dnsproxy/proxy/cache.go` | 536-552 | `msgToKey()` | 缓存 key 包含 DO 位 |
+| DNSSEC | `dnsproxy/proxy/proxy.go` | 741-744 | `Resolve()` 内缓存写入条件 | CD 位为 1 时不写缓存 |
+| DNSSEC | `dnsproxy/proxy/proxy.go` | 805-816 | `cacheWorks()` | CD 位为 1 时不读缓存 |
