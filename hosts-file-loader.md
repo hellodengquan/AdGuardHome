@@ -704,3 +704,349 @@ _, err = aghos.FileWalker(func(r io.Reader) (patterns []string, cont bool, err e
 | `internal/aghnet/hostscontainer.go:233` | `TODO(e.burkov): Accept a parameter to specify the files to refresh.` | 目前刷新是全量所有文件，不支持单文件增量刷新，1M 条时每次都要全部重新解析 |
 | `internal/aghnet/hostscontainer.go:250` | `TODO(e.burkov): Serialize updates using [time.Time].` | 更新通知没有时间戳，无法判断新旧顺序 |
 | `internal/filtering/rewrite/storage.go:203` | `TODO(d.kolyshev): Handle duplicate items.` | $dnsrewrite 重复项未处理 |
+
+---
+
+## 十一、ErrorContext 报错的输出目的地
+
+### 11.1 日志系统的两层架构
+
+AdGuard Home 共存着两套日志系统，HostsContainer 使用的是较新的 `log/slog` 结构化日志：
+
+| 日志系统 | 引入包 | 使用场景 |
+|---------|--------|---------|
+| 旧版 | `github.com/AdguardTeam/golibs/log` | 老代码、启动早期 |
+| 新版 | `log/slog`（标准库） | HostsContainer、过滤引擎等新代码 |
+
+HostsContainer 中的 `hc.logger.ErrorContext()` 调用走的是 **slog 路径**。
+
+### 11.2 日志输出配置链路
+
+日志初始化在 `internal/home/log.go`，由 `configureLogger()` 和 `newSlogLogger()` 两个函数协同完成：
+
+```
+命令行参数 + 配置文件
+    │
+    ▼
+getLogSettings() 合并配置
+    │
+    ├─► newSlogLogger() 配置 slog 的格式和级别
+    │      │
+    │      └─ 格式: slogutil.FormatAdGuardLegacy
+    │         级别: Info / Debug(verbose)
+    │
+    └─► configureLogger() 配置输出目的地
+           │
+           ├─ ls.File == ""         → 输出到 stdout（默认）
+           ├─ ls.File == "syslog"    → 系统 syslog / Windows eventlog
+           └─ ls.File == "xxx.log"   → lumberjack 文件轮转
+```
+
+### 11.3 三种输出目的地详解
+
+#### 1. stdout（默认）
+当 `config.log.file` 为空时，日志直接输出到标准输出。slog handler 使用 `slogutil.FormatAdGuardLegacy` 格式（AdGuard 旧版文本格式，而非 JSON）。
+
+#### 2. 文件（带轮转）
+`internal/home/log.go:76` 使用 `lumberjack.Logger`：
+
+```go
+log.SetOutput(&lumberjack.Logger{
+    Filename:   logFilePath,
+    Compress:   ls.Compress,     // 是否压缩旧日志
+    LocalTime:  ls.LocalTime,    // 是否使用本地时间命名
+    MaxBackups: ls.MaxBackups,   // 最大保留文件数
+    MaxSize:    ls.MaxSize,      // 单文件最大大小(MB)
+    MaxAge:     ls.MaxAge,       // 最大保留天数
+})
+```
+
+注意：这里 `log.SetOutput` 设置的是 **旧版 golibs/log** 的输出，但 slogutil 内部会通过某种桥接机制保持一致（都输出到同一目的地）。
+
+#### 3. syslog / eventlog
+当 `ls.File == "syslog"` 时，调用 `aghos.ConfigureSyslog(serviceName)`：
+- Unix/Linux: 输出到系统 syslog
+- Windows: 输出到 Event Log（事件查看器）
+
+### 11.4 日志级别与 hosts 相关日志
+
+`slog` 级别控制（`internal/home/log.go:29`）：
+- 默认：`slog.LevelInfo`
+- `--verbose` 或 `verbose: true`：`slog.LevelDebug`
+
+HostsContainer 产生的日志级别：
+| 日志内容 | 级别 | 可见条件 |
+|---------|------|---------|
+| `"refreshing"` | Debug | verbose 模式 |
+| `"sending update"` | Debug | verbose 模式 |
+| `"replaced the last update"` | Debug | verbose 模式 |
+| `"refreshing" + error` | **Error** | 始终可见 |
+| `"updates channel is broken"` | **Error** | 始终可见 |
+| `"watcher closed the events channel"` | Debug | verbose 模式 |
+
+### 11.5 禁用日志
+
+当 `config.log.enabled == false` 时，使用 `slogutil.NewDiscardLogger()`，所有日志（包括 Error）都会被直接丢弃，不会出现在任何输出流中。
+
+### 11.6 结论
+
+**hosts 解析失败的 ErrorContext 日志最终落到哪里，取决于配置：**
+
+| 配置 | 输出目的地 |
+|-----|-----------|
+| 默认（无配置） | **stdout** |
+| `log_file: "/path/to/aghome.log"` | **文件**（lumberjack 轮转） |
+| `log_file: "syslog"` | **系统 syslog**（Windows Event Log） |
+| `verbose: true` | 同上，且包含 Debug 级信息 |
+| `log.enabled: false` | **全部丢弃** |
+
+---
+
+## 十二、Hosts 文件 Truncate 到 0 字节时的 Race 与防护
+
+### 12.1 事件产生机制
+
+外部进程将 hosts 文件 truncate 到 0 字节时，`fsnotify` 会触发 `fsnotify.Write` 事件。典型的写文件操作（包括 truncate+write）可能会触发多次 Write 事件。
+
+### 12.2 OSWatcher 层的去重防护
+
+`internal/aghos/fswatcher.go:196` 的 `handleEvents` 函数：
+
+```go
+func (w *OSWatcher) handleEvents(ctx context.Context) {
+    defer close(w.events)
+    ch := w.watcher.Events
+    for e := range ch {
+        if !w.isTrackedEvent(e) {
+            continue
+        }
+        skipDuplicates(ch)  // ← 关键点：排空 channel 中后续事件
+        select {
+        case w.events <- Event{}:
+            // Go on.
+        default:
+            w.logger.DebugContext(ctx, "events buffer is full")
+        }
+    }
+}
+```
+
+`skipDuplicates` 的实现（`internal/aghos/fswatcher.go:245`）：
+```go
+func skipDuplicates(ch <-chan fsnotify.Event) {
+    for {
+        select {
+        case <-ch:
+            // Go on.  不断读取，直到 channel 为空
+        default:
+            return
+        }
+    }
+}
+```
+
+**第一层防护：事件去重合并**
+- 短时间内的多次 fsnotify 事件会被合并为一次通知
+- 合并粒度是"同一次事件循环中 channel 里所有积压事件"
+- 注意：这不是时间去抖（debounce），而是 channel 清空式去重
+
+**事件 channel 容量：`make(chan Event, 1)`**
+- 只有 1 个缓冲槽
+- 如果 buffer 已满，新事件会被直接丢弃（记录 debug 日志）
+- 避免事件堆积导致 refresh 风暴
+
+### 12.3 HostsContainer 层的串行化防护
+
+`internal/aghnet/hostscontainer.go:187` 的 `handleEvents` 是**单 goroutine** 运行的：
+
+```go
+func (hc *HostsContainer) handleEvents(ctx context.Context) {
+    defer close(hc.updates)
+    eventsCh := hc.watcher.Events()
+    ok := eventsCh != nil
+    for ok {
+        select {
+        case _, ok = <-eventsCh:
+            if !ok { continue }
+            if err := hc.refresh(ctx); err != nil {  // ← 同步执行
+                hc.logger.ErrorContext(ctx, "refreshing", slogutil.KeyError, err)
+            }
+        case _, ok = <-hc.done:
+        }
+    }
+}
+```
+
+**第二层防护：串行化 refresh**
+- `refresh()` 是同步执行的，在返回之前，下一个事件会被阻塞在 `<-eventsCh` 上
+- 保证同一时刻只有一个 refresh 在运行
+- 避免并发刷新导致的资源竞争
+
+### 12.4 Truncate 到 0 字节的具体行为
+
+当文件被截为 0 字节时：
+
+```
+truncate 操作
+    │
+    ▼
+fsnotify.Write 事件（可能多次）
+    │
+    ▼
+OSWatcher.skipDuplicates() 合并为一次事件
+    │
+    ▼
+HostsContainer.refresh()
+    ├─ 新建空 Storage
+    ├─ FileWalker.Walk() 打开文件
+    ├─ hostsfile.Parse() 解析 0 字节 → 0 条记录
+    ├─ 解析成功（空文件不是错误）
+    ├─ current.Load().Equal(strg)? → 内容有变化
+    └─ current.Store(空 Storage)  ← 生效为空
+```
+
+**重要结论：空文件会被当作有效内容加载！**
+
+`hostsfile.Parse()` 解析空内容不会返回 error，而是生成一个空的 Storage。`refresh()` 会正常执行 `current.Store(strg)`，导致系统 hosts 临时全部失效。如果外部进程是 truncate + re-write 的原子写模式（先清空再写入），在两次事件之间会有一个短暂的空窗口。
+
+### 12.5 现有的防护机制总结
+
+| 防护层级 | 机制 | 能防御什么 | 不能防御什么 |
+|---------|------|-----------|-------------|
+| OSWatcher | `skipDuplicates()` channel 去重 | 同一次写入产生的多个 Write 事件 | 时间上分散的多次写入 |
+| OSWatcher | events channel 容量 = 1 | 避免事件堆积 | 会丢事件 |
+| HostsContainer | 单 goroutine 串行 refresh | 并发刷新竞争 | 每次事件还是会触发一次完整解析 |
+| refresh | 新版本独立构建 + 原子替换 | 半更新状态 | 空文件会真的生效 |
+
+### 12.6 已知的潜在问题
+
+1. **空文件生效问题**：truncate 到 0 字节后，如果写操作没有立即跟上，会有一段时间系统 hosts 全部失效
+2. **无时间去抖**：连续多次修改（如脚本循环写）会触发连续多次全量重解析
+3. **无重试机制**：解析失败只记一次 Error 日志，不会自动重试
+
+相关 TODO（`internal/aghos/fswatcher.go:244`）：
+```
+// TODO(e.burkov): Check if this is still needed.
+```
+注释中对 `skipDuplicates` 的必要性存疑，说明这部分逻辑可能需要重新评估。
+
+---
+
+## 十三、旧版 Storage 的 GC 回收时机与暂停时间
+
+### 13.1 引用关系分析
+
+要理解旧版 Storage 何时被 GC，需要先理清所有引用：
+
+```
+HostsContainer.current (atomic.Pointer)
+    │
+    ├─► 指向 *hostsfile.DefaultStorage (当前版本)
+    │
+    └─ Store(new) 后，旧版本失去这一引用
+
+HostsContainer.updates (chan *hostsfile.DefaultStorage)
+    │
+    └─ sendUpd() 可能向 channel 中塞入一个引用
+        （容量 1，新的会替换旧的）
+
+订阅者 (client.Storage 等)
+    │
+    └─ 通过 hc.Upd() channel 接收更新后
+        可能在内部短期持有旧版本引用
+```
+
+### 13.2 回收时机分阶段分析
+
+**阶段 1：Store 之后**
+```go
+hc.current.Store(strg)  // 旧版失去 current 引用
+```
+此时旧版 Storage 可能还被：
+- `updates` channel 中的旧值引用（如果没被消费）
+- 正在进行中的查询引用（已经 Load 了旧指针）
+
+**阶段 2：sendUpd 替换后**
+```go
+case <-ch:
+    ch <- recs       // 取出旧的，放入新的
+```
+channel 中的旧版本引用被释放。
+
+**阶段 3：订阅者消费后**
+`client.Storage` 等订阅者消费了 `updates` channel 中的更新后，会替换自己内部的引用，旧版本才真正成为垃圾。
+
+**阶段 4：下一次 GC 周期**
+Go 垃圾回收器在下一次标记阶段发现这些不可达对象，在下一次清除阶段回收内存。
+
+触发 GC 的条件（默认）：
+- 堆内存增长达到上次 GC 后的 100%（`GOGC=100`）
+- 或者每 2 分钟至少触发一次（Go runtime 强制 GC）
+
+### 13.3 1M 条目的 GC 开销估算
+
+假设旧版 Storage 约 500MB：
+
+| GC 阶段 | 行为 | 对请求的影响 |
+|--------|------|-------------|
+| 标记阶段（Mark） | 并发遍历对象图 | **几乎无影响**（并发标记，仅在 mark termination 时 STW，通常 < 10ms） |
+| 清除阶段（Sweep） | 回收空闲内存 | **无影响**（并发清除，增量进行） |
+| STW 暂停 | 栈扫描、mark termination | **几十毫秒级**（取决于 goroutine 数量和堆大小） |
+
+注意：这是 Go 1.5+ 并发 GC 的典型表现，具体数值取决于 CPU 核心数、堆大小、goroutine 数量等因素。
+
+### 13.4 代码中的内存优化措施
+
+#### 13.4.1 FreeOSMemory
+
+`internal/filtering/filtering.go:772`：
+
+```go
+// Make sure that the OS reclaims memory as soon as possible.
+debug.FreeOSMemory()
+```
+
+过滤引擎初始化后显式调用 `debug.FreeOSMemory()`，强制 GC 一次并将释放的内存归还操作系统。
+
+**注意**：这是在 `initFiltering()` 中，仅过滤列表刷新时调用。**系统 hosts 刷新（HostsContainer.refresh）不会调用 FreeOSMemory**。
+
+#### 13.4.2 --no-mem-optimization 选项
+
+`internal/home/options.go:272` 有一个已废弃的选项：
+```
+description: "Deprecated.  Disable memory optimization."
+longName:    "no-mem-optimization"
+```
+
+说明项目曾经有过内存优化相关的逻辑，但现在已废弃。具体做什么需要看历史代码，当前代码中已无对应逻辑。
+
+### 13.5 GC 相关的已知限制
+
+1. **无显式 GC 调优**：代码中没有 `debug.SetGCPercent()`、`GOGC` 环境变量设置等
+2. **无 GC 统计日志**：HostsContainer 刷新前后不记录 GC 相关指标
+3. **无内存压力检测**：不会根据当前内存使用情况调整刷新策略
+4. **无对象池复用**：每次 refresh 都创建全新的 Storage，旧的直接丢弃给 GC
+
+### 13.6 与 GC 相关的 TODO 与注释
+
+| 位置 | 内容 | 含义 |
+|-----|------|------|
+| `internal/filtering/filtering.go:772` | `// Make sure that the OS reclaims memory as soon as possible.` | 过滤引擎刷新后主动归还内存给 OS |
+| `internal/home/options.go:272` | `"Deprecated. Disable memory optimization."` | 内存优化选项已废弃 |
+| `internal/querylog/qlogfile.go:431` | `// be of the form '"key":"' to generate less garbage.` | 为减少 GC 压力而优化字符串拼接 |
+
+### 13.7 结论
+
+**旧版 Storage 的回收节奏：**
+- 最快：刷新后下一次 GC 周期回收（通常几秒到几分钟内）
+- 最慢：如果没有新的分配触发 GC，可能等待长达 2 分钟（强制 GC 周期）
+
+**GC 暂停时间：**
+- 代码中没有显式的 GC 暂停时间控制或测量
+- 1M 条目 ~500MB 堆对象的 STW 暂停在现代 Go 版本下通常为**几十毫秒级**
+- 并发标记和清除对查询服务几乎无影响
+
+**减轻 GC 压力的代码措施：**
+- 过滤引擎刷新后调用 `debug.FreeOSMemory()` 主动归还内存
+- 查询日志等热点路径有减少垃圾生成的优化注释
+- HostsContainer 使用 `atomic.Pointer` 无锁设计减少分配
