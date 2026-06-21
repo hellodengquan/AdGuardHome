@@ -1271,3 +1271,345 @@ func (r *NetworkRule) hasNoRestrictions() (ok bool) {
 | 规则过宽检查 `hasNoRestrictions` | `urlfilter/rules/network.go` | 292-302 |
 | `DNSEngine.MatchRequestInto()` 收集 | `urlfilter/dnsengine.go` | 154-187 |
 | `GetDNSBasicRule()` 选最终规则 | `urlfilter/rules/match.go` | 173-196 |
+
+---
+
+## 九、urlfilter 第三方库版本依赖与升级影响分析
+
+### 9.1 版本依赖现状
+
+**go.mod 中的声明**（`go.mod:8`）：
+
+```
+require github.com/AdguardTeam/urlfilter v0.23.2
+```
+
+AdGuard Home 与 urlfilter 是**同一组织（AdguardTeam）**下的两个项目，urlfilter 是核心过滤引擎库，AdGuard Home 是上层应用。这是一个「内部库 + 应用」的分层架构。
+
+### 9.2 urlfilter 在 AdGuard Home 中的使用面
+
+整理所有直接使用 `urlfilter.` 的代码位置：
+
+| 使用位置 | 用途 | 关键类型/函数 |
+|---------|------|--------------|
+| `internal/filtering/filtering.go` | 主过滤引擎 | `DNSEngine`, `DNSRequest`, `DNSResult` |
+| `internal/filtering/rulelist/engine.go` | 规则列表引擎 | `DNSEngine` |
+| `internal/filtering/rulelist/textengine.go` | 文本规则引擎 | `DNSEngine`, `DNSRequest`, `DNSResult` |
+| `internal/filtering/safesearch/safesearch.go` | 安全搜索引擎 | `DNSEngine`, `DNSRequest` |
+| `internal/filtering/rewrite/storage.go` | 重写规则存储 | `DNSEngine`, `DNSRequest` |
+| `internal/dnsforward/access.go` | 访问控制（黑名单主机） | `DNSEngine` |
+| `internal/aghnet/ignore.go` | 忽略域名 | `DNSEngine` |
+
+**共 7 个模块**直接依赖 urlfilter，形成了广泛的使用面。
+
+### 9.3 ApplyClientFiltering 与 urlfilter 的关系澄清
+
+注意：`ApplyClientFiltering` **不是** urlfilter 的接口，而是 AdGuard Home 内部 `filtering` 包的一个**注入函数字段**。
+
+但它与 urlfilter 有深刻的关联——这个函数的存在，本质上是为了把**客户端信息**传递到**过滤规则匹配**流程中，而过滤规则匹配是由 urlfilter 执行的。
+
+**完整的传递链路**：
+
+```
+client.Storage.ApplyClientFiltering()
+    ↓ 注入为
+DNSFilter.applyClientFiltering (函数字段)
+    ↓ 设置到
+filtering.Settings.ClientName / ClientIP / ClientTags
+    ↓ 构造
+urlfilter.DNSRequest { ClientIdentifiers, ClientIP, ClientTags }
+    ↓ 传入
+urlfilter.DNSEngine.MatchRequest()
+    ↓ 调用
+urlfilter.rules.NetworkRule.Match()
+    ↓ 调用
+urlfilter.rules.NetworkRule.matchClient() / matchClientTags()
+```
+
+### 9.4 urlfilter 升级可能带来的接口变更风险
+
+如果 urlfilter 升级，以下接口变更会直接影响 ApplyClientFiltering 相关流程：
+
+#### 风险 1：`DNSRequest` 结构变更
+
+```go
+// 当前版本（v0.23.2）
+type DNSRequest struct {
+    ClientTags        *container.SortedSliceSet[string]
+    ClientIdentifiers *container.SortedSliceSet[string]
+    ClientIP          netip.Addr
+    // ...
+}
+```
+
+**如果 urlfilter 改了字段名或类型**：
+- `filtering.go` 的 `matchHost()` 方法会编译失败（构造 `urlfilter.DNSRequest` 的地方）
+- `filtering/rewrite/storage.go` 等 7 个模块都要跟着改
+- 但 `ApplyClientFiltering` 函数本身**签名不变**，因为它只操作 `filtering.Settings`
+
+#### 风险 2：匹配逻辑变更
+
+**例如**：urlfilter 调整了 `matchClient` 中的优先级（permitted 先于 restricted 检查）
+- 会影响所有带 `$client` 修饰符的规则的行为
+- AdGuard Home 侧代码不需要改，但业务行为变了
+- 这种「静默变更」风险更高
+
+#### 风险 3：新增修饰符支持
+
+**例如**：urlfilter 新增了 `$clienttag` 的新语法（如 `$ctag=tag1,tag2` 的与逻辑）
+- 需要 AdGuard Home 侧的 UI 和配置层适配
+- `ApplyClientFiltering` 中可能需要新增对更多标签来源的支持
+
+### 9.5 函数注入设计对升级的缓冲作用
+
+有趣的是，`ApplyClientFiltering` 的**函数注入设计**本身就提供了一层升级缓冲：
+
+```
+┌─────────────────────────────────────────────────────────────┐
+│  urlfilter 库（第三方，可能升级）                            │
+│    DNSRequest, DNSEngine, NetworkRule                       │
+└─────────────┬───────────────────────────────────────────────┘
+              │
+              ▼
+┌─────────────────────────────────────────────────────────────┐
+│  filtering 包（AdGuard Home 内部）                           │
+│    Settings 结构体（AdGuard Home 自己的类型）                 │
+│    ApplyClientFiltering 函数字段（抽象接口）                  │
+│    matchHost() → 构造 DNSRequest → 调用 urlfilter           │
+└─────────────┬───────────────────────────────────────────────┘
+              │
+              ▼
+┌─────────────────────────────────────────────────────────────┐
+│  client 包（AdGuard Home 内部）                              │
+│    Storage.ApplyClientFiltering() （具体实现）               │
+└─────────────────────────────────────────────────────────────┘
+```
+
+**缓冲作用**：
+- 如果 urlfilter 接口变了，只需要在 `filtering.matchHost()` 这一层做适配
+- `ApplyClientFiltering` 函数签名（`func(clientID string, cliAddr netip.Addr, setts *Settings)`）不变
+- `client` 包完全感知不到 urlfilter 的变化 → 影响面被限制在 `filtering` 包内
+
+### 9.6 升级时的验证要点
+
+升级 urlfilter 版本时，关于客户端相关功能需要验证：
+
+1. **编译检查**：所有构造 `urlfilter.DNSRequest` 的地方是否编译通过
+2. **单元测试**：`filtering/` 下与 `$client` 修饰符相关的测试
+3. **集成测试**：客户端策略叠加 + 规则匹配的端到端测试
+4. **优先级验证**：多规则混合时（`$client` + `$important` + 白名单），优先级是否符合预期
+5. **边界场景**：IPv6、子网匹配、空 ClientID 等
+
+---
+
+## 十、特殊网络场景下的客户端识别边界分析
+
+### 10.1 IPv6 场景的边界
+
+#### 10.1.1 IPv6 Zone Index（链路本地地址的作用域）
+
+**问题**：IPv6 链路本地地址（`fe80::/10`）带有 zone index（如 `fe80::1%eth0`），同一个 IP 在不同网络接口上可能对应不同的设备。
+
+**代码中的处理**（`internal/client/index.go:252-276`）：
+
+```go
+func (ci *index) findByIP(ip netip.Addr) (c *Persistent, found bool) {
+    // 1. 先按完整 IP（含 zone）精确匹配
+    uid, found := ci.ipToUID[ip]
+    if found {
+        return ci.uidToClient[uid], true
+    }
+
+    // 2. 去掉 zone 后，再在子网中查找
+    ipWithoutZone := ip.WithZone("")
+    ci.subnetToUID.Range(func(pref netip.Prefix, id UID) (cont bool) {
+        // Remove zone before checking because prefixes strip zones.
+        if pref.Contains(ipWithoutZone) {
+            uid, found = id, true
+            return false
+        }
+        return true
+    })
+    // ...
+}
+```
+
+**两个关键点**：
+- **精确匹配保留 zone**：`ipToUID` map 的 key 是完整的 `netip.Addr`（含 zone），不同接口上的相同 IP 会被区分
+- **子网匹配去掉 zone**：子网（Prefix）不包含 zone，所以查找前先剥离
+
+#### 10.1.2 `findByIPWithoutZone` 的不确定性
+
+**场景**：查询日志（querylog）中不保存 IPv6 zone（见注释 TODO），需要根据 IP 反查客户端。
+
+**代码**（`internal/client/index.go:309-327`）：
+
+```go
+// Note that multiple clients can have the same IP address with different zones.
+// Therefore, the result of this method is indeterminate.
+func (ci *index) findByIPWithoutZone(ip netip.Addr) (c *Persistent) {
+    // ...
+    for addr, uid := range ci.ipToUID {
+        if addr.WithZone("") == ip {
+            return ci.uidToClient[uid]  // 返回第一个匹配的，结果不确定！
+        }
+    }
+    return nil
+}
+```
+
+**风险**：当多个客户端配置了相同 IP 但不同 zone 时，查询日志反查可能得到错误的客户端。
+
+#### 10.1.3 IPv6 隐私扩展地址（Privacy Extensions）
+
+**问题**：IPv6 主机通常会定期生成随机的临时地址用于出站连接，导致同一个设备有多个 IPv6 地址。
+
+**客户端识别的应对**：
+- **IP 精确匹配**：失效（临时地址一直在变）
+- **子网匹配**：可能生效（如果配置了整个 /64 子网对应一个客户端）
+- **DHCPv6 MAC 映射**：可能失效（隐私扩展地址不通过 DHCP 分配）
+- **ClientID（DoH/DoT/DoQ）**：最可靠（与 IP 无关）
+
+**代码证据**：`findByIP()` 中 DHCP MAC 映射只检查 `dhcp.MACByIP(addr)`，对于 IPv6 隐私地址不会命中。
+
+### 10.2 NAT 后多主机场景的边界
+
+#### 10.2.1 经典 NAT 场景
+
+**场景描述**：多个内网设备通过 NAT 共享一个公网 IP 访问 AdGuard Home（例如 AdGuard Home 部署在公网 VPS 上）。
+
+```
+客户端 A (192.168.1.10) ──┐
+客户端 B (192.168.1.20) ──┼── NAT 路由器 (公网 IP: 203.0.113.1) ──→ AdGuard Home
+客户端 C (192.168.1.30) ──┘
+```
+
+**客户端识别效果**：
+
+| 识别方式 | 效果 | 原因 |
+|---------|------|------|
+| **IP 精确匹配** | ❌ 全部相同 | 三个客户端的源 IP 都是 203.0.113.1 |
+| **子网匹配** | ❌ 全部相同 | 都在同一个 /32 或更大子网内 |
+| **DHCP MAC 映射** | ❌ 无效 | AdGuard Home 看不到内网 MAC |
+| **ClientID** | ✅ 可区分 | 需要客户端配置 DoH/DoT/DoQ 时加上 ClientID |
+| **$client 修饰符规则** | ⚠️ 取决于配置方式 | 用 IP 会全部命中，用 ClientID 可区分 |
+
+#### 10.2.2 应对方案：EDNS Client Subnet (ECS)
+
+AdGuard Home 支持从 EDNS Client Subnet 选项中读取客户端子网信息。
+
+**相关代码位置**：
+- `internal/dnsforward/process.go` 中的处理流程
+- `internal/querylog/query.go:88-90`：`ReqECS` 字段
+
+**但 ECS 主要用于**：
+- 向上游 DNS 传递客户端子网（实现 CDN 就近接入）
+- 记录查询日志
+
+**ECS 不用于**：
+- 客户端识别（`Find()` 方法不检查 ECS）
+- 客户端策略叠加
+
+验证：在 `storage.go` 的 `Find()` 方法中，`FindParams` 结构体没有 ECS 相关字段，查找逻辑也不使用 ECS。
+
+#### 10.2.3 NAT 场景下的策略叠加行为
+
+当多个客户端共享一个 IP（NAT 场景）时，如果配置了该 IP 对应的客户端策略，会发生什么？
+
+```go
+// internal/client/storage.go:564-576
+func (s *Storage) findByIP(addr netip.Addr) (p *Persistent, ok bool) {
+    // 1. IP 精确匹配 → 所有 NAT 后的客户端都命中同一个 Persistent
+    p, ok = s.index.findByIP(addr)
+    if ok {
+        return p, true
+    }
+    // 2. DHCP MAC 映射 → 公网场景不命中
+    foundMAC := s.dhcp.MACByIP(addr)
+    // ...
+}
+```
+
+**结果**：NAT 后的所有设备会**共享同一个客户端配置**。
+- 如果这个 IP 对应的客户端配置了「禁止访问社交网站」，所有 NAT 后的设备都不能访问
+- 无法单独对 NAT 后的某台设备设策略，除非使用 ClientID
+
+### 10.3 多个重叠子网的优先级
+
+当一个 IP 同时属于多个配置了客户端的子网时，哪一个会被选中？
+
+**排序规则**（`internal/client/persistent.go:196-212`）：
+
+```go
+func subnetCompare(x, y netip.Prefix) (cmp int) {
+    if x == y {
+        return 0
+    }
+    xAddr, xBits := x.Addr(), x.Bits()
+    yAddr, yBits := y.Addr(), y.Bits()
+
+    if xBits == yBits {
+        return xAddr.Compare(yAddr)
+    }
+
+    // 【关键】位数多（更精确）的子网排在前面
+    if xBits > yBits {
+        return -1  // x 在前
+    } else {
+        return 1
+    }
+}
+```
+
+**遍历顺序**：`SortedMap.Range()` 按 `subnetCompare` 排序后的顺序遍历 → **更精确的子网先被检查**。
+
+**匹配逻辑**（`index.go:259-269`）：
+
+```go
+ci.subnetToUID.Range(func(pref netip.Prefix, id UID) (cont bool) {
+    if pref.Contains(ipWithoutZone) {
+        uid, found = id, true
+        return false  // 找到第一个就停止遍历！
+    }
+    return true
+})
+```
+
+**结论**：当 IP 同时属于多个子网时，**前缀长度最长（最精确）的子网优先**。
+
+**示例**：
+- 子网 A：`10.0.0.0/8` → 客户端「访客网络」
+- 子网 B：`10.0.1.0/24` → 客户端「办公网络」
+- IP `10.0.1.100` 同时属于两个子网
+- 结果：命中「办公网络」（因为 /24 比 /8 更精确）
+
+### 10.4 多 IP 客户端的识别边界
+
+一个 Persistent 客户端可以配置多个 IP 地址：
+
+```go
+type Persistent struct {
+    IPs     []netip.Addr    // 多个 IP
+    Subnets []netip.Prefix  // 多个子网
+    MACs    []net.HardwareAddr
+    ClientIDs []ClientID
+    // ...
+}
+```
+
+**查找时的行为**：
+- 任一 IP 命中 → 整个客户端配置生效
+- 没有「根据命中的 IP 不同应用不同策略」的机制
+- 一个客户端只有一套策略配置
+
+### 10.5 边界场景总结表
+
+| 场景 | IP 精确匹配 | 子网匹配 | DHCP MAC | ClientID | 可靠度 |
+|------|------------|---------|----------|----------|--------|
+| 普通 IPv4 局域网 | ✅ | ✅ | ✅ | ✅ | 高 |
+| 普通 IPv6 局域网 | ✅ | ✅ | 部分 | ✅ | 中 |
+| IPv6 隐私扩展地址 | ❌ | 部分 | ❌ | ✅ | 低 → 中（用 ClientID） |
+| IPv6 链路本地（多 zone） | ⚠️ 取决于 zone | ✅ | ❌ | ✅ | 中 |
+| NAT 后多主机共享 IP | ❌（都一样） | ❌（都一样） | ❌ | ✅ | 低 → 高（用 ClientID） |
+| 客户端配置了多个 IP | ✅（任一命中即可） | ✅ | ✅ | ✅ | 高 |
+| 多个重叠子网 | — | ✅（最长前缀优先） | — | — | 高 |
