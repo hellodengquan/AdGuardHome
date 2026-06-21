@@ -489,6 +489,379 @@ T4 时刻的三种可能查询结果：
 > ```
 > 说明开发者已意识到缺少按来源精确清理 runtime 缓存的机制，目前只能通过 `UpdateDHCP()` 全部清空再重建。
 
+### 3.5 长租约（多天/周）下缓存淘汰与续约时间窗口的协作
+
+#### 3.5.1 续约时间窗口的实现
+
+DHCP 协议定义了两个续约时间点：
+- **T1 (Renewing)**：租约时长的 50%，客户端开始向原服务器续约
+- **T2 (Rebinding)**：租约时长的 80%，客户端向任意服务器广播续约
+
+**DHCPv6 的实现**（明确计算 T1/T2）：
+
+`internal/dhcpsvc/v6.go:156-214`
+
+```go
+type dhcpInterfaceV6 struct {
+    t1 time.Duration  // 0.5 × LeaseDuration
+    t2 time.Duration  // 0.8 × LeaseDuration
+}
+
+// 创建时预计算
+t1: conf.LeaseDuration / 2,
+t2: conf.LeaseDuration * 4 / 5,
+```
+
+响应时将 T1/T2 放入 IA_NA 选项（`v6.go:511-512`）：
+
+```go
+return iaNAOption{
+    nested: []iaAddrOption{{
+        addr:              lease.IP,
+        preferredLifetime: iface.common.leaseTTL,
+        validLifetime:     iface.common.leaseTTL,
+    }},
+    iaid: iaid,
+    t1:   iface.t1,   // 50% 时间点
+    t2:   iface.t2,   // 80% 时间点
+}.Encode()
+```
+
+**DHCPv4 的实现**（未发送 T1/T2，有 TODO）：
+
+`internal/dhcpsvc/options4.go:329-349`
+
+```go
+// TODO(e.burkov):  Add also renewal (T1) and rebinding (T2) time options, see
+// RFC 2131 Section 4.4.5, and RFC 2132 Sections 9.11 and 9.12.
+func (iface *dhcpInterfaceV4) appendTimeOptions(
+    opts layers.DHCPOptions,
+    lease *Lease,
+) (res layers.DHCPOptions) {
+    var dur time.Duration
+    if lease.IsStatic {
+        dur = iface.common.leaseTTL
+    } else {
+        dur = lease.Expiry.Sub(iface.clock.Now())  // 仅发送剩余时间
+    }
+    // 只写入 IPAddressLeaseTime 选项，不写 RenewalTime/RebindingTime
+    ...
+}
+```
+
+> **关键差异**：DHCPv4 客户端只能使用操作系统默认的续约策略（通常也是 50%/80%），但 AdGuard Home 不主动发送 T1/T2 选项；DHCPv6 则明确发送 50%/80% 的 T1/T2。
+
+#### 3.5.2 长租约场景下的续约时间轴
+
+以 LeaseDuration = **7 天**（一周）为例：
+
+```
+T0              T1(3.5天)          T2(5.6天)          T0+7天(过期)
+ ├─────────────────┼──────────────────┼──────────────────┤
+ │                 │                  │                  │
+ └─ 分配租约       └─ 客户端 RENEW    └─ 客户端 REBIND   └─ Expiry
+                    (单播给原服务器)    (广播给所有服务器)
+```
+
+AdGuard Home 对续约的处理（`internal/dhcpsvc/handler4.go:283-320` → `handleRenew`）：
+
+```go
+func (iface *dhcpInterfaceV4) handleRenew(ctx, req, fd, ip) {
+    iface.common.indexMu.Lock()           // 全局写锁
+    defer iface.common.indexMu.Unlock()
+
+    lease, hasLease := iface.common.leases[mk]
+    if !hasLease {
+        return  // 无租约记录则静默丢弃
+    }
+    if lease.IP != ip {
+        iface.respondNAK(...)             // IP 不匹配则 NAK
+        return
+    }
+    iface.updateAndRespond(ctx, l, req, lease, fd, idOpt)
+}
+```
+
+`updateAndRespond`（`internal/dhcpsvc/v4.go:355-374`）会更新租约：
+
+```go
+func (iface *dhcpInterfaceV4) updateAndRespond(...) {
+    lease.Hostname = cmp.Or(hostname4(req), lease.Hostname)  // 主机名可能更新
+    err := iface.updateLease(ctx, lease)                     // → leaseIndex.update()
+    if err != nil {
+        iface.respondNAK(...)
+        return
+    }
+    iface.respondACK(ctx, req, fd, lease, idOpt)
+}
+```
+
+#### 3.5.3 租约续约时 Expiry 的更新逻辑
+
+**`internal/dhcpsvc/lease.go:69-82` → `Lease.updateExpiry()`**：
+
+```go
+func (l *Lease) updateExpiry(clock timeutil.Clock, ttl time.Duration) {
+    if l.IsStatic {
+        return
+    }
+    now := clock.Now()
+    if now.Before(l.Expiry) {
+        return  // ⚠️ 租约未过期则不更新 Expiry！
+    }
+    l.Expiry = now.Add(ttl)  // 过期后才重置为 now+TTL
+}
+```
+
+**但注意**：`updateExpiry` 仅在 `handleDiscover` 中被调用（续约时不调用）。续约走的是 `updateAndRespond` → `leaseIndex.update()`，这个更新过程中 **Expiry 保持不变**。
+
+实际的 Expiry 更新在响应构造时才计算剩余时间（`options4.go:342`）：
+
+```go
+dur = lease.Expiry.Sub(iface.clock.Now())
+```
+
+这意味着：
+- 租约记录中的 `Expiry` 始终是**初次分配时设置的绝对过期时间**
+- 每次续约 ACK 中返回给客户端的是**剩余时间**（`lease.Expiry - now`）
+- 客户端收到剩余时间后，会重置自己的本地计时器为 `now + 剩余时间`，从而实现续约
+
+**长租约下的实际效果**：假设 7 天租约在 T1（3.5 天）续约成功，客户端的本地租期会被重置为 `now + 3.5天剩余 ≈ now + 3.5天`，但服务器端 `lease.Expiry` 仍然是 T0+7天。下一次续约时客户端会在 `now + 1.75天`（新租期的 50%）再次发起，此时服务器端剩余时间约为 1.75 天。
+
+#### 3.5.4 长租约与 runtimeIndex 缓存淘汰的协作矛盾
+
+**核心问题**：runtimeIndex 没有自动过期机制，而长租约意味着长时间不触发 `UpdateDHCP()`。
+
+| 淘汰触发条件 | 触发时机 | 长租约下的频率 |
+|------------|---------|--------------|
+| `UpdateDHCP()` 批量刷新 | 用户访问 `/control/clients` HTTP API | 可能数天/数周一次 |
+| `ClientRuntime()` 惰性查询 | 每次 DNS 请求时实时查 `HostByIP` | 高频，但只查不删 |
+| `removeEmpty()` 清理空 Runtime | 仅在批量刷新后调用 | 依赖上面的刷新 |
+
+**协作时序分析（7天租约）**：
+
+```
+T0:  客户端拿到 192.168.1.100，租约7天
+     → runtimeIndex[192.168.1.100].dhcp = "my-pc"  (由 UpdateDHCP 写入)
+
+T1 (3.5天): 客户端 RENEW，续约成功
+     → 服务器 leaseIndex 更新（Hostname 可能变化）
+     → ⚠️ runtimeIndex 不会收到通知，仍是旧值
+
+T3 (5天):   用户访问 /control/clients
+     → UpdateDHCP() 被调用
+     → clearSource(SourceDHCP) 清空所有 DHCP 来源
+     → 重新从 leaseIndex 拉取所有租约
+     → ✅ runtimeIndex 与租约同步
+
+T4 (8天):   客户端关机未续约，租约过期
+     → leaseIndex 中租约仍存在（不会自动清除）
+     → ⚠️ runtimeIndex 中也仍存在
+
+T5 (9天):   另一个客户端通过 findExpiredLease 回收该 IP
+     → leaseIndex 中 IP 映射到新 MAC/Hostname
+     → ⚠️ runtimeIndex 不会被通知
+
+T6 (9天+):  DNS 请求触发 ClientRuntime(192.168.1.100)
+     → dhcp.HostByIP(ip) 返回新 Hostname
+     → runtimeIndex.setInfo() 覆盖为新值
+     → ✅ 通过惰性查询纠正（但中间 DNS 请求可能用了旧 Hostname）
+
+T7 (10天):  用户访问 /control/clients
+     → UpdateDHCP() 全量刷新，最终一致性达成
+```
+
+#### 3.5.5 长租约下的设计局限
+
+1. **续约期间 Hostname 变更不感知**：如果客户端续约时上报了不同的 Hostname，`updateAndRespond` 会更新租约记录，但 runtimeIndex 直到下一次 `UpdateDHCP()` 或 `ClientRuntime()` 才会看到变化。
+
+2. **过期租约不会自动清理**：leaseIndex 中过期的租约会一直保留，直到被 `findExpiredLease()` 回收复用或被 `Reset()` 清除。runtimeIndex 同理。
+
+3. **租约回收复用存在竞态窗口**：当长租约过期被回收分配给新客户端时，在惰性查询触发前，runtimeIndex 可能短暂指向旧客户端信息。
+
+4. **DHCPv4 T1/T2 缺失**：由于代码 TODO 未实现 RenewalTime/RebindingTime 选项，DHCPv4 客户端完全依赖操作系统默认续约策略（通常是 50%/80%），无法在服务端精细控制长租约的续约时机。
+
+---
+
+### 3.6 多 DHCP 服务器并存部署下的客户端识别冲突
+
+AdGuard Home 支持三种多服务器并存场景，每种场景的冲突风险不同：
+
+```
+场景 A: IPv4 + IPv6 双栈（同一台 AdGuard Home 实例）
+场景 B: 主备部署（两台 AdGuard Home，各自独立运行）
+场景 C: 与其他 DHCP 服务器共存（如路由器自带 DHCP）
+```
+
+#### 3.6.1 场景 A：IPv4 + IPv6 双栈（同实例）
+
+**部署形态**：同一个 `DHCPServer` 实例同时管理 IPv4 和 IPv6 接口。
+
+`internal/dhcpsvc/v4.go:200-207` 和 `internal/dhcpsvc/v6.go:202-207`：
+
+```go
+// IPv4 接口
+common: &netInterface{
+    indexMu:       srv.leasesMu,     // 共享全局锁
+    index:         srv.leases,       // 共享全局租约索引
+    leases:        map[macKey]*Lease{},  // 接口独立的 MAC 索引
+    ...
+}
+
+// IPv6 接口
+common: &netInterface{
+    indexMu:       srv.leasesMu,     // 同一个全局锁
+    index:         srv.leases,       // 同一个全局索引
+    leases:        map[macKey]*Lease{},  // 另一个独立的 MAC 索引
+    ...
+}
+```
+
+**双栈共享的全局数据结构**：`leaseIndex`
+
+`internal/dhcpsvc/leaseindex.go:17-25`
+
+```go
+type leaseIndex struct {
+    byAddr map[netip.Addr]*Lease     // IP → Lease（v4+v6 地址天然不冲突）
+    byName map[string]*Lease         // hostname → Lease（⚠️ 可能冲突）
+    ...
+}
+```
+
+**冲突点分析**：
+
+| 数据结构 | 是否冲突 | 原因 |
+|---------|---------|------|
+| `leaseIndex.byAddr` | ❌ 不冲突 | IPv4 和 IPv6 地址空间完全分离，netip.Addr 内部编码区分 v4/v6 |
+| `leaseIndex.byName` | ⚠️ **冲突** | 同一个 hostname 只能对应一个 Lease，后写入的覆盖先写入的 |
+| `iface.leases[macKey]` | ❌ 不冲突 | v4 和 v6 接口有各自独立的 map |
+| `leasedOffsets` 位图 | ❌ 不冲突 | 各接口独立维护 |
+
+**hostname 冲突的实际影响**：
+
+假设同一台客户端（同一个 MAC）同时获取了 IPv4 和 IPv6 租约，且上报了相同 Hostname：
+
+```go
+// leaseIndex.add() 中的冲突检测
+func (idx *leaseIndex) add(ctx, logger, l, iface) error {
+    loweredName := strings.ToLower(l.Hostname)
+
+    if _, ok := idx.byAddr[l.IP]; ok {
+        return fmt.Errorf("lease for ip %s already exists", l.IP)
+    } else if _, ok = idx.byName[loweredName]; ok {
+        return fmt.Errorf("lease for hostname %s already exists", l.Hostname)  // ← 会报错！
+    }
+    ...
+}
+```
+
+实际表现：
+- v4 租约先写入 → 成功，`byName["my-pc"] = v4Lease`
+- v6 租约后写入 → 失败，返回 `"lease for hostname my-pc already exists"`
+- **但 v6 的 IP 仍会通过其他方式分配给客户端**，只是 AdGuard Home 内部的租约索引中缺少 hostname→v6IP 的反向映射
+
+**客户端识别链路的影响**：
+
+`ApplyClientFiltering` / `findByIP` 通过 IP 查 MAC：
+
+```go
+// storage.go:564-573
+func (s *Storage) findByIP(addr netip.Addr) (p *Persistent, ok bool) {
+    p, ok = s.index.findByIP(addr)      // 先按 IP 查持久化客户端
+    if ok {
+        return p, true
+    }
+    foundMAC := s.dhcp.MACByIP(addr)    // 再通过 DHCP 租约查 MAC
+    if foundMAC != nil {
+        return s.index.findByMAC(foundMAC)  // 按 MAC 查持久化客户端
+    }
+    return nil, false
+}
+```
+
+`MACByIP` 走 `byAddr` 索引（`server.go:225-234`），不受 hostname 冲突影响，所以 **v4/v6 的 MAC 解析都是正确的**。
+
+受影响的是 `HostByIP` / `ClientRuntime` 获取主机名：
+- v4 IP → `byAddr` 命中 → 返回正确 Hostname ✅
+- v6 IP → `byAddr` 未命中（因为 add 失败没写入）→ 返回空字符串 ❌
+- `IPByHost("my-pc")` → 只返回 v4 IP，丢失 v6 IP ❌
+
+**双栈冲突总结**：MAC 解析不受影响，但 hostname→IP 反向映射和 v6 的主机名补全会丢失。这是代码级别的 BUG。
+
+#### 3.6.2 场景 B：主备部署（两台 AdGuard Home）
+
+**部署形态**：两台独立的 AdGuard Home 作为 DHCP 主备服务器，各自维护独立的租约数据库。
+
+客户端在 T1（50% 租期）单播给主服务器，T2（80% 租期）广播给任意服务器。可能出现：
+- 主服务器响应 → 主的租约更新
+- 备服务器响应 → 备的租约更新
+- 两台同时响应 → 客户端选第一个，另一台的租约成为"幽灵租约"
+
+**冲突分析**：
+
+两台服务器之间**没有租约同步机制**（AdGuard Home 本身不提供 DHCP 故障转移协议）。
+
+客户端识别链路只连接到**当前 AdGuard Home 实例**的 DHCP 服务：
+
+```go
+// client/storage.go:90-97  StorageConfig
+type StorageConfig struct {
+    ...
+    DHCP DHCP  // 指向当前实例的 DHCPServer
+    ...
+}
+```
+
+实际影响：
+1. **备服务器分配的租约在主服务器上不可见** → 客户端从备拿到 IP，主的查询日志/策略叠加无法识别该客户端
+2. **两台都有同一 MAC 的租约但 IP 不同** → 取决于 DNS 请求到哪台 AGH，识别到的客户端信息不同
+3. **持久化客户端（按 MAC 配置）不受影响** → 只要 `MACByIP` 能在本机租约中找到 MAC，后续 `findByMAC` 就能匹配到持久化策略
+
+**应对方式**：主备部署场景下，如果依赖 DHCP 租约做客户端识别，必须确保：
+- 两台 AGH 的地址池不重叠（避免 IP 冲突）
+- 持久化客户端**按 MAC 配置**而非按 IP 配置（MAC 在两台机器上都能匹配）
+- 不依赖 DHCP 租约的 Hostname 进行策略匹配（Hostname 可能只存在于分配租约的那台）
+
+#### 3.6.3 场景 C：与第三方 DHCP 服务器共存
+
+**部署形态**：AdGuard Home 只做 DNS 过滤，网络中另有路由器/Windows Server 等负责 DHCP。
+
+此场景下 `client.DHCP` 接口使用 `EmptyDHCP` 实现：
+
+```go
+// dhcpsvc/dhcpsvc.go:99-109
+func (Empty) HostByIP(_ netip.Addr) (host string) { return "" }
+func (Empty) MACByIP(_ netip.Addr) (mac net.HardwareAddr) { return nil }
+func (Empty) Leases() (leases []*Lease) { return nil }
+```
+
+**客户端识别链路完全绕过 DHCP 租约**：
+
+```
+ApplyClientFiltering(id, addr, setts)
+  ├── findByClientID() → 可能命中
+  ├── findByIP() → 只查持久化客户端 IP（不是 DHCP）
+  │     └── 失败 → dhcp.MACByIP() → 返回 nil → 无法转 MAC 查询
+  └── findByCIDR/findByMAC → 不触发 DHCP
+```
+
+因此这种场景下：
+- ✅ 按 ClientID 配置的持久化客户端：正常识别
+- ✅ 按 MAC 配置的持久化客户端：**无法识别**（没有 DHCP 租约提供 IP→MAC 桥接）
+- ✅ 按 IP/子网配置的持久化客户端：正常识别
+- ❌ DHCP 租约 Hostname：完全不可用（只能依赖 rDNS/ARP 等其他来源）
+
+#### 3.6.4 多服务器冲突矩阵
+
+| 部署场景 | byAddr | byName (hostname) | MAC 解析 | Hostname 补全 | 策略叠加可靠性 |
+|---------|--------|-------------------|----------|--------------|--------------|
+| 单 IPv4 | ✅ | ✅ | ✅ | ✅ | 高 |
+| 单 IPv6 | ✅ | ✅ | ✅ | ✅ | 高 |
+| IPv4+IPv6 双栈 | ✅ | ⚠️ v6 覆盖丢失 | ✅ 都正常 | ⚠️ v6 Hostname 丢失 | 中（按 MAC 配置没问题） |
+| 双 AGH 主备 | ⚠️ 各管各的 | ⚠️ 各管各的 | ⚠️ 仅本机可见 | ⚠️ 仅本机可见 | 低（必须按 MAC 持久化） |
+| 第三方 DHCP | ❌ 无 | ❌ 无 | ❌ 无 | ❌ 无 | 中高（按 IP/ClientID 没问题） |
+
 ---
 
 ## 四、客户端识别（查询日志补全）
@@ -821,16 +1194,21 @@ DNS 请求        dnsforward          filtering          client/storage        d
 
 | 功能 | 文件 | 关键函数/方法 |
 |------|------|-------------|
-| DHCP 租约结构 | `internal/dhcpsvc/lease.go` | `Lease` 结构体 |
+| DHCP 租约结构 | `internal/dhcpsvc/lease.go` | `Lease` 结构体、`updateExpiry` |
 | 租约索引 | `internal/dhcpsvc/leaseindex.go` | `leaseIndex.add/remove/update` |
-| DHCPv4 处理器 | `internal/dhcpsvc/handler4.go` | `handleDiscover/handleRequest/handleRelease/handleDecline` |
+| DHCPv4 处理器 | `internal/dhcpsvc/handler4.go` | `handleDiscover/handleRenew/handleRelease/handleDecline` |
+| DHCPv6 处理器 | `internal/dhcpsvc/handler6.go` | `handleSolicit/handleRequest/handleRenew/handleRebind` |
 | 租约分配与过期回收 | `internal/dhcpsvc/interface.go` | `allocateLease/reserveLease/findExpiredLease/blockLease` |
+| 续约响应 | `internal/dhcpsvc/v4.go` | `updateAndRespond/respondACK` |
+| DHCPv4 时间选项 | `internal/dhcpsvc/options4.go` | `appendTimeOptions`（T1/T2 TODO） |
+| DHCPv6 T1/T2 | `internal/dhcpsvc/v6.go` | `t1/2` 字段（0.5×/0.8×LeaseDuration） |
 | 全局读写锁 | `internal/dhcpsvc/server.go` | `DHCPServer.leasesMu`（所有接口共享） |
 | 租约查询接口 | `internal/dhcpsvc/server.go` | `Leases/HostByIP/MACByIP/IPByHost` |
 | 持久化 | `internal/dhcpsvc/db.go` | `dbLoad/dbStore` |
 | 运行时客户端缓存 | `internal/client/runtimeindex.go` | `runtimeIndex.setInfo/clearSource/removeEmpty` |
-| 客户端存储 | `internal/client/storage.go` | `Find/ApplyClientFiltering/UpdateDHCP/ClientRuntime` |
-| 运行时客户端 | `internal/client/client.go` | `Runtime.Info()`（来源优先级） |
+| 客户端存储 | `internal/client/storage.go` | `Find/findByIP/ApplyClientFiltering/UpdateDHCP/ClientRuntime` |
+| 运行时客户端 | `internal/client/client.go` | `Runtime.Info()`（来源优先级）、`Runtime.unset/isEmpty` |
+| 空 DHCP 实现 | `internal/dhcpsvc/dhcpsvc.go` | `EmptyDHCP`（第三方 DHCP 场景） |
 | DNS 过滤设置 | `internal/dnsforward/filter.go` | `clientRequestFilteringSettings` |
 | 查询日志补全 | `internal/querylog/search.go` | `client()` |
 | 查询日志请求级缓存 | `internal/querylog/client.go` | `clientCache/clientCacheKey` |
@@ -856,3 +1234,11 @@ DNS 请求        dnsforward          filtering          client/storage        d
 7. **最终一致性缓存设计**：DHCP 权威数据立即修改并持久化，上层客户端缓存（runtimeIndex）通过 `UpdateDHCP()` 批量刷新和 `ClientRuntime()` 惰性查询实现最终收敛。DHCP 层不主动推送变更通知到 client 层，缺少按来源精确清理 runtime 缓存的机制（代码中有 TODO 标注）
 
 8. **阻塞租约的设计**：DHCPDECLINE 不直接删除租约，而是将 MAC 置全零、Hostname 清空后保留在全局索引中，通过 `IsBlocked()` 标记。`Leases()` 导出时会跳过阻塞租约，既防止冲突 IP 被立即复用，又不暴露给上层客户端识别
+
+9. **续约时间不对称实现**：DHCPv6 明确计算并发送 T1(50%)/T2(80%) 续约时间窗口，DHCPv4 仅发送剩余租期、缺少 T1/T2 选项（代码 TODO）。服务器端 lease.Expiry 始终保留初次分配的绝对过期时间，不随续约前移，通过响应时计算 `Expiry - now` 剩余时间返回给客户端实现续约
+
+10. **长租约缓存惰性收敛**：runtimeIndex 无 TTL 自动过期，长租约（多天/周）场景下续约期间 Hostname 变更、过期租约回收复用等变更只能通过 `ClientRuntime()` 每次 DNS 请求时的惰性查询或用户访问 `/control/clients` 触发的全量 `UpdateDHCP()` 刷新收敛，存在分钟级到天级的不一致窗口
+
+11. **双栈 hostname 索引冲突 BUG**：IPv4 和 IPv6 共享同一个 `leaseIndex.byName` 哈希表，同一客户端（同 MAC 同 Hostname）同时获取 v4/v6 租约时，v6 的 `byName` 写入会因冲突检测失败被丢弃，导致 v6 IP 的 Hostname 补全和 `IPByHost` 反向映射失效（仅 v4 可见），但 `byAddr` 的 MAC 解析不受影响
+
+12. **主备部署识别割裂**：多台 AdGuard Home 作为 DHCP 主备部署时，实例之间无租约同步机制，客户端识别链路仅连接当前实例的 DHCP 服务，备机分配的租约在主机上不可见，按 IP/Hostname 匹配策略会失效，仅按 MAC 配置的持久化客户端在两台机器上都能可靠匹配
