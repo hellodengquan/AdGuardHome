@@ -864,6 +864,328 @@ ApplyClientFiltering(id, addr, setts)
 
 ---
 
+### 3.7 DHCP relay 中继代理转发时客户端识别链路拼接
+
+#### 3.7.1 DHCPv4 relay 支持情况
+
+AdGuard Home 作为 DHCPv4 服务器**支持**接收经过中继代理转发的请求，但仅做最基础的 giaddr 处理。
+
+**关键标识：`giaddr`（RelayAgentIP 字段）**
+
+当客户端与服务器不在同一子网时，DHCP relay 代理会在 BOOTP 头的 `giaddr` 字段填入自己的接口地址，然后将请求单播给 DHCP 服务器。
+
+**代码位置**：`internal/dhcpsvc/v4.go:400-413` → `newIPv4UDPLayers()`
+
+```go
+switch {
+case isSpecified(req.RelayAgentIP.To4()):
+    // giaddr 非零 → 发回 relay 代理的服务器端口
+    dstIP, dstPort = req.RelayAgentIP.To4(), ServerPortV4
+case isSpecified(req.ClientIP.To4()):
+    // ciaddr 非零 → 单播给客户端
+    dstIP, dstPort = req.ClientIP.To4(), ClientPortV4
+default:
+    // 广播给本地链路
+    ...
+}
+```
+
+**NAK 响应的特殊处理**（`v4.go:293-301`）：
+
+```go
+// 如果 giaddr 非零，必须设广播位，让 relay 把 NAK 广播给客户端
+// 因为客户端可能还没有正确的 IP 地址，无法单播回应
+if isSpecified(req.RelayAgentIP) {
+    flags = flags | FlagsBroadcast
+}
+```
+
+#### 3.7.2 relay 场景下客户端真实 MAC 的保留
+
+**核心要点：relay 转发不修改 CHADDR 字段**
+
+DHCPv4 协议规定，中继代理只能修改 `giaddr`、`hops` 等字段，**不能修改 `chaddr`（客户端硬件地址）**。因此即使经过多级 relay 转发，请求到达 AdGuard Home 时，`req.ClientHWAddr` 仍然是客户端的真实 MAC 地址。
+
+**租约写入链路完全正常**：
+
+```
+客户端 → DHCP relay(giaddr=relayIP, chaddr=clientMAC) → AdGuard Home
+    │
+    └─ handleDiscover/handleSelecting
+        ├── req.ClientHWAddr  →  仍是客户端真实 MAC
+        ├── mk := macKey{...} →  用真实 MAC 生成键
+        └── lease.HWAddr = ... →  存入真实 MAC
+```
+
+#### 3.7.3 客户端识别链路在 relay 场景下的表现
+
+**完全不受影响**，因为客户端识别依赖的是 `byAddr[ip].HWAddr`，而这个 HWAddr 在租约创建时就已经从 `chaddr` 正确写入了。
+
+**完整调用链验证**：
+
+```
+DNS 请求 (源 IP = 客户端 IP)
+  │
+  └─ ApplyClientFiltering(id, addr, setts)
+        ├── findByClientID() → 未命中
+        ├── findByIP() → 未命中
+        │     └─ s.index.findByIP(addr) → 持久化客户端无
+        ├── s.dhcp.MACByIP(addr) → 查 leaseIndex.byAddr
+        │     └─ 命中 → 返回 Lease.HWAddr (即客户端真实 MAC)
+        └─ s.index.findByMAC(foundMAC) → 按 MAC 查持久化客户端
+              └─ 命中 → 叠加该客户端的策略设置
+```
+
+#### 3.7.4 DHCPv4 relay 的已知局限
+
+1. **不支持 Option 82（Relay Agent Information）**：代码中完全没有解析 Option 82（中继代理信息选项，包含 Circuit ID、Remote ID 等）的逻辑，无法基于 relay 端口标识做更细粒度的客户端区分。
+
+2. **不处理多个 giaddr 叠加**：仅使用最外层的 giaddr 做响应路由，多级 relay 场景下依赖标准协议行为。
+
+3. **地址池子网选择逻辑**：从现有代码看，`dhcpInterfaceV4` 绑定到具体接口，没有基于 giaddr 选择不同地址池的能力。所有经过 relay 转发的请求都由**监听该接口的 DHCP 服务**分配同一地址池的 IP。
+
+#### 3.7.5 DHCPv6 relay 的支持状态
+
+**完全不支持**。证据：
+
+- **`handleDHCPv6` 消息分发**（`internal/dhcpsvc/handler6.go:47-66`）：
+
+```go
+switch typ {
+case layers.DHCPv6MsgTypeSolicit:     // ✅
+case layers.DHCPv6MsgTypeRequest:     // ✅
+case layers.DHCPv6MsgTypeConfirm:     // ✅
+case layers.DHCPv6MsgTypeRenew:       // ✅
+case layers.DHCPv6MsgTypeRebind:      // ✅（stub 实现）
+case layers.DHCPv6MsgTypeInformationRequest:  // ✅
+case layers.DHCPv6MsgTypeRelease:     // ✅
+case layers.DHCPv6MsgTypeDecline:     // ✅
+default:
+    return fmt.Errorf("dhcpv6: request type: %w: %d", errors.ErrBadEnumValue, typ)
+}
+```
+
+- 没有 `DHCPv6MsgTypeRelayForward` / `DHCPv6MsgTypeRelayReply` 的 case
+- 没有 `RelayForw` / `RelayRepl` 消息的解封装和封装逻辑
+- 没有 hop count、link-address 等 relay 字段处理
+
+此外 `serveEther6` 上还有 `lint:ignore U1000 TODO(e.burkov): Use.` 注释（`handle6.go:42`），说明 DHCPv6 服务端整体仍处于开发阶段。
+
+**DHCPv6 relay 场景下客户端识别的影响**：
+
+如果 DHCPv6 请求经过 relay 转发到达 AdGuard Home，会直接走进 `default` 分支报错返回，**不会创建租约**。因此客户端识别链路中也不会有这些 IPv6 地址的 MAC 映射。IPv6 客户端只能依赖 SLAAC + ARP/NDP + rDNS 等其他识别路径。
+
+---
+
+### 3.8 IPv6 SLAAC 与 DHCPv6 混合环境下客户端识别
+
+#### 3.8.1 SLAAC 的三种配置模式
+
+AdGuard Home 的 DHCPv6 支持三种 SLAAC 相关模式，由 `IPv6Config` 中的两个布尔字段控制：
+
+**文件**：`internal/dhcpsvc/v6.go:82-88`
+
+```go
+// RASlaacOnly: 只发 RA，不启动 DHCPv6 服务器（纯 SLAAC 环境）
+RASLAACOnly bool
+
+// RAAllowSlaac: RA 中设置 M/O 标志，允许 SLAAC 与 DHCPv6 共存（混合模式）
+RAAllowSLAAC bool
+```
+
+**三种模式对应关系**：
+
+| 模式 | RASLAACOnly | RAAllowSLAAC | DHCPv6 服务器 | RA 标志位 |
+|------|-------------|--------------|-------------|-----------|
+| 纯 DHCPv6 | false | false | ✅ 启动 | M=1, O=1（仅 DHCP） |
+| 混合模式 | false | true | ✅ 启动 | M=0, O=0 或 M=1, O=1（SLAAC + DHCPv6） |
+| 纯 SLAAC | true | 任意 | ❌ 不启动 | M=0, O=0（仅 SLAAC） |
+
+**纯 SLAAC 模式下跳过 DHCPv6 启动**（`internal/dhcpd/v6_unix.go:735-740`）：
+
+```go
+if s.conf.RASLAACOnly {
+    log.Debug("not starting dhcpv6 server due to ra_slaac_only=true")
+    return nil
+}
+```
+
+#### 3.8.2 SLAAC 地址的本质：不在 DHCP 租约中
+
+SLAAC（Stateless Address Autoconfiguration）是 IPv6 的无状态地址自动配置机制：
+- 客户端从 RA 消息中获取前缀
+- 自己生成接口标识（EUI-64 或隐私扩展临时地址）
+- 通过 NDP（邻居发现协议）做地址冲突检测
+- **不经过 DHCPv6 服务器，不生成 DHCP 租约**
+
+因此：
+- `leaseIndex.byAddr` 中**没有**这些 SLAAC 地址
+- `s.dhcp.MACByIP(slaacAddr)` → 返回 `nil`
+- `s.dhcp.HostByIP(slaacAddr)` → 返回 `""`
+- 按 MAC 配置的持久化客户端**无法通过 SLAAC 地址匹配**（IP→MAC 桥接断裂）
+
+#### 3.8.3 SLAAC 环境下客户端识别的四条替代路径
+
+当 DHCP 租约不可用时，客户端识别降级到以下四条路径，按优先级排列：
+
+```
+来源优先级（高 → 低）:
+  SourcePersistent (持久化客户端)
+  SourceHostsFile  (hosts 文件)
+  SourceDHCP       (DHCP 租约)  ← SLAAC 下不可用
+  SourceRDNS       (rDNS 反向解析)
+  SourceARP        (ARP/NDP 邻居表)
+  SourceWHOIS      (WHOIS 查询)
+```
+
+**路径 1：持久化客户端（按 IP / 子网匹配）**
+
+`internal/client/index.go` → `findByIP()` / `findBySubnet()`
+
+如果管理员手动为 SLAAC 地址配置了持久化客户端（按 IP 或子网），则直接命中。这是最可靠的方式，但需要手动维护。
+
+**路径 2：hosts 文件匹配**
+
+`internal/client/runtimeindex.go` → `SourceHostsFile`
+
+系统 hosts 文件中如果配置了 IPv6 地址到主机名的映射，会被 `aghnet.HostsContainer` 加载并注入 runtimeIndex。
+
+**路径 3：rDNS 反向解析（PTR 查询）**
+
+**文件**：`internal/client/addrproc.go` → `DefaultAddrProc`
+
+触发时机：**每次 DNS 请求时**异步触发
+
+```go
+// dnsforward/process.go:150-165
+func (s *Server) processClientIP(ctx context.Context, l *slog.Logger, addr netip.Addr) {
+    ...
+    s.addrProc.Process(ctx, addr)  // 放入异步队列
+}
+```
+
+处理流程：
+
+```
+DNS 请求到达
+  └─ processClientIP(ip)
+        └─ addrProc.Process(ip) → 放入 clientIPs channel（队列大小 255）
+              │
+              └─ process goroutine 消费队列
+                    ├── p.rdns.Process(ip) → PTR 查询 + 缓存（TTL 1 小时）
+                    │     └─ 有变化 → 返回 host
+                    ├── p.whois.Process(ip) → WHOIS 查询
+                    └── p.addrUpdater.UpdateAddress(ctx, ip, host, info)
+                          └── storage.UpdateAddress()
+                                └── runtimeIndex.setInfo(ip, SourceRDNS, []string{host})
+```
+
+rDNS 关键参数（`addrproc.go:129-141`）：
+- `defaultQueueSize = 255`：IP 处理队列大小
+- `defaultCacheSize = 10_000`：rDNS 缓存容量
+- `defaultIPTTL = 1 * time.Hour`：rDNS 结果缓存 1 小时
+
+**路径 4：ARP/NDP 邻居表**
+
+**文件**：`internal/arpdb/arpdb.go` → `Neighbor` 结构
+
+```go
+type Neighbor struct {
+    Name string          // 主机名（非所有平台都能获取）
+    IP   netip.Addr      // IPv4 或 IPv6
+    MAC  net.HardwareAddr // 硬件地址
+}
+```
+
+触发时机：**每 10 分钟定时刷新**
+
+`internal/home/clients.go:311` → `arpClientsUpdatePeriod = 10 * time.Minute`
+
+`internal/client/storage.go:244-270` → `refreshARP()`
+
+```go
+func (s *Storage) refreshARP(ctx) {
+    ...
+    ns := s.arpDB.Neighbors()  // 从系统 NDP/ARP 表读取
+    ...
+    src := SourceARP
+    s.runtimeIndex.clearSource(src)  // 先清空所有 ARP 来源
+
+    for _, n := range ns {
+        s.runtimeIndex.setInfo(n.IP, src, []string{n.Name})
+        // ⚠️ 注意：这里只写入了 Name（主机名），没有写入 MAC！
+    }
+
+    s.runtimeIndex.removeEmpty()
+}
+```
+
+> **重要发现**：ARP/NDP 刷新时 `setInfo` 只传了 `Name`，**没有将 MAC 地址写入 runtimeIndex**。这意味着 SLAAC 环境下，即使通过 NDP 知道了 IPv6 地址对应的 MAC，也无法用于 `findByMAC` 匹配持久化客户端。ARP 来源在 runtimeIndex 中只提供主机名，不提供 IP→MAC 的桥接能力。
+
+#### 3.8.4 混合模式下的完整识别路径对比
+
+同一台客户端同时拥有 DHCPv6 地址和 SLAAC 地址时，两条路径并行：
+
+| 识别维度 | DHCPv6 地址 | SLAAC 地址 |
+|---------|------------|-----------|
+| IP→MAC 桥接 | ✅ `MACByIP()` 直接返回 | ❌ 需通过 ARP/NDP（但不写入 MAC 到 runtimeIndex） |
+| Hostname 补全 | ✅ `HostByIP()` 从租约读取 | ✅ 通过 rDNS 或 ARP/NDP 的 Name 字段 |
+| 匹配按 MAC 的持久化客户端 | ✅ 能匹配 | ❌ 不能匹配（无 MAC 桥接） |
+| 匹配按 IP 的持久化客户端 | ✅ 能匹配 | ✅ 能匹配（直接按 IP） |
+| 匹配按子网的持久化客户端 | ✅ 能匹配 | ✅ 能匹配 |
+| 信息更新延迟 | 租约更新即更新 | rDNS 1 小时缓存 / ARP 10 分钟刷新 |
+| 信息可靠性 | 高（DHCP 协议保证） | 中（依赖 DNS/邻居表） |
+
+#### 3.8.5 实际请求路径时序（SLAAC 地址首次 DNS 查询）
+
+```
+T0: 客户端通过 SLAAC 生成 2001:db8::abcd，首次发送 DNS 查询到 AdGuard Home
+
+T0.001s: processInitial 阶段
+        ├── processClientIP(2001:db8::abcd) → addrProc 入队（异步）
+        └── clientRequestFilteringSettings()
+              └── ApplyClientFiltering(id, addr, setts)
+                    ├── findByClientID() → 未命中
+                    ├── findByIP() → 未命中
+                    ├── findBySubnet() → 可能命中（按子网配置）
+                    ├── s.dhcp.MACByIP(addr) → 返回 nil（无 DHCPv6 租约）
+                    └── findByMAC → 不触发（没有 MAC）
+              → 应用全局默认设置或子网级设置
+        → DNS 请求被正常处理
+
+T0.05s: addrProc goroutine 从队列取出 2001:db8::abcd
+        ├── rdns.Process() → 发起 PTR 查询
+        └── WHOIS 查询（如果启用）
+
+T0.1s: rDNS 返回结果 "client-pc.localdomain"
+        └── addrUpdater.UpdateAddress()
+              └── runtimeIndex.setInfo(2001:db8::abcd, SourceRDNS, ["client-pc.localdomain"])
+
+T1: 客户端第二次 DNS 查询
+        └── ApplyClientFiltering → 仍走相同路径
+              └── ClientRuntime() → 现在有 SourceRDNS 的主机名
+                    → 但 Hostname 仅用于日志展示，不用于策略匹配
+                    → 策略叠加仍依赖 IP/子网/ClientID
+```
+
+#### 3.8.6 SLAAC 环境下的策略匹配限制
+
+**核心限制：SLAAC 地址无法通过 MAC 匹配持久化客户端**
+
+原因链：
+1. SLAAC 地址不在 DHCP 租约中 → `dhcp.MACByIP()` 返回 nil
+2. ARP/NDP 邻居表虽然有 MAC，但 `refreshARP()` 只写入 Name，不写入 MAC 到 runtimeIndex
+3. `ApplyClientFiltering` 中的 `findByIP` 失败后，没有其他 IP→MAC 的转换路径
+4. 最终 `findByMAC` 不触发 → 按 MAC 配置的持久化客户端对 SLAAC 地址无效
+
+**SLAAC 环境下有效的策略配置方式**：
+- ✅ 按 IP 地址配置（手动指定 SLAAC 地址）
+- ✅ 按子网/CIDR 配置（匹配整个前缀）
+- ✅ 按 ClientID 配置（DNS-over-HTTPS/QUIC 等带 ClientID 的协议）
+- ❌ 按 MAC 配置（DHCP 链路不通，ARP/NDP 链路不用于策略匹配）
+
+---
+
 ## 四、客户端识别（查询日志补全）
 
 ### 4.1 客户端信息来源优先级
@@ -1214,6 +1536,12 @@ DNS 请求        dnsforward          filtering          client/storage        d
 | 查询日志请求级缓存 | `internal/querylog/client.go` | `clientCache/clientCacheKey` |
 | 策略叠加 | `internal/client/storage.go` | `ApplyClientFiltering()` |
 | DHCP 刷新触发 | `internal/home/clientshttp.go` | `handleGetClients`（访问 `/control/clients` 时调用 `UpdateDHCP`） |
+| DHCPv4 relay 支持 | `internal/dhcpsvc/v4.go` | `newIPv4UDPLayers()`（giaddr 路由）、`respondNAK`（广播位处理） |
+| rDNS 反向解析地址处理器 | `internal/client/addrproc.go` | `DefaultAddrProc/processRDNS/Process`（异步队列 + 1h 缓存） |
+| ARP/NDP 邻居表 | `internal/arpdb/arpdb.go` | `Neighbor/Interface`（支持 IPv4+IPv6） |
+| ARP 刷新定时 | `internal/client/storage.go` | `refreshARP()`（每 10 分钟全量刷新） |
+| DNS 请求触发 rDNS | `internal/dnsforward/process.go` | `processClientIP()`（每次 DNS 请求异步入队） |
+| SLAAC 模式配置 | `internal/dhcpsvc/v6.go` | `RASLAACOnly/RAAllowSLAAC`（三模式） |
 
 ---
 
@@ -1242,3 +1570,7 @@ DNS 请求        dnsforward          filtering          client/storage        d
 11. **双栈 hostname 索引冲突 BUG**：IPv4 和 IPv6 共享同一个 `leaseIndex.byName` 哈希表，同一客户端（同 MAC 同 Hostname）同时获取 v4/v6 租约时，v6 的 `byName` 写入会因冲突检测失败被丢弃，导致 v6 IP 的 Hostname 补全和 `IPByHost` 反向映射失效（仅 v4 可见），但 `byAddr` 的 MAC 解析不受影响
 
 12. **主备部署识别割裂**：多台 AdGuard Home 作为 DHCP 主备部署时，实例之间无租约同步机制，客户端识别链路仅连接当前实例的 DHCP 服务，备机分配的租约在主机上不可见，按 IP/Hostname 匹配策略会失效，仅按 MAC 配置的持久化客户端在两台机器上都能可靠匹配
+
+13. **DHCPv4 relay 透明支持**：DHCPv4 中继场景下 CHADDR 字段保留客户端真实 MAC，租约写入和客户端识别链路完全不受影响，`MACByIP`/`HostByIP` 正常工作。但不支持 Option 82 中继代理信息，无法基于 relay 端口做细粒度区分；DHCPv6 relay 完全不支持（消息类型未实现），IPv6 跨子网环境下租约无法创建
+
+14. **SLAAC 环境下 IP→MAC 桥接断裂**：SLAAC 地址不在 DHCP 租约中，`dhcp.MACByIP()` 直接失效。替代路径有四条：持久化客户端（按 IP/子网）、hosts 文件、rDNS 反向解析（每次 DNS 请求异步触发，1 小时缓存）、ARP/NDP 邻居表（每 10 分钟刷新）。核心限制是 **ARP/NDP 刷新只写入主机名不写入 MAC**，导致 SLAAC 地址无法通过 MAC 匹配持久化客户端，按 MAC 配置的策略在纯 SLAAC 环境下完全失效
