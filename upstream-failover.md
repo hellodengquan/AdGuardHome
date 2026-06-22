@@ -730,7 +730,353 @@ DNSSEC 在整个链路中只影响**三件事**：
 
 ---
 
-## 10 代码索引
+## 10 补充细节三：私有反向 DNS 请求路径与上游回退的关系
+
+私有反向 DNS（Private RDNS）请求是 dnsproxy 中一类特殊处理的请求，它从请求入口就走上完全独立的路径，并且**永远不会触发 Fallback**。理解这条路径需要追踪从 `handleDNSRequest` 到 `replyFromUpstream` 的完整调用链。
+
+### 10.1 入口识别：`isForbiddenARPA`
+
+**代码位置**：`dnsproxy/proxy/server.go:123-150` — `DNSContext.isForbiddenARPA()`
+
+```go
+func (dctx *DNSContext) isForbiddenARPA(
+    privateNets netutil.SubnetSet,
+    l *slog.Logger,
+) (ok bool) {
+    q := dctx.Req.Question[0]
+    switch q.Qtype {
+    case dns.TypePTR, dns.TypeSOA, dns.TypeNS:
+        // 只处理 PTR / SOA / NS 三种类型
+    default:
+        return false
+    }
+
+    // 从 ARPA 域名中提取反向地址前缀
+    requestedPref, err := netutil.ExtractReversedAddr(q.Name)
+    if err != nil {
+        return false
+    }
+
+    // 反向地址在私有网段内 → 标记为私有 RDNS 请求
+    if privateNets.Contains(requestedPref.Addr()) {
+        dctx.RequestedPrivateRDNS = requestedPref  // 关键标记！
+        return !dctx.IsPrivateClient  // 公网客户端请求私有 ARPA → 直接拒绝
+    }
+
+    return false
+}
+```
+
+这个函数在 `validateRequest`（`proxy.go:760-788`）中被调用，位置在 `Resolve()` 之前：
+
+```go
+// proxy.go:760-784
+func (p *Proxy) validateRequest(d *DNSContext) (resp *dns.Msg) {
+    switch {
+    // ...
+    case d.isForbiddenARPA(p.privateNets, p.logger):
+        p.logger.Debug("private arpa domain is requested", ...)
+        return p.messages.NewMsgNXDOMAIN(d.Req)  // 公网客户端 → 直接 NXDOMAIN
+    // ...
+    }
+}
+```
+
+**两层过滤**：
+1. **公网客户端请求私有 ARPA** → 直接返回 NXDOMAIN，根本走不到 `Resolve()`
+2. **内网客户端请求私有 ARPA** → 通过校验，设置 `RequestedPrivateRDNS` 标记，进入 `Resolve()`
+
+### 10.2 `selectUpstreams` 中的分支
+
+**代码位置**：`dnsproxy/proxy/proxy.go:549-562`
+
+```go
+func (p *Proxy) selectUpstreams(
+    d *DNSContext,
+) (upstreams []upstream.Upstream, isPrivate bool) {
+    // ── 第一优先级分支 ──────────────────────────────────────
+    if d.RequestedPrivateRDNS != (netip.Prefix{}) || p.shouldStripDNS64(d.Req) {
+        private := p.PrivateRDNSUpstreamConfig
+        if p.UsePrivateRDNS && d.IsPrivateClient && private != nil {
+            upstreams = private.getUpstreamsForDomain(host)
+        }
+        return upstreams, true  // ② isPrivate = true！
+    }
+    // ────────────────────────────────────────────────────────
+
+    // 后续分支（自定义上游、默认上游）永远不会走到
+    // ...
+}
+```
+
+**关键点**：
+- `RequestedPrivateRDNS` 非空时，直接进入私有 RDNS 分支
+- 返回的第二个值 `isPrivate = true`，这个标记决定了后续的回退行为
+- 私有上游组来自 `PrivateRDNSUpstreamConfig`，与主上游 `UpstreamConfig` 完全独立
+
+### 10.3 为何不走 Fallback：`replyFromUpstream` 中的判断
+
+**代码位置**：`dnsproxy/proxy/proxy.go:581-621`
+
+```go
+func (p *Proxy) replyFromUpstream(d *DNSContext) (ok bool, err error) {
+    req := d.Req
+
+    upstreams, isPrivate := p.selectUpstreams(d)
+    if len(upstreams) == 0 {
+        d.Res = p.messages.NewMsgNXDOMAIN(req)
+        return false, fmt.Errorf("selecting upstream: %w", upstream.ErrNoUpstreams)
+    }
+
+    if isPrivate {
+        p.recDetector.add(d.Req)  // 加入递归检测，防止 PTR → A → PTR 循环
+    }
+
+    // ① 查询私有上游
+    resp, u, err := p.exchangeUpstreams(req, wrapped)
+
+    // ── Fallback 触发条件 ──────────────────────────────────
+    //     err != nil       → 主上游全部失败
+    // && !isPrivate       → 不是私有请求  ← 关键条件！
+    // && p.Fallbacks != nil → 配置了 fallback
+    // ──────────────────────────────────────────────────────
+    if err != nil && !isPrivate && p.Fallbacks != nil {
+        resp, u, err = upstream.ExchangeParallel(wrappedFallbacks, req)
+    }
+    // ...
+}
+```
+
+**`!isPrivate` 这个条件直接锁死了私有 RDNS 的 Fallback 路径**。即使 `PrivateRDNSUpstreamConfig` 中的所有上游都失败，`err != nil`，只要 `isPrivate == true`，Fallback 分支就不会执行。
+
+### 10.4 设计意图与安全考虑
+
+为什么私有 RDNS 故意不走 Fallback？从代码和 RFC 规范中可以找到三个理由：
+
+1. **隐私保护（RFC 6761 § 6.1）**：私有地址的反向解析（如 `1.168.192.in-addr.arpa`）属于内网信息，不应泄漏到公网 DNS。如果内网 DNS 失败，直接返回 SERVFAIL 比发给 Quad9/Cloudflare 等公网 Fallback 更安全。
+
+2. **避免无效流量**：公网 DNS 不可能知道 `10.0.0.1` 对应的主机名，查询注定失败，徒增延迟。
+
+3. **防止 DNS 泄漏**：企业内网的命名方案（如 `server1.dc1.corp.local`）通过 PTR 查询可能泄漏内部网络结构，这在安全上是敏感信息。
+
+### 10.5 完整路径对比
+
+| 路径 | 普通公网 DNS 请求 | 私有 RDNS 请求（内网客户端） |
+|------|------------------|----------------------------|
+| 入口识别 | 无特殊标记 | `isForbiddenARPA` 设置 `RequestedPrivateRDNS` |
+| 上游选择 | 自定义 → 默认上游 | 直接走 `PrivateRDNSUpstreamConfig` |
+| `isPrivate` 标记 | `false` | `true` |
+| Fallback 触发 | 满足条件时触发 | **永远不触发** |
+| 缓存 | 支持（除非 CD 位） | **不缓存**（`cacheWorks()` 中 `RequestedPrivateRDNS != {}` 直接返回 false） |
+| 全部失败时 | SERVFAIL（经过 Fallback 后） | SERVFAIL（直接） |
+
+---
+
+## 11 补充细节四：DoT/DoH 加密上游与传统 UDP 上游混合配置的健康度判定差异
+
+当用户在 AdGuard Home 中混合配置多种协议的上游时（如同时配置 `udp://1.1.1.1` 和 `tls://1.1.1.1` 和 `https://1.1.1.1/dns-query`），健康度判定机制在表面上使用同一套 RTT 统计逻辑，但实际上由于 **地址标识差异**、**连接开销差异** 和 **失败重试机制差异**，三种上游的"健康度"表现差异巨大。
+
+### 11.1 地址标识：同一 IP，不同协议 = 不同的 RTT 统计键
+
+健康度统计的核心是 `p.upstreamRTTStats` map，其 key 是上游的 `Address()` 返回值。不同协议的 `Address()` 实现不同，导致即使是同一个 IP，不同协议的 RTT 统计**完全独立**。
+
+**代码位置**：各协议的 `Address()` 方法
+
+```go
+// Plain UDP（plain.go:76-85）
+func (p *plainDNS) Address() string {
+    switch p.net {
+    case networkUDP:
+        return p.addr.Host  // → "1.1.1.1"（只有 IP，无 scheme）
+    case networkTCP:
+        return p.addr.String()  // → "tcp://1.1.1.1:53"
+    }
+}
+
+// DoT（dot.go:89）
+func (p *dnsOverTLS) Address() string {
+    return p.addr.String()  // → "tls://1.1.1.1:853"
+}
+
+// DoH（doh.go:151）
+func (p *dnsOverHTTPS) Address() string {
+    return p.addrRedacted  // → "https://1.1.1.1/dns-query"（密码脱敏）
+}
+
+// DoQ（doq.go:167）
+func (p *dnsOverQUIC) Address() string {
+    return p.addr.String()  // → "quic://1.1.1.1:853"
+}
+```
+
+**结果**：对于同一个服务器 1.1.1.1，四种协议在 `upstreamRTTStats` map 中是四个**独立的 key**，各自维护独立的 RTT 统计：
+
+```
+p.upstreamRTTStats = {
+    "1.1.1.1":                      {rttSum: X, reqNum: Y},    // UDP
+    "tcp://1.1.1.1:53":             {rttSum: X, reqNum: Y},    // TCP
+    "tls://1.1.1.1:853":            {rttSum: X, reqNum: Y},    // DoT
+    "https://1.1.1.1/dns-query":    {rttSum: X, reqNum: Y},    // DoH
+}
+```
+
+`calcWeights()`（`exchange.go:129`）按 index 遍历时，每个上游查各自的统计：
+
+```go
+func (p *Proxy) calcWeights(ups []upstream.Upstream) (weights []float64) {
+    for _, u := range ups {
+        stat := p.upstreamRTTStats[u.Address()]  // 按协议独立的 key 查找
+        // ...
+    }
+}
+```
+
+### 11.2 RTT 基线差异：加密协议的握手开销
+
+`exchange()` 方法中计时的 `dur` 包含了从调用 `u.Exchange(req)` 到返回的**全部时间**：
+
+**代码位置**：`dnsproxy/proxy/exchange.go:75-105`
+
+```go
+func (p *Proxy) exchange(
+    u upstream.Upstream,
+    req *dns.Msg,
+) (resp *dns.Msg, dur time.Duration, err error) {
+    startTime := p.time.Now()
+    resp, err = u.Exchange(req)       // 这里包含了所有协议开销
+    dur = p.time.Now().Sub(startTime)  // 总耗时
+    // ...
+    if err == nil {
+        p.updateRTT(u.Address(), dur)  // 成功 → 用总耗时更新
+    } else {
+        p.updateRTT(u.Address(), defaultTimeout)  // 失败 → 10s 惩罚
+    }
+}
+```
+
+**三种协议的 RTT 构成差异**：
+
+| 协议 | 首次请求 RTT 构成 | 后续请求 RTT 构成 | 典型基线 |
+|------|-----------------|-----------------|----------|
+| **UDP** | UDP 传输 + DNS 处理（~10-50ms） | 同首次（每次新建） | ~20ms |
+| **TCP** | TCP 三次握手（~RTT×1.5） + DNS 处理 | 同首次（每次新建） | ~30ms |
+| **DoT** | TCP 握手 + TLS 握手（~RTT×3-4） + DNS 处理 | 连接复用（仅 DNS 处理） | 首次 ~80ms，复用后 ~20ms |
+| **DoH** | TCP + TLS + HTTP/2 握手（~RTT×4） + DNS 处理 | 连接复用（HTTP/2 流复用） | 首次 ~100ms，复用后 ~25ms |
+| **DoQ** | QUIC 握手（~RTT×1-2，支持 0-RTT） + DNS 处理 | 连接复用（QUIC 流复用） | 首次 ~40ms，复用后 ~20ms |
+
+**对权重的影响**：
+- **冷启动阶段**：UDP 权重最高（平均 RTT 最小）→ 被优先选中 → UDP 的统计样本越来越多 → 权重差距拉大
+- **热运行阶段**：加密协议连接建立后，后续请求的 RTT 与 UDP 接近 → 权重逐渐追平 → 开始竞争
+- **失败惩罚**：所有协议失败时统一用 `defaultTimeout`（10s）惩罚，对原本 RTT 小的 UDP 权重打击更大（从 1/20ms 降到 1/10000ms，权重下降 500 倍）
+
+### 11.3 失败重试机制差异：加密协议的"内部重试"
+
+加密协议（DoT/DoH/DoQ）在 `Exchange()` 内部有自己的重试逻辑，**这些重试的耗时会计入总 RTT**，但对上层 `exchangeUpstreams` 来说是透明的。
+
+**DoT 内部重试**（`dot.go:92-132`）：
+
+```go
+func (p *dnsOverTLS) Exchange(req *dns.Msg) (reply *dns.Msg, err error) {
+    conn, err := p.conn(h)  // 从池取连接
+    reply, err = p.exchangeWithConn(conn, req)
+    if err != nil {
+        // 池中的坏连接 → 关闭并新建重试
+        err = errors.WithDeferred(err, conn.Close())
+        conn, err = tlsDial(h, p.tlsConf.Clone())  // 新建连接（含握手）
+        reply, err = p.exchangeWithConn(conn, req)
+    }
+    p.putBack(conn)
+    return reply, nil
+}
+```
+
+**DoH 内部重试**（`doh.go:154-202`）：
+
+```go
+func (p *dnsOverHTTPS) Exchange(req *dns.Msg) (resp *dns.Msg, err error) {
+    client, isCached, err := p.getClient()
+    resp, err = p.exchangeHTTPS(client, req)
+
+    // 缓存 client 出现超时 / QUIC 错误 → 最多重置 client 并重试 2 次
+    for i := 0; isCached && p.shouldRetry(err) && i < 2; i++ {
+        client, err = p.resetClient(err)  // 关闭旧 client，重建（含握手）
+        resp, err = p.exchangeHTTPS(client, req)
+    }
+    // ...
+}
+```
+
+**DoQ 内部重试**（`doq.go:170-223`）：
+
+```go
+func (p *dnsOverQUIC) Exchange(req *dns.Msg) (resp *dns.Msg, err error) {
+    conn, cached, err := p.getConnection()  // 复用缓存连接
+    resp, err = p.exchangeQUIC(req, conn)
+
+    if cached && err != nil {
+        // 缓存连接坏了 → 关闭并重建
+        p.closeConnWithError(conn, err)
+        conn, _, err = p.getConnection()  // 新建 QUIC 连接（含握手）
+        resp, err = p.exchangeQUIC(req, conn)
+    }
+    // ...
+}
+```
+
+**对健康度判定的影响**：
+1. **RTT 膨胀**：加密协议的内部重试会计入 `dur`，导致其平均 RTT 高于实际 DNS 查询时间。UDP 失败时直接返回 error，不会内部重试。
+2. **成功率高估**：加密协议通过内部重试"消化"了部分失败，上层 `exchangeUpstreams` 看到的 `err == nil` 比例更高 → 更少触发 10s 惩罚。
+3. **UDP 的"脆弱性"**：UDP 没有内部重试，一次网络丢包就直接失败 → 立即触发 10s 惩罚 → 权重骤降。
+
+### 11.4 连接池对"平均 RTT"的影响
+
+第 8 章详细介绍了各协议的连接池模型，这些模型直接影响 RTT 统计的分布：
+
+| 协议 | 连接池模型 | 对 RTT 统计的影响 |
+|------|-----------|------------------|
+| **UDP** | 无连接池，每次新建 | RTT 分布稳定，波动小 |
+| **DoT** | FILO 池，最多保留 N 条连接 | 池命中时 RTT 低（~20ms），池空/坏连接时 RTT 高（~80ms）→ **双峰分布** |
+| **DoH** | `http.Transport` LRU 池，`MaxConnsPerHost=2` | 同 DoT，HTTP/2 流复用进一步降低后续请求开销 |
+| **DoQ** | 单连接 + 多 Stream 复用 | 连接建立后 RTT 极低且稳定，连接失效时所有并发请求同时失败 → **全有或全无** |
+
+**权重计算的公平性问题**：`calcWeights()` 用**算术平均** RTT，对双峰分布不友好。DoT/DoH 偶尔出现的 80ms（建连）会拉高平均值，而 UDP 稳定的 20ms 平均值更优。这导致在冷启动或网络抖动时，UDP 始终获得更高权重，加密协议即使 99% 的请求很快，只要有 1% 的建连开销，平均权重就被拉低。
+
+### 11.5 混合配置时的实际行为示例
+
+假设用户配置：
+
+```yaml
+upstream_dns:
+  - udp://1.1.1.1:53
+  - tls://1.1.1.1:853
+  - https://1.1.1.1/dns-query
+```
+
+**冷启动阶段（前 10 个请求）**：
+
+| 请求 # | 选中上游 | 原因 | 实际 RTT | 更新后平均 RTT |
+|--------|---------|------|----------|---------------|
+| 1 | 随机（权重都是 1） | 无历史数据 | 假设选中 UDP，20ms | UDP: 20ms, DoT: -, DoH: - |
+| 2 | UDP（权重 1/20=0.05，其余 1） | UDP 有数据，权重略低 | UDP，20ms | UDP: 20ms |
+| 3 | 随机（DoT/DoH 权重 1 高于 UDP 0.05） | 新上游权重默认 1 | 假设选中 DoT，首次建连 80ms | DoT: 80ms，权重 1/80=0.0125 |
+| 4 | UDP（0.05 最高） | UDP 权重最高 | UDP，20ms | UDP: 20ms |
+| 5 | DoH（权重 1） | DoH 还没数据 | DoH，首次建连 100ms | DoH: 100ms，权重 0.01 |
+
+**结果**：冷启动阶段 UDP 占据绝对优势，因为加密协议的首次建连开销拉低了权重。
+
+**热运行阶段（100+ 请求后，连接池稳定）**：
+
+| 上游 | 成功请求占比 | 平均 RTT | 权重 |
+|------|------------|----------|------|
+| UDP | 100%（无内部重试） | 20ms | 0.05 |
+| DoT | 99%（1% 内部重试消化） | 25ms（含偶发建连） | 0.04 |
+| DoH | 99% | 30ms（HTTP/2 开销） | 0.033 |
+
+**结果**：UDP 权重仍然最高，但差距缩小。一旦 UDP 出现一次超时（网络波动），立即被惩罚到 10000ms 平均 RTT，权重骤降到 0.0001，此时 DoT/DoH 会接管所有请求，直到 UDP 的平均 RTT 被后续成功请求逐渐拉低。
+
+---
+
+## 12 代码索引
 
 | 模块 | 文件 | 行号 | 函数/类型 | 说明 |
 |------|------|------|----------|------|
@@ -767,3 +1113,17 @@ DNSSEC 在整个链路中只影响**三件事**：
 | DNSSEC | `dnsproxy/proxy/cache.go` | 536-552 | `msgToKey()` | 缓存 key 包含 DO 位 |
 | DNSSEC | `dnsproxy/proxy/proxy.go` | 741-744 | `Resolve()` 内缓存写入条件 | CD 位为 1 时不写缓存 |
 | DNSSEC | `dnsproxy/proxy/proxy.go` | 805-816 | `cacheWorks()` | CD 位为 1 时不读缓存 |
+| 私有 RDNS | `dnsproxy/proxy/server.go` | 123-150 | `DNSContext.isForbiddenARPA()` | 入口识别私有 ARPA 请求，设置 `RequestedPrivateRDNS` |
+| 私有 RDNS | `dnsproxy/proxy/proxy.go` | 760-784 | `Proxy.validateRequest()` | 公网客户端请求私有 ARPA 直接返回 NXDOMAIN |
+| 私有 RDNS | `dnsproxy/proxy/proxy.go` | 549-562 | `Proxy.selectUpstreams()` | 私有 RDNS 分支，返回 `isPrivate=true` |
+| 私有 RDNS | `dnsproxy/proxy/proxy.go` | 581-621 | `Proxy.replyFromUpstream()` | `!isPrivate` 条件锁死 fallback 路径 |
+| 私有 RDNS | `dnsproxy/proxy/proxy.go` | 805-808 | `cacheWorks()` | 私有 RDNS 请求不缓存 |
+| 混合健康度 | `dnsproxy/upstream/plain.go` | 76-85 | `plainDNS.Address()` | UDP 返回 `Host`（"1.1.1.1"），TCP 返回完整 URL |
+| 混合健康度 | `dnsproxy/upstream/dot.go` | 89 | `dnsOverTLS.Address()` | 返回 `tls://host:853` |
+| 混合健康度 | `dnsproxy/upstream/doh.go` | 151 | `dnsOverHTTPS.Address()` | 返回脱敏后的 `https://...` URL |
+| 混合健康度 | `dnsproxy/upstream/doq.go` | 167 | `dnsOverQUIC.Address()` | 返回 `quic://host:853` |
+| 混合健康度 | `dnsproxy/proxy/exchange.go` | 75-105 | `Proxy.exchange()` | 计时包含全部协议开销，更新 RTT |
+| 混合健康度 | `dnsproxy/proxy/exchange.go` | 127-146 | `Proxy.calcWeights()` | 用算术平均 RTT 计算权重 |
+| 混合健康度 | `dnsproxy/upstream/dot.go` | 92-132 | `dnsOverTLS.Exchange()` | 内部重试逻辑，失败后重建连接 |
+| 混合健康度 | `dnsproxy/upstream/doh.go` | 154-202 | `dnsOverHTTPS.Exchange()` | 内部重试，最多 resetClient 两次 |
+| 混合健康度 | `dnsproxy/upstream/doq.go` | 170-223 | `dnsOverQUIC.Exchange()` | 内部重试，缓存连接坏了重建 |
