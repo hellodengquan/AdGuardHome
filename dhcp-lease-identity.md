@@ -1186,6 +1186,371 @@ T1: 客户端第二次 DNS 查询
 
 ---
 
+### 3.9 租约持久化写盘失败时的回滚路径
+
+#### 3.9.1 持久化原子性保障：`maybe.WriteFile`
+
+写盘使用的是 `github.com/google/renameio/v2/maybe` 库，这本身提供了**文件级别的原子性**：
+
+`internal/dhcpsvc/db.go:197-201`
+
+```go
+err = maybe.WriteFile(idx.dbFilePath, buf, databasePerm)
+if err != nil {
+    // Don't wrap the error since it's informative enough as is.
+    return err
+}
+```
+
+`maybe.WriteFile` 的工作原理：
+1. 先将 JSON 内容写入临时文件（`dbFilePath.tmp-*`）
+2. `fsync` 确保临时文件落盘
+3. 通过 `rename()` 原子替换目标文件
+
+因此**磁盘文件本身不会出现半写损坏**：要么是旧的完整内容，要么是新的完整内容。但问题出在**内存与磁盘的一致性**上。
+
+#### 3.9.2 `add()` 写入失败的一致性分析
+
+`internal/dhcpsvc/leaseindex.go:76-105`
+
+```go
+func (idx *leaseIndex) add(ctx, logger, l, iface) (err error) {
+    // 步骤 1: 冲突检测（只读）
+    if _, ok := idx.byAddr[l.IP]; ok {
+        return fmt.Errorf("lease for ip %s already exists", l.IP)
+    } else if _, ok = idx.byName[loweredName]; ok {
+        return fmt.Errorf("lease for hostname %s already exists", l.Hostname)
+    }
+
+    // 步骤 2: 写入接口层 MAC 索引
+    err = iface.addLease(l)       // iface.leases[macKey] = l
+    if err != nil { return err }  // ← 失败：byAddr/byName/db 都未写，没问题
+
+    // 步骤 3: 写入全局 IP 索引
+    idx.byAddr[l.IP] = l
+
+    // 步骤 4: 写入全局 hostname 索引
+    idx.byName[loweredName] = l
+
+    // 步骤 5: 持久化到磁盘
+    err = idx.dbStore(ctx, logger)
+    if err != nil {
+        return err                // ⚠️ 失败：MAC/IP/hostname 都已写入内存，但磁盘还是旧的！
+    }
+
+    return nil
+}
+```
+
+**写盘失败的后果**：
+- ✅ 磁盘文件：还是旧内容（`maybe.WriteFile` 原子性保证）
+- ❌ 内存状态：`iface.leases`、`idx.byAddr`、`idx.byName` 都已经写入了新租约
+- ❌ 无回滚：返回 error，但**没有 undo 步骤 2/3/4 的操作**
+- ❌ 调用者（`handleSelecting`）收到 error 会 respondNAK 拒绝客户端，但内存已脏
+
+**客户端识别影响**：
+- 写盘失败后，`MACByIP()` 和 `HostByIP()` 能查到这条新租约（因为在内存里）
+- 客户端识别链路在当前进程内是正常的 ✅
+- 如果此时进程崩溃或重启，这条租约会丢失（磁盘上没有）❌
+- 重启后客户端识别链路找不到这条租约，之前匹配到的策略会失效
+
+#### 3.9.3 `remove()` 删除失败的一致性分析
+
+`internal/dhcpsvc/leaseindex.go:113-142`
+
+```go
+func (idx *leaseIndex) remove(ctx, logger, l, iface) (err error) {
+    // 步骤 1: 存在性检查（只读）
+    if _, ok := idx.byAddr[l.IP]; !ok { return error }
+    if _, ok := idx.byName[loweredName]; !ok { return error }
+
+    // 步骤 2: 从接口层 MAC 索引删除
+    err = iface.removeLease(l)    // delete(iface.leases, macKey)
+    if err != nil { return err }
+
+    // 步骤 3: 从全局 IP 索引删除
+    delete(idx.byAddr, l.IP)
+
+    // 步骤 4: 从全局 hostname 索引删除
+    delete(idx.byName, loweredName)
+
+    // 步骤 5: 持久化到磁盘
+    err = idx.dbStore(ctx, logger)
+    if err != nil {
+        return err                // ⚠️ 失败：三个索引都已删除，但磁盘还是旧内容！
+    }
+
+    return nil
+}
+```
+
+**写盘失败的后果（与 add 相反）**：
+- ✅ 磁盘文件：还是旧内容（包含被删的租约）
+- ❌ 内存状态：三个索引都已删除，当前进程查不到这条租约
+- ❌ 无回滚：如果写盘失败，不会把租约加回内存索引
+- ❌ 典型场景：DHCPRELEASE 或 DHCPDECLINE 调用 remove，写盘失败后
+
+**客户端识别影响**：
+- 写盘失败后，当前进程内 `MACByIP()` 和 `HostByIP()` 查不到这条租约
+- 客户端识别链路在当前进程内找不到对应客户端，退回全局策略 ❌
+- 如果重启，租约会"复活"（磁盘上还在），又能被识别到 ⚠️（不一致但反而恢复了）
+
+#### 3.9.4 `update()` 更新失败的一致性分析——最危险
+
+`internal/dhcpsvc/leaseindex.go:147-183`
+
+```go
+func (idx *leaseIndex) update(ctx, logger, l, iface) (err error) {
+    // 步骤 1: 冲突检测
+    existing, ok := idx.byAddr[l.IP]
+    if ok && !slices.Equal(l.HWAddr, existing.HWAddr) { return error }
+    existing, ok = idx.byName[loweredName]
+    if ok && !slices.Equal(l.HWAddr, existing.HWAddr) { return error }
+
+    // 步骤 2: 接口层更新（替换旧指针为新指针）
+    prev, err := iface.updateLease(l)  // iface.leases[macKey] = l，返回 prev
+    if err != nil { return err }
+
+    // 步骤 3: 持久化到磁盘
+    err = idx.dbStore(ctx, logger)
+    if err != nil {
+        return err                     // ⚠️ 危险！接口层已替换，但全局索引还没更新
+    }
+
+    // 步骤 4: 删除旧的全局索引条目
+    delete(idx.byAddr, prev.IP)
+    delete(idx.byName, strings.ToLower(prev.Hostname))
+
+    // 步骤 5: 写入新的全局索引条目
+    idx.byAddr[l.IP] = l
+    idx.byName[loweredName] = l
+
+    return nil
+}
+```
+
+**写盘失败的后果（更严重）**：
+- ✅ 磁盘文件：还是旧内容
+- ⚠️ `iface.leases[macKey]`：已经替换成了新的 Lease 指针 l
+- ❌ `idx.byAddr`：还指向旧 Lease（prev），或者根本没有这个 key（如果 IP 变了）
+- ❌ `idx.byName`：还指向旧 Lease（prev），或者根本没有这个 key（如果 Hostname 变了）
+- ❌ **全局索引与接口层索引分叉**：按 MAC 查（`iface.leases[macKey]`）能拿到新租约，但按 IP/Hostname 查还是旧租约
+
+**客户端识别影响（续约场景）**：
+- 典型场景：`updateAndRespond()` → `updateLease` → 续约时 Hostname 变化
+- 写盘失败后：
+  - `HostByIP(oldIP)` → 返回旧 Hostname（byName 未更新）❌
+  - `MACByIP(oldIP)` → 可能返回正确 MAC（如果 IP 没变，byAddr 指向 prev 但 prev.MAC 相同）✅
+  - 如果 IP 同时变化：`MACByIP(newIP)` → 返回 nil（byAddr 中只有 prev.IP）❌
+- 内部状态不一致，同一条租约通过不同查询路径得到不同结果
+
+#### 3.9.5 上层调用者的处理方式
+
+调用 `add`/`remove`/`update` 的地方处理方式一致，以 `handleSelecting` 为例：
+
+`internal/dhcpsvc/handler4.go:223-233`
+
+```go
+// Commit the lease and send ACK.
+lease.Hostname = hostname4(req)
+err := iface.updateLease(ctx, lease)   // → idx.update()
+if err != nil {
+    l.ErrorContext(ctx, "updating lease", slogutil.KeyError, err)  // 仅记录错误日志
+    iface.respondNAK(ctx, req, fd, idOpt)                         // 发送 NAK 拒绝客户端
+
+    return
+}
+
+iface.respondACK(ctx, req, fd, lease, idOpt)
+```
+
+共同特征：
+1. **`ErrorContext` 打日志**：记录写盘失败错误，便于排查
+2. **发送 NAK 给客户端**：拒绝本次请求，客户端会重试
+3. **不做回滚**：完全信任内存状态，不尝试恢复
+
+#### 3.9.6 一致性状态矩阵
+
+| 操作 | 写盘失败时内存状态 | 写盘失败时磁盘状态 | 重启后恢复结果 | 当前进程内识别可靠性 |
+|------|-----------------|-----------------|--------------|------------------|
+| `add()` | 已添加新租约 | 还是旧内容（无新租约） | 新租约丢失 | ✅ 正常（内存有） |
+| `remove()` | 已删除租约 | 还是旧内容（有旧租约） | 租约复活 | ❌ 不可用（内存无） |
+| `update()` | 接口层新/全局索引旧（分叉） | 还是旧内容 | 恢复旧内容 | ⚠️ 不确定（按查询路径不同） |
+| `clear()` | 已清空所有索引 | 写盘失败则可能残留旧内容 | 不一致 | ❌ 完全不可用 |
+
+#### 3.9.7 设计权衡与缺陷
+
+**设计意图**：
+- 优先保证服务可用性（客户端请求不阻塞，即使写盘失败也返回 NAK 让客户端重试）
+- 磁盘原子性已保证，内存与磁盘的不一致被视为可接受的临时状态
+- 下一次成功的 `dbStore` 会将内存中累积的变更一次性写入磁盘
+
+**缺陷**：
+1. **无回滚机制**：写盘失败后内存状态不可逆，只能靠后续成功写盘来同步
+2. **`update()` 的全局索引延迟更新**：dbStore 放在 byAddr/byName 更新之前，写盘失败导致分叉
+3. **无重试机制**：写盘失败后不会自动重试，直到下一次租约变更才会再次触发 `dbStore`
+4. **进程崩溃窗口**：写盘失败后崩溃，内存中所有未持久化的变更都会丢失（add 丢失、remove 恢复、update 恢复旧值）
+
+---
+
+### 3.10 DHCP Option 82 等厂商扩展在客户端识别链路上的处理
+
+#### 3.10.1 当前已解析的 DHCPv4 选项
+
+`internal/dhcpsvc/options4.go` 中实现了以下选项解析：
+
+| 选项类型 | 解析函数 | 用途 | 是否参与租约写入 | 是否参与客户端识别 |
+|---------|---------|------|----------------|----------------|
+| `DHCPOptMessageType` (53) | 内置（gopacket） | 消息类型 | ❌ | ❌ |
+| `DHCPOptServerID` (54) | `serverID4()` | SELECTING 阶段判断目标服务器 | ❌ | ❌ |
+| `DHCPOptRequestIP` (50) | `requestedIPv4()` | 请求的 IP 地址 | ✅（用于分配/验证） | ❌ |
+| `DHCPOptHostname` (12) | `hostname4()` | 客户端主机名 | ✅（写入 `lease.Hostname`） | ✅（最终用于 byName 索引和 HostByIP） |
+| `DHCPOptClientID` (61) | `clientIdentifier4()` | 客户端标识符 | ❌（仅用于 NAK/ACK 的 echo） | ❌ |
+| `DHCPOptParamsReq` (55) | `paramsRequest4()` | 客户端请求的参数列表 | ❌ | ❌ |
+| `DHCPOptUserClass` (77) | `userClassID4()` | 用户分类 | ❌ | ❌ |
+| `DHCPOptVendorClass` (60) | `vendorClassID4()` | 厂商标识（如 "MSFT 5.0"） | ❌ | ❌ |
+| `DHCPOptRelayAgentInfo` (82) | **未实现** | 中继代理信息（CircuitID/RemoteID） | ❌ | ❌ |
+
+#### 3.10.2 Option 82（Relay Agent Information）的完整状态
+
+**代码中完全不存在 Option 82 的解析逻辑**。证据：
+
+- 在 `internal/dhcpsvc` 全模块中搜索 `"option82\|Option82\|RelayAgent\|82"` 无任何匹配
+- `options4.go` 中解析选项的循环没有处理 `layers.DHCPOptRelayAgentInfo`
+- `options4.go` 的 `appendTimeOptions`/`respondOffer`/`respondACK` 也不回显 Option 82
+
+**典型的 Option 82 内容**（如果存在的话）：
+
+```
+Option 82: Relay Agent Information
+  Sub-option 1: Agent Circuit ID    → "ge-0/0/1" (物理端口标识)
+  Sub-option 2: Agent Remote ID     → "switch-hostname" (接入设备标识)
+  Sub-option 5: Link Selection      → 192.168.100.1/24 (选中继链路子网)
+  Sub-option 6: Subscriber ID       → "user1234" (订户标识)
+```
+
+**对客户端识别链路的实际影响**：
+
+由于 Option 82 完全不被解析：
+1. **租约结构中没有这些字段**：`Lease` 结构体只包含 IP/MAC/Hostname/Expiry/IsStatic，没有 CircuitID/RemoteID/SubscriberID
+2. **`runtimeIndex.setInfo` 不会收到这些信息**：没有任何路径能将 Option 82 注入客户端标识
+3. **`ApplyClientFiltering` 无法按接入位置匹配**：无法实现"交换机某端口下的设备用策略 A"这类需求
+4. **双宿主/多网关场景不区分**：同一客户端从不同 relay 端口接入时，识别链路完全一致，不做区分
+
+#### 3.10.3 Vendor Class ID（选项 60）的状态
+
+Vendor Class ID 虽然解析了（`vendorClassID4()`），但**不参与任何后续处理**：
+
+`internal/dhcpsvc/options4.go:424-444`
+
+```go
+// vendorClassID4 returns the vendor class identifier from msg, if any.
+func vendorClassID4(msg *layers.DHCPv4) (id []byte) {
+    for _, opt := range msg.Options {
+        if opt.Type == layers.DHCPOptVendorClass && len(opt.Data) > 0 {
+            return opt.Data  // 如 "MSFT 5.0" / "udhcp 1.31.1" / "Android"
+        }
+    }
+
+    return nil
+}
+```
+
+搜索整个代码库，`vendorClassID4` 被定义后**没有被任何地方调用**。
+
+同理 `userClassID4()`（User Class，选项 77）也是只定义不调用。
+
+#### 3.10.4 DHCPv6 的厂商扩展选项
+
+DHCPv6 标准中有更多选项，但同样未被用于客户端识别：
+
+| 选项 | 标准编号 | 用途 | 代码状态 |
+|------|---------|------|---------|
+| Client Identifier | 1 | DUID（设备唯一标识） | ✅ 解析了，用于 `clientIDMatchingServer` 校验，但不存入租约 |
+| Server Identifier | 2 | 服务器 DUID | ✅ 解析，仅用于校验 |
+| Vendor Class | 16 | 厂商标识 | ❌ 未解析 |
+| Vendor-specific Info | 17 | 厂商私有数据 | ❌ 未解析 |
+| Interface-ID | 18 | relay 接口标识（类似 v4 Option82 Sub1） | ❌ 未解析 |
+| Client Link-Layer Address | 79 | 客户端链路层地址 | ❌ 未解析（仅在 DHCPv6 relay 场景下有意义） |
+
+**DUID（DHCPv6 Client ID）的状态**：
+
+`internal/dhcpsvc/db.go:38` 中有 TODO 标注：
+
+```go
+// TODO(e.burkov):  Migrate to add DUID and IAID fields for DHCPv6 leases.
+```
+
+说明目前 DUID 虽然在握手时被校验（防止错误响应），但**不会被持久化到 JSON 文件中**，重启后会丢失。后续用 DUID 做客户端识别的扩展路径已预留但未实现。
+
+#### 3.10.5 实际请求中厂商扩展的路径追踪
+
+**DHCPv4 客户端请求到达，带 Option 82 和 Vendor Class**：
+
+```
+客户端 → DHCP relay（插入 Option 82: CircuitID, RemoteID）→ AdGuard Home
+  │
+  └─ handleDHCPv4(ctx, typ, req, fd)
+        ├── typ = DHCPMsgTypeDiscover → handleDiscover()
+        │     ├── req.ClientHWAddr → ✅ 用于生成 macKey
+        │     ├── requestedIPv4(req) → ✅ 处理请求 IP
+        │     ├── hostname4(req) → ✅ 读取 Hostname（Option 12）
+        │     ├── clientIdentifier4(req) → ✅ 读取 ClientID（Option 61）
+        │     ├── vendorClassID4(req) → ❌ 不被调用
+        │     ├── 遍历 req.Options → ⚠️ Option 82 存在于切片中，但无人读取
+        │     ├── allocateLease() → 写入租约（不含 Option 82 信息）
+        │     └── respondOffer() → 构造响应，不回显 Option 82
+        │
+        └─ handleRequest() → handleSelecting()
+              ├── hostname4(req) → ✅ 更新租约 Hostname
+              ├── updateLease() → 写入 leaseIndex
+              │     └── dbStore → 写入 JSON（不含 Option 82/VendorClass）
+              └── respondACK()
+```
+
+**查询日志补全和策略叠加阶段（完全不涉及扩展选项）**：
+
+```
+DNS 请求 → ApplyClientFiltering(id, addr, setts)
+  ├── findByClientID() → 按 DNS ClientID（不是 DHCP ClientID！）
+  ├── findByIP() → 按 IP
+  │     └── dhcp.MACByIP(addr) → byAddr[addr].HWAddr（不含扩展）
+  ├── findBySubnet() → 按子网
+  └── findByMAC() → 按 MAC
+
+→ 搜索阶段：clientCache → dhcp.HostByIP() → byName 索引
+             → 只返回 Hostname，不返回其他扩展字段
+```
+
+#### 3.10.6 扩展能力总结与路径
+
+**目前的实际情况**：
+
+| 扩展类型 | 是否解析 | 是否写入租约 | 是否持久化 | 是否参与客户端识别 |
+|---------|---------|------------|----------|----------------|
+| Option 12 Hostname | ✅ | ✅ | ✅ | ✅（唯一参与识别的选项） |
+| Option 60 Vendor Class | ⚠️ 写了函数但不调用 | ❌ | ❌ | ❌ |
+| Option 61 Client ID | ✅ 仅用于响应 echo | ❌ | ❌ | ❌ |
+| Option 77 User Class | ⚠️ 写了函数但不调用 | ❌ | ❌ | ❌ |
+| Option 82 Relay Agent Info | ❌ 完全不处理 | ❌ | ❌ | ❌ |
+| DHCPv6 DUID | ✅ 握手校验用 | ❌ | ❌（有 TODO） | ❌ |
+| DHCPv6 Vendor Class (16) | ❌ | ❌ | ❌ | ❌ |
+| DHCPv6 Interface-ID (18) | ❌ | ❌ | ❌ | ❌ |
+| DHCPv6 Client LLA (79) | ❌ | ❌ | ❌ | ❌ |
+
+**如果将来要接入 Option 82 做客户端识别，扩展路径已预留**：
+
+1. **租约结构**：在 `Lease` 结构体中新增 `CircuitID`、`RemoteID` 等字段（参照 DUID 的 TODO 模式）
+2. **JSON 持久化**：在 `dbLease` 中添加对应字段，`toDBLease`/`toInternal` 转换
+3. **选项解析**：在 `options4.go` 中新增解析函数，遍历 sub-option TLV
+4. **租约写入**：在 `handleDiscover`/`handleSelecting`/`updateAndRespond` 中调用解析函数
+5. **客户端识别**：在 `ApplyClientFiltering` 或 `findBy*` 系列函数中新增按 CircuitID 匹配的逻辑
+6. **运行时缓存**：将 CircuitID 注入 `runtimeIndex.setInfo` 的信息列表
+
+目前整条链路完全没有这些步骤的实现，Option 82 等厂商扩展对客户端识别而言相当于**完全不存在**。
+
+---
+
 ## 四、客户端识别（查询日志补全）
 
 ### 4.1 客户端信息来源优先级
@@ -1542,6 +1907,10 @@ DNS 请求        dnsforward          filtering          client/storage        d
 | ARP 刷新定时 | `internal/client/storage.go` | `refreshARP()`（每 10 分钟全量刷新） |
 | DNS 请求触发 rDNS | `internal/dnsforward/process.go` | `processClientIP()`（每次 DNS 请求异步入队） |
 | SLAAC 模式配置 | `internal/dhcpsvc/v6.go` | `RASLAACOnly/RAAllowSLAAC`（三模式） |
+| 租约持久化原子写 | `internal/dhcpsvc/db.go` | `maybe.WriteFile`（临时文件+原子 rename） |
+| 租约变更一致性 | `internal/dhcpsvc/leaseindex.go` | `add/remove/update`（内存索引与 dbStore 的时序） |
+| DHCPv4 选项解析 | `internal/dhcpsvc/options4.go` | `hostname4/clientIdentifier4/vendorClassID4/userClassID4` |
+| DHCPv6 DUID 持久化 TODO | `internal/dhcpsvc/db.go` | `dbLease` 结构体注释（预留扩展点） |
 
 ---
 
@@ -1574,3 +1943,7 @@ DNS 请求        dnsforward          filtering          client/storage        d
 13. **DHCPv4 relay 透明支持**：DHCPv4 中继场景下 CHADDR 字段保留客户端真实 MAC，租约写入和客户端识别链路完全不受影响，`MACByIP`/`HostByIP` 正常工作。但不支持 Option 82 中继代理信息，无法基于 relay 端口做细粒度区分；DHCPv6 relay 完全不支持（消息类型未实现），IPv6 跨子网环境下租约无法创建
 
 14. **SLAAC 环境下 IP→MAC 桥接断裂**：SLAAC 地址不在 DHCP 租约中，`dhcp.MACByIP()` 直接失效。替代路径有四条：持久化客户端（按 IP/子网）、hosts 文件、rDNS 反向解析（每次 DNS 请求异步触发，1 小时缓存）、ARP/NDP 邻居表（每 10 分钟刷新）。核心限制是 **ARP/NDP 刷新只写入主机名不写入 MAC**，导致 SLAAC 地址无法通过 MAC 匹配持久化客户端，按 MAC 配置的策略在纯 SLAAC 环境下完全失效
+
+15. **持久化写盘失败无回滚机制**：使用 `maybe.WriteFile` 保证磁盘文件原子性（不会半写损坏），但 `add/remove/update` 三个方法都是**先修改内存索引再写盘**，写盘失败时没有 undo 操作。`update()` 最危险：接口层 MAC 索引已替换但全局 byAddr/byName 索引还没更新，会导致同一条租约按 MAC 查询和按 IP/Hostname 查询得到不同结果。上层调用者只做"打日志+NAK 拒绝客户端"处理，依赖下一次成功的 `dbStore` 来同步所有累积变更
+
+16. **厂商扩展选项几乎全部未接入识别链路**：DHCPv4 的 8 个选项中只有 `Option 12 (Hostname)` 全程参与租约写入和客户端识别。`Option 60 (Vendor Class)` 和 `Option 77 (User Class)` 虽然写了解析函数但完全没被调用。`Option 82 (Relay Agent Info)` 连解析逻辑都没有。DHCPv6 的 DUID 仅用于握手校验、不持久化（代码有 TODO 标注预留扩展点）。整条链路上只有 IP/MAC/Hostname 三个维度能被用于客户端识别，接入位置、厂商标识、订户 ID 等信息全部丢失
